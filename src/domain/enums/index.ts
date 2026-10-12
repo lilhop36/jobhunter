@@ -1,6 +1,7 @@
 ﻿export * from './lifecycle.enum';
 export * from './calendar.enum';
 export * from './salary-type.enum';
+export * from './salary-period.enum';
 export * from './location-category.enum';
 export * from './evidence-state.enum';
 export * from './application-method.enum';
