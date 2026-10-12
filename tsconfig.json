@@ -1,0 +1,28 @@
+﻿{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "node",
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "baseUrl": ".",
+    "paths": {
+      "@domain/*": ["src/domain/*"],
+      "@application/*": ["src/application/*"],
+      "@ports/*": ["src/ports/*"],
+      "@adapters/*": ["src/adapters/*"],
+      "@infrastructure/*": ["src/infrastructure/*"],
+      "@app/*": ["apps/*"]
+    }
+  },
+  "include": ["src/**/*", "apps/**/*", "prisma/**/*", "tests/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
