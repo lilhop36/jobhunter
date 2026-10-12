@@ -1,0 +1,8 @@
+﻿export enum LifecycleStatus {
+  DISCOVERED = 'DISCOVERED',
+  ACCEPTED = 'ACCEPTED',
+  REJECTED = 'REJECTED',
+  DUPLICATE = 'DUPLICATE',
+  EXPIRED = 'EXPIRED',
+  DEAD_LINK = 'DEAD_LINK',
+}

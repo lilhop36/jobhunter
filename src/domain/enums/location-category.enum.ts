@@ -1,0 +1,7 @@
+﻿export enum LocationCategory {
+  ADDIS_ABABA = 'ADDIS_ABABA',
+  OTHER_CITIES = 'OTHER_CITIES',
+  REMOTE = 'REMOTE',
+  HYBRID = 'HYBRID',
+  UNKNOWN = 'UNKNOWN',
+}
