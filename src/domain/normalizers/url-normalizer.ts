@@ -26,6 +26,12 @@ export function canonicalizeUrl(url: string | null | undefined): string | null {
   }
 }
 
+/**
+ * @deprecated Unsafe as a uniqueness key: this is a 32-bit non-cryptographic hash,
+ * which collides with roughly 50% probability by about 77k distinct values. Use the
+ * versioned SHA-256 fingerprints in `job-identity.ts` (ADR-0001) instead. Retained
+ * only until the source adapter is migrated.
+ */
 export function contentFingerprint(input: string | null | undefined): string {
   if (!input) return '';
   const s = input.replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
