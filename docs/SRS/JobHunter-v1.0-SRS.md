@@ -1,7 +1,7 @@
 JOBHUNTER v1.0
 Software Requirements Specification
 Industry-Standard Structured Edition
-Pragmatic MVP â€” Ethiopia-first, single-user, data-quality-first
+Pragmatic MVP — Ethiopia-first, single-user, data-quality-first
 job discovery and notification system
 Document Control
 Document basis: This edition restructures the uploaded JobHunter v1.0 Full SRS. Product scope, decisions, requirements, constraints, and acceptance criteria are retained; the principal change is organization into a conventional SRS hierarchy.
@@ -90,11 +90,11 @@ Table of Contents
   10.4 Threshold Policy
   10.5 Acceptance Criteria
 11. Implementation and Release Plan
-  11.1 Milestone 1 â€” Core Job Pipeline
-  11.2 Milestone 2 â€” Deterministic Matching
-  11.3 Milestone 3 â€” Telegram Loop
-  11.4 Milestone 4 â€” AI Fallback
-  11.5 Milestone 5 â€” Reliability and Validation
+  11.1 Milestone 1 — Core Job Pipeline
+  11.2 Milestone 2 — Deterministic Matching
+  11.3 Milestone 3 — Telegram Loop
+  11.4 Milestone 4 — AI Fallback
+  11.5 Milestone 5 — Reliability and Validation
 12. Post-MVP Roadmap
 13. Risks and Mitigations
 14. Engineering Rules
@@ -108,13 +108,13 @@ This SRS defines the requirements for JobHunter v1.0, a single-user, Ethiopia-fi
 The MVP continuously collects jobs from a deliberately small set of reliable and permitted sources, preserves raw evidence, normalizes and validates listings, removes duplicates and unusable opportunities, extracts structured fields deterministically, optionally uses AI for ambiguous cases, compares jobs against one candidate profile, and delivers high-confidence opportunities through Telegram.
 1.3 Product Definition
 JobHunter v1.0 is a single-user, Ethiopia-first job discovery and filtering system built around a trustworthy job-data pipeline, deterministic matching, and optional AI-assisted extraction.
-Collect â†’ Clean â†’ Verify â†’ Structure â†’ Match â†’ Explain â†’ Notify â†’ Measure
+Collect → Clean → Verify → Structure → Match → Explain → Notify → Measure
 1.4 Problem Statement
 Job opportunities are fragmented across job boards, company pages, permitted public channels, PDFs, and other sources. Listings may be duplicated, expired, poorly structured, missing salary information, ambiguous about location, or difficult to compare with a candidate profile. Manually checking these sources consumes time and attention.
 1.5 Product Vision
 JobHunter should behave like a disciplined personal job-search assistant: discover opportunities broadly enough to be useful, filter aggressively enough to reduce noise, and explain every delivered match using evidence.
 1.6 Goals
-Collect from 3â€“5 actively maintained sources.
+Collect from 3–5 actively maintained sources.
 Preserve raw source evidence.
 Normalize URLs, text, dates, salary, location, title, and company.
 Detect duplicate jobs.
@@ -143,12 +143,12 @@ Mobile application.
 Paid AI dependency.
 1.8 Definitions and Acronyms
 1.9 Reference Basis
-Primary source: uploaded â€œJobHunter v1.0 â€” Full SRSâ€, Version 1.0, dated 2026-10-04. No additional external product requirements are introduced by this restructuring.
+Primary source: uploaded “JobHunter v1.0 — Full SRS”, Version 1.0, dated 2026-10-04. No additional external product requirements are introduced by this restructuring.
 2. Overall Description
 2.1 Product Perspective
 The system is a personal job-search pipeline with source adapters, a persistent PostgreSQL coordination/data layer, a separate worker process for heavy background work, a web interface for inspection and profile management, Telegram for notifications, and optional AI providers for ambiguous extraction cases.
 The primary processing flow is:
-Job Sources â†’ Source Adapters â†’ RawJob â†’ Deterministic Normalization â†’ Field Fidelity â†’ Deterministic Extraction â†’ AI Fallback (only when triggered) â†’ Structured Evidence â†’ Deduplication + Lifecycle â†’ Deterministic Matcher â†’ Match + Confidence + Explanation â†’ Notification Outbox â†’ Telegram â†’ User Feedback â†’ Precision Measurement
+Job Sources → Source Adapters → RawJob → Deterministic Normalization → Field Fidelity → Deterministic Extraction → AI Fallback (only when triggered) → Structured Evidence → Deduplication + Lifecycle → Deterministic Matcher → Match + Confidence + Explanation → Notification Outbox → Telegram → User Feedback → Precision Measurement
 2.2 Users and Operating Model
 Primary user
 One seeded candidate owns one profile and one Telegram destination.
@@ -157,15 +157,15 @@ Ownership fields such as userId shall remain in the schema where useful. Registr
 Operator
 The developer/operator may inspect source health, worker runs, errors, and system configuration. This does not require a large customer-facing admin dashboard.
 2.3 Product Principles
-Data quality first â€” bad structured data produces bad matches.
-Deterministic first â€” clear information is handled by reproducible rules.
-AI is advisory â€” it produces evidence, not authoritative facts or final decisions.
-Unknown is valid â€” unknown information must not be silently treated as negative evidence.
-Evidence before claims â€” important values retain provenance.
-Score is not confidence â€” compatibility and evidence completeness are different dimensions.
-Graceful degradation â€” AI, a source, or Telegram can fail without destroying the pipeline.
-Attention is the product â€” useful alerts matter more than alert volume.
-Scope follows validation â€” infrastructure and features are justified by measured bottlenecks.
+Data quality first — bad structured data produces bad matches.
+Deterministic first — clear information is handled by reproducible rules.
+AI is advisory — it produces evidence, not authoritative facts or final decisions.
+Unknown is valid — unknown information must not be silently treated as negative evidence.
+Evidence before claims — important values retain provenance.
+Score is not confidence — compatibility and evidence completeness are different dimensions.
+Graceful degradation — AI, a source, or Telegram can fail without destroying the pipeline.
+Attention is the product — useful alerts matter more than alert volume.
+Scope follows validation — infrastructure and features are justified by measured bottlenecks.
 2.4 System Scope and Boundaries
 The v1.0 boundary is intentionally narrow: one seeded candidate, one Telegram destination, a small set of actively maintained sources, PostgreSQL-backed durable work, and a deterministic matching/notification loop. Broader platform capabilities are deferred until validation demonstrates a need.
 2.5 Operating Environment
@@ -176,7 +176,7 @@ Backend API: NestJS.
 Background processing: separate Node.js worker process.
 AI: optional, on-demand, advisory; local Ollama or optional external HTTP provider.
 Client interface: web application.
-Geographic priority: Ethiopia â†’ Remote â†’ International.
+Geographic priority: Ethiopia → Remote → International.
 2.6 Assumptions and Constraints
 The MVP is intentionally single-user.
 Only a deliberately small set of actively maintained sources is targeted.
@@ -259,9 +259,9 @@ ONLINE_URL | EMAIL | SOURCE_ACCOUNT | PDF_FORM | IN_PERSON | INSTRUCTIONS | UNKN
 A job must have a usable application path before notification unless the notification policy explicitly permits informational listings.
 3.6 AI Provider Interface
 AiProvider
-â”œâ”€â”€ OllamaProvider
-â”œâ”€â”€ ExternalHttpProvider (optional)
-â””â”€â”€ NoopProvider
+├── OllamaProvider
+├── ExternalHttpProvider (optional)
+└── NoopProvider
 Ambiguous skill extraction
 Low-confidence role interpretation
 Ambiguous seniority
@@ -315,7 +315,7 @@ Weights are a versioned initial hypothesis. They must be evaluated against real 
 Skill credit
 UNKNOWN rule
 UNKNOWN is not automatically a failure. A factor with unknown evidence may be excluded from the denominator and the known weights renormalized. Confidence/evidence completeness must decrease.
-FinalScore = sum(known score Ã- weight) / sum(known weights)
+FinalScore = sum(known score × weight) / sum(known weights)
 Salary
 Known salary may participate in salary preference scoring. Negotiable, as-per-scale, not-disclosed, and unknown salary shall normally be excluded from the salary denominator unless the candidate explicitly requires disclosed salary.
 Remote
@@ -327,9 +327,9 @@ Every JobMatch stores matcherVersion. Changes to weights, thresholds, or scoring
 4.7 AI-Assisted Extraction
 Providers
 AiProvider
-â”œâ”€â”€ OllamaProvider
-â”œâ”€â”€ ExternalHttpProvider (optional)
-â””â”€â”€ NoopProvider
+├── OllamaProvider
+├── ExternalHttpProvider (optional)
+└── NoopProvider
 v1.0 AI use cases
 Ambiguous skill extraction
 Low-confidence role interpretation
@@ -562,7 +562,7 @@ Identical structured input and matcherVersion must produce identical match outpu
 The full pipeline must operate with NoopProvider. AI failures must not stop the pipeline.
 7. System Architecture and Operational Requirements
 7.1 High-Level Architecture
-Job Sources â†’ Source Adapters â†’ RawJob â†’ Deterministic Normalization â†’ Description / URL / Field Fidelity â†’ Deterministic Extraction â†’ AI Fallback (only when triggered) â†’ Structured Evidence â†’ Deduplication + Lifecycle â†’ Deterministic Matcher â†’ Match + Confidence + Explanation â†’ Notification Outbox â†’ Telegram â†’ User Feedback â†’ Precision Measurement
+Job Sources → Source Adapters → RawJob → Deterministic Normalization → Description / URL / Field Fidelity → Deterministic Extraction → AI Fallback (only when triggered) → Structured Evidence → Deduplication + Lifecycle → Deterministic Matcher → Match + Confidence + Explanation → Notification Outbox → Telegram → User Feedback → Precision Measurement
 7.2 Process Separation
 NestJS API and heavy background processing shall run as separate processes. API handles reads, profile changes, feedback, and operational commands. Worker handles collection, extraction, AI, matching, lifecycle, and notification dispatch.
 7.3 Worker Responsibilities
@@ -629,7 +629,7 @@ HTTP failures
 Duration
 Unexpected zero results
 Pipeline funnel
-collected â†’ parsed â†’ valid â†’ unique â†’ active â†’ matched â†’ notified
+collected → parsed → valid → unique → active → matched → notified
 AI metrics
 calls
 bypassed
@@ -685,7 +685,7 @@ AI schema validation
 Notification eligibility
 Telegram retry/backoff
 9.2 Integration Testing
-Test Source â†’ RawJob â†’ Job â†’ Match â†’ Outbox â†’ Telegram dispatch/feedback.
+Test Source → RawJob → Job → Match → Outbox → Telegram dispatch/feedback.
 9.3 Real-Data Fixtures
 Maintain representative fixtures for every source, including clean, malformed, duplicate, missing-field, Ethiopian-date, salary-ambiguous, and dead-link cases.
 9.4 Determinism
@@ -717,11 +717,11 @@ When JobHunter sends an alert, is it worth the user's attention?
 Do not invent an arbitrary precision target before collecting baseline data. Record precision from the first notification, establish the baseline, then set a formal target based on actual observed performance.
 10.5 Acceptance Criteria
 11. Implementation and Release Plan
-11.1 Milestone 1 â€” Core Job Pipeline
+11.1 Milestone 1 — Core Job Pipeline
 PostgreSQL
 Worker process
 Source abstraction
-3â€“5 adapters
+3–5 adapters
 RawJob
 Normalization
 URL validation
@@ -730,7 +730,7 @@ Deduplication
 SourceRun
 Health checks
 Exit condition: trustworthy jobs exist in PostgreSQL.
-11.2 Milestone 2 â€” Deterministic Matching
+11.2 Milestone 2 — Deterministic Matching
 Seeded candidate
 Skills
 Roles
@@ -742,7 +742,7 @@ Confidence
 UNKNOWN handling
 Evidence
 Exit condition: real jobs receive explainable deterministic matches.
-11.3 Milestone 3 â€” Telegram Loop
+11.3 Milestone 3 — Telegram Loop
 Telegram linking
 Eligibility
 Outbox
@@ -753,7 +753,7 @@ Reject
 Apply/Open
 Feedback
 Exit condition: useful alerts arrive reliably.
-11.4 Milestone 4 â€” AI Fallback
+11.4 Milestone 4 — AI Fallback
 AiProvider
 NoopProvider
 OllamaProvider
@@ -763,7 +763,7 @@ AI evidence
 Timeouts
 Fallback
 Exit condition: AI improves ambiguous cases without becoming required.
-11.5 Milestone 5 â€” Reliability and Validation
+11.5 Milestone 5 — Reliability and Validation
 Lifecycle sweeps
 Link-rot checks
 Backup
@@ -799,12 +799,12 @@ B.1 Salary
   "salaryMax": 70000,
   "salaryCurrency": "ETB",
   "salaryPeriod": "MONTH",
-  "salaryEvidence": "50,000â€“70,000 ETB per month",
+  "salaryEvidence": "50,000–70,000 ETB per month",
   "salaryConfidence": 0.94
 }
 B.2 Ethiopian date
 {
-  "originalPublishedDateText": "áˆ˜áˆµáŠ¨áˆ¨áˆ 5, 2018",
+  "originalPublishedDateText": "መስከረም 5, 2018",
   "publishedCalendar": "ETHIOPIAN",
   "publishedAt": "deterministically converted Gregorian date",
   "dateConfidence": 0.99,
@@ -859,27 +859,27 @@ Notification Precision is measured and documented.
 Appendix D. Final Product Definition
 JobHunter v1.0 is successful when it can reliably turn fragmented job postings into a small stream of trustworthy opportunities.
 SOURCE
-  â†“
+  ↓
 RAW DATA
-  â†“
+  ↓
 NORMALIZE
-  â†“
+  ↓
 VERIFY
-  â†“
+  ↓
 STRUCTURE
-  â†“
+  ↓
 AI ONLY WHEN NEEDED
-  â†“
+  ↓
 MATCH DETERMINISTICALLY
-  â†“
+  ↓
 CONFIDENCE
-  â†“
+  ↓
 FILTER
-  â†“
+  ↓
 TELEGRAM
-  â†“
+  ↓
 USER FEEDBACK
-  â†“
+  ↓
 NOTIFICATION PRECISION
 The first objective is not to build a large job platform. It is to prove that the user can trust JobHunter's alerts. Once that is demonstrated, multi-user support, queues, semantic matching, advanced AI, application tracking, and learned ranking can be added as evidence-driven expansions.
 Document Type | Software Requirements Specification
@@ -902,7 +902,7 @@ AI | Optional, on-demand, advisory
 ---
 Primary KPI | Notification Precision
 ---
-Geographic Priority | Ethiopia â†’ Remote â†’ International
+Geographic Priority | Ethiopia → Remote → International
 ---
 Version | Date | Change | Status
 ---
@@ -1044,7 +1044,7 @@ SalaryType | Example | Canonical numeric value?
 ---
 EXACT | 50,000 ETB/month | Yes
 ---
-RANGE | 50,000â€“70,000 ETB/month | Yes
+RANGE | 50,000–70,000 ETB/month | Yes
 ---
 STARTING_FROM | Starting from 50,000 ETB | Minimum
 ---
@@ -1136,7 +1136,7 @@ Telegram rate limits | Medium | Outbox and retry/backoff.
 ---
 Worker/power restart | Medium | Persistent task state and catch-up.
 ---
-Source proliferation | High | 3-5 source MVP limit.
+Source proliferation | High | 3–5 source MVP limit.
 ---
 Overengineering | High | Validation gate before expansion.
 ---
