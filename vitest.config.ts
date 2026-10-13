@@ -5,6 +5,10 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Integration tests share one PostgreSQL database and truncate between
+    // cases. Running files in parallel would let one file TRUNCATE another's
+    // fixtures mid-test, so files must be strictly sequential.
+    fileParallelism: false,
   },
   resolve: {
     alias: {

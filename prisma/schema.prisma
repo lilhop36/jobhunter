@@ -293,7 +293,11 @@ model WorkTask {
   id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   type           String
   payload        Json?
-  dedupeKey      String?        @unique
+  /// Deduplication scope is intentionally not a plain @unique: uniqueness only
+  /// applies while a task is PENDING or RUNNING. A hand-written partial unique
+  /// index (`one_active_task_per_dedupe_key`) enforces it because Prisma cannot
+  /// express partial indexes. Keep in sync with ACTIVE_WORK_TASK_STATUSES.
+  dedupeKey      String?
   status         WorkTaskStatus @default(PENDING)
   priority       Int            @default(0)
   attempts       Int            @default(0)
@@ -301,6 +305,9 @@ model WorkTask {
   runAfter       DateTime       @default(now())
   lockedAt       DateTime?
   lockedBy       String?
+  /// Unique token minted per claim. Heartbeat/complete/fail must present it so a
+  /// worker whose lease was reclaimed cannot mutate a newer attempt.
+  leaseToken     String?        @unique
   leaseExpiresAt DateTime?
   sourceRunId    String?        @db.Uuid
   lastError      String?
