@@ -1,4 +1,4 @@
-﻿JOBHUNTER v1.0
+JOBHUNTER v1.0
 Software Requirements Specification
 Industry-Standard Structured Edition
 Pragmatic MVP â€” Ethiopia-first, single-user, data-quality-first

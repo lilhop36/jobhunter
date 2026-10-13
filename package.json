@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "jobhunting",
   "version": "1.0.0",
   "private": true,
@@ -8,14 +8,20 @@
   ],
   "scripts": {
     "build": "tsc --build",
-    "dev": "tsc --watch",
-    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
+    "verify": "tsc --noEmit && vitest --run",
     "test": "vitest",
     "test:unit": "vitest --run tests/unit",
     "test:integration": "vitest --run tests/integration",
     "test:failure": "vitest --run tests/failure",
     "test:ci": "vitest --run"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.0",
+    "@vitest/coverage-v8": "2.1.9",
+    "typescript": "5.6.3",
+    "vitest": "2.1.9"
   },
   "engines": {
     "node": ">=20"
