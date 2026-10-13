@@ -9,7 +9,7 @@ Do NOT modify files.
 
 Review the current implementation against:
 
-1. JobHunter SRS (docs/SRS/JobHunter-v1.0-SRS.md)
+1. JobHunter SRS (docs/SRS/JobHunter-v1.1-SRS.md)
 2. AGENTS.md
 3. Existing architecture (docs/architecture/architecture.md)
 4. Existing tests

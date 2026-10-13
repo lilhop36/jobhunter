@@ -1,8 +1,8 @@
 // JobHunter v1.0 — Prisma schema (Milestone 1: ingestion data model)
 //
-// Source of truth: docs/SRS/JobHunter-v1.0-SRS.md
+// Source of truth: docs/SRS/JobHunter-v1.1-SRS.md
 //   - 5.2 Entity Attributes (JobSource, SourceRun, RawJob, Job, SystemLog)
-//   - 5.6 Index requirements
+//   - 5.6 Database Requirements
 //   - 7.5 Durable work and locking
 //
 // NOTE: `one_active_run_per_source` (partial unique index) and the work-queue

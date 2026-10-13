@@ -1,6 +1,6 @@
 # JobHunter Requirements Reference
 
-**Source of Truth:** [docs/SRS/JobHunter-v1.0-SRS.md](../../../../docs/SRS/JobHunter-v1.0-SRS.md)
+**Source of Truth:** [docs/SRS/JobHunter-v1.1-SRS.md](../../../../docs/SRS/JobHunter-v1.1-SRS.md)
 
 ## Purpose
 

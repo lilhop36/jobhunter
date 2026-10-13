@@ -28,7 +28,7 @@ Do not implement requirements that have not been established.
 
 The authoritative product requirements are:
 
-docs/SRS/JobHunter-v1.0-SRS.md
+docs/SRS/JobHunter-v1.1-SRS.md
 
 Before implementing any substantial feature:
 

@@ -12,6 +12,6 @@ See AGENTS.md at repository root for:
 
 When working on JobHunter:
 1. Load/read AGENTS.md first for any non-trivial task.
-2. Treat docs/SRS/JobHunter-v1.0-SRS.md as the source of truth for requirements.
+2. Treat docs/SRS/JobHunter-v1.1-SRS.md as the source of truth for requirements.
 3. Use the jobhunter-engineering skill for implementation-heavy work.
 4. Prefer the reviewer subagent for independent review before claiming completion.
