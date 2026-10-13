@@ -1,4 +1,4 @@
-﻿export enum SalaryPeriod {
+export enum SalaryPeriod {
   HOUR = 'HOUR',
   DAY = 'DAY',
   WEEK = 'WEEK',

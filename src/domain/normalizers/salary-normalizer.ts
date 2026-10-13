@@ -1,16 +1,18 @@
-﻿import { SalaryPeriod, SalaryType } from '../enums';
+import { SalaryPeriod, SalaryType } from '../enums';
 import { SalaryParsed } from '../types';
 
+// Currency recognition. Codes are validated strings; we never invent an amount.
 const CURRENCY_ALIASES: Array<{ pattern: RegExp; code: string }> = [
-  { pattern: /(?:^|\b)etb\b|birr|\bbr\b|ብር/i, code: 'ETB' },
-  { pattern: /\busd\b|us\$|\$/i, code: 'USD' },
-  { pattern: /(?:^|\b)eur\b|€/i, code: 'EUR' },
-  { pattern: /(?:^|\b)gbp\b|£/i, code: 'GBP' },
+  { pattern: /(?:^|\b)etb\b|birr|(?:^|\s)br(?:$|\s)|\u1265\u122d/i, code: 'ETB' },
+  { pattern: /\busd\b|us\$|\$|\u0024/i, code: 'USD' },
+  { pattern: /(?:^|\b)eur\b|\u20ac/i, code: 'EUR' },
+  { pattern: /(?:^|\b)gbp\b|\u00a3/i, code: 'GBP' },
   { pattern: /(?:^|\b)kes\b/i, code: 'KES' },
   { pattern: /(?:^|\b)aed\b/i, code: 'AED' },
 ];
 
-const SALARY_KEYWORDS = /\bsalary\b|\bwage\b|\bpay\b|compensation|remuneration|stipend|ደመወዝ/i;
+// "salary" in English and Amharic (ደመወዝ).
+const SALARY_KEYWORDS = /\bsalary\b|\bwage\b|\bpay\b|compensation|remuneration|stipend|\u12f0\u1218\u12c8\u12d8/i;
 
 function detectCurrency(lower: string): string | null {
   for (const alias of CURRENCY_ALIASES) {
@@ -20,8 +22,8 @@ function detectCurrency(lower: string): string | null {
 }
 
 const PERIOD_PATTERNS: Array<{ pattern: RegExp; period: SalaryPeriod }> = [
-  { pattern: /per\s+month|monthly|\/\s*month|p\.?m\.?\b|በወር/i, period: SalaryPeriod.MONTH },
-  { pattern: /per\s+annum|yearly|annually|\/\s*year|p\.?a\.?\b|በዓመት|በአመት/i, period: SalaryPeriod.YEAR },
+  { pattern: /per\s+month|monthly|\/\s*month|p\.?m\.?\b/i, period: SalaryPeriod.MONTH },
+  { pattern: /per\s+annum|per\s+year|yearly|annually|\/\s*year|p\.?a\.?\b/i, period: SalaryPeriod.YEAR },
   { pattern: /per\s+hour|hourly|\/\s*hour|p\.?h\.?\b/i, period: SalaryPeriod.HOUR },
   { pattern: /per\s+day|daily|\/\s*day|p\.?d\.?\b/i, period: SalaryPeriod.DAY },
   { pattern: /per\s+week|weekly|\/\s*week|p\.?w\.?\b/i, period: SalaryPeriod.WEEK },
@@ -79,8 +81,9 @@ function nonNumeric(type: SalaryType, raw: string, confidence: number): SalaryPa
   };
 }
 
+// Range separators: hyphen, en dash (U+2013), em dash (U+2014), or the word "to".
 function hasRangeSeparator(lower: string): boolean {
-  return /[-–—]|\bto\b/.test(lower);
+  return /[-\u2013\u2014]|\bto\b/.test(lower);
 }
 
 export function parseSalary(text: string | null | undefined): SalaryParsed {
@@ -94,7 +97,7 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
   const hasKeyword = SALARY_KEYWORDS.test(lower);
   const numbers = extractNumbers(lower);
   const hasAmountContext = currency !== null || hasKeyword;
-  const negotiable = /negotiat/i.test(lower);
+  const negotiable = /negotia/i.test(lower);
 
   // Numeric extraction only when a currency token or salary keyword is present,
   // so plain years (2018) and phone numbers never become salaries.
@@ -110,7 +113,7 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
         currency,
         period,
         evidence: raw,
-        confidence: negotiable ? 60 : 90,
+        confidence: negotiable ? 0.6 : 0.9,
       };
     }
 
@@ -128,15 +131,15 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
       currency,
       period,
       evidence: raw,
-      confidence: negotiable ? 60 : 90,
+      confidence: negotiable ? 0.6 : 0.9,
     };
   }
 
   // No concrete amount: represent the non-numeric salary states (AC-007).
-  if (negotiable) return nonNumeric(SalaryType.NEGOTIABLE, raw, 90);
-  if (/as\s+per\s+scale|scale/i.test(lower)) return nonNumeric(SalaryType.AS_PER_SCALE, raw, 90);
+  if (negotiable) return nonNumeric(SalaryType.NEGOTIABLE, raw, 0.9);
+  if (/as\s+per\s+scale|scale/i.test(lower)) return nonNumeric(SalaryType.AS_PER_SCALE, raw, 0.9);
   if (/not\s+disclosed|undisclosed|confidential|not\s+specified/i.test(lower)) {
-    return nonNumeric(SalaryType.NOT_DISCLOSED, raw, 90);
+    return nonNumeric(SalaryType.NOT_DISCLOSED, raw, 0.9);
   }
   return unknown(raw);
 }

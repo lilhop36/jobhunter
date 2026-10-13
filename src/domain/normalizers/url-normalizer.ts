@@ -1,4 +1,4 @@
-﻿export function canonicalizeUrl(url: string | null | undefined): string | null {
+export function canonicalizeUrl(url: string | null | undefined): string | null {
   if (!url) return null;
   let trimmed = url.trim();
   if (!trimmed) return null;

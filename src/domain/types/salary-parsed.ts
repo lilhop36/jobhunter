@@ -1,4 +1,4 @@
-﻿import { SalaryType, SalaryPeriod } from '../enums';
+import { SalaryType, SalaryPeriod } from '../enums';
 
 export interface SalaryParsed {
   type: SalaryType;
@@ -7,5 +7,5 @@ export interface SalaryParsed {
   currency: string | null;
   period: SalaryPeriod | null;
   evidence: string | null;
-  confidence: number; // 0-100
+  confidence: number; // 0..1 extraction confidence (SRS B.1)
 }

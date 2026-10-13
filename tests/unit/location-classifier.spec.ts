@@ -1,4 +1,4 @@
-﻿import { classifyLocation } from '@domain/normalizers/location/location-classifier';
+import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 
 describe('location classifier', () => {
   it('hybrid', () => {
@@ -47,7 +47,7 @@ describe('location classifier', () => {
   it('multiple ethiopian places lower confidence', () => {
     const r = classifyLocation({ text: 'Adama / Hawassa' });
     expect(r.category).toBe('ETHIOPIA_CITY');
-    expect(r.confidence).toBeLessThan(80);
+    expect(r.confidence).toBeLessThan(0.8);
   });
 
   it('international on-site', () => {

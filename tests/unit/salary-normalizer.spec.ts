@@ -1,6 +1,6 @@
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
 
-describe('salary parser — non-numeric states (AC-007)', () => {
+describe('salary parser - non-numeric states (AC-007)', () => {
   it('negotiable never fabricates numbers', () => {
     const r = parseSalary('Salary negotiable');
     expect(r.type).toBe('NEGOTIABLE');
@@ -31,7 +31,7 @@ describe('salary parser — non-numeric states (AC-007)', () => {
   });
 });
 
-describe('salary parser — numeric extraction', () => {
+describe('salary parser - numeric extraction', () => {
   it('exact amount with currency', () => {
     const r = parseSalary('50,000 ETB');
     expect(r.type).toBe('EXACT');
@@ -41,7 +41,7 @@ describe('salary parser — numeric extraction', () => {
   });
 
   it('range with en dash', () => {
-    const r = parseSalary('50,000–70,000 ETB/month');
+    const r = parseSalary('50,000\u201370,000 ETB/month');
     expect(r.type).toBe('RANGE');
     expect(r.min).toBe(50000);
     expect(r.max).toBe(70000);
@@ -89,7 +89,7 @@ describe('salary parser — numeric extraction', () => {
   it('keeps numeric value alongside negotiable with lower confidence', () => {
     const r = parseSalary('50,000 ETB negotiable');
     expect(r.min).toBe(50000);
-    expect(r.confidence).toBeLessThan(90);
+    expect(r.confidence).toBeLessThan(0.9);
     expect(r.evidence).toBe('50,000 ETB negotiable');
   });
 });

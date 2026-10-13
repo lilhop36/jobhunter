@@ -1,4 +1,4 @@
-﻿export enum SalaryType {
+export enum SalaryType {
   EXACT = 'EXACT',
   RANGE = 'RANGE',
   STARTING_FROM = 'STARTING_FROM',

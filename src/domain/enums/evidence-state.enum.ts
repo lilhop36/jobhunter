@@ -1,6 +1,5 @@
-﻿export enum EvidenceState {
-  WEAK = 'WEAK',
-  MEDIUM = 'MEDIUM',
-  STRONG = 'STRONG',
+export enum EvidenceState {
+  KNOWN = 'KNOWN',
   UNKNOWN = 'UNKNOWN',
+  CONFLICTING = 'CONFLICTING',
 }

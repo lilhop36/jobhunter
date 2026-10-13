@@ -1,4 +1,4 @@
-﻿export enum LocationCategory {
+export enum LocationCategory {
   ADDIS_ABABA = 'ADDIS_ABABA',
   ETHIOPIA_CITY = 'ETHIOPIA_CITY',
   ETHIOPIA_REGION = 'ETHIOPIA_REGION',

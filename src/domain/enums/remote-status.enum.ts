@@ -1,4 +1,4 @@
-﻿export enum RemoteStatus {
+export enum RemoteStatus {
   ONSITE = 'ONSITE',
   REMOTE = 'REMOTE',
   HYBRID = 'HYBRID',

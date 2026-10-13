@@ -1,4 +1,4 @@
-﻿import { canonicalizeUrl, contentFingerprint } from '@domain/normalizers/url-normalizer';
+import { canonicalizeUrl, contentFingerprint } from '@domain/normalizers/url-normalizer';
 
 describe('canonicalizeUrl', () => {
   it('lowercases host', () => {
