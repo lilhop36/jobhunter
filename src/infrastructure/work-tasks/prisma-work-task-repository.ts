@@ -26,8 +26,14 @@ const ACTIVE_STATUS_LIST = Prisma.raw(ACTIVE_WORK_TASK_STATUSES.map((s) => `'${s
  * and would be stored in the connection's session time zone, silently shifting
  * every lease/backoff by the server offset. Using `now() AT TIME ZONE 'UTC'`
  * keeps database time consistent with stored values regardless of session TZ.
+ *
+ * The value is truncated to milliseconds to match the column precision. Without
+ * it, a value written as `runAfter` is rounded up to the next millisecond while a
+ * comparison still uses the un-rounded microsecond clock, so a task enqueued and
+ * claimed inside one transaction (where `now()` is fixed) would intermittently
+ * look not-yet-due. Truncating keeps reads and writes on the same grid.
  */
-const NOW_UTC = Prisma.raw("(now() AT TIME ZONE 'UTC')");
+const NOW_UTC = Prisma.raw("date_trunc('milliseconds', now() AT TIME ZONE 'UTC')");
 
 const DEFAULT_BACKOFF: WorkTaskBackoff = { baseSeconds: 5, factor: 2, maxSeconds: 3600 };
 

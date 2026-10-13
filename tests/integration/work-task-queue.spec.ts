@@ -272,6 +272,25 @@ describe('database-time correctness under a non-UTC session timezone', () => {
   });
 });
 
+describe('database-time precision', () => {
+  it('makes a task enqueued and claimed within one transaction immediately due', async () => {
+    // Inside a transaction `now()` is fixed, so the stored `runAfter` and the
+    // claim comparison read the same instant. The value must be rounded to the
+    // column's millisecond precision, otherwise `runAfter` could be written up to
+    // a millisecond in the future and the task would look not-yet-due.
+    await prisma.$transaction(async (tx) => {
+      const txRepo = new PrismaWorkTaskRepository(tx);
+      const task = await txRepo.enqueue({ type: 'same-tx', dedupeKey: 'same-tx' });
+
+      const claimed = await txRepo.claim('same-tx-worker', 60);
+
+      expect(claimed).not.toBeNull();
+      expect(claimed!.id).toBe(task.id);
+      expect(claimed!.status).toBe('RUNNING');
+    });
+  });
+});
+
 describe('failure handling and retries', () => {
   it('permanently fails a non-retryable failure', async () => {
     await repo.enqueue({ type: 't', dedupeKey: 'perm' });
