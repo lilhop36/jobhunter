@@ -10,7 +10,7 @@
     "build": "tsc --build",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
-    "verify": "tsc --noEmit && vitest --run",
+    "verify": "node scripts/check-disk-space.mjs && tsc --noEmit && vitest --run",
     "test": "vitest",
     "test:unit": "vitest --run tests/unit",
     "test:integration": "vitest --run tests/integration",
