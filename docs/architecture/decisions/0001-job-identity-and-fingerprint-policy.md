@@ -1,6 +1,6 @@
 # ADR-0001: Job identity, content fingerprints, and duplicate handling
 
-- **Status:** Proposed — awaiting owner/reviewer sign-off
+- **Status:** Approved by the reviewer on 2026-10-13; migration not yet written
 - **Date:** 2026-10-13
 - **Relates to:** SRS v1.1 §5.2, §5.3, §5.4, §5.6, §7.7, §7.8; ENG-002, ENG-005, ENG-025
 - **Blocks:** the collection slice (`RawJob`/`Job` persistence, `RunSourceCollection`)
@@ -149,19 +149,47 @@ WHERE "sourceId" = $1 AND "sourceJobIdentifier" = $2 AND "contentHash" = $3;
 
 `lastSeenAt` is the only column a re-observation writes. It is observation metadata
 owned by the collection stage, not captured evidence, so this does not mutate source
-evidence and is consistent with ENG-002 ("never deleted or mutated by *downstream*
-stages"). No captured field is ever overwritten.
+evidence. ENG-002 reads, verbatim: *"Raw source evidence is preserved. Every accepted
+Job traces to a RawJob, and a RawJob is never deleted or mutated by downstream stages."*
+The constraint is on **downstream** stages; collection is the stage that produces the
+RawJob, and `lastSeenAt` records *last observed by the collection process*, never a
+claim about when the source changed the posting. No captured field is ever overwritten.
+
+`contentHash` and `lastSeenAt` are NOT NULL. Every capture yields a hash (the hash of
+empty content is still a valid, deterministic value), and every row has an observation
+time.
+
+### RawJob insert paths
+
+The insert has **two mutually exclusive statements**, because a partial unique index is
+only inferred by an `ON CONFLICT` whose predicate it can satisfy. The repository picks
+the statement by whether the resolved identifier is present — never a single statement
+with a fallback predicate:
+
+| Record | Index used | Conflict target |
+|--------|-----------|-----------------|
+| Has a source identifier | `one_raw_observation_per_identifier` | `("sourceId","sourceJobIdentifier","contentHash") WHERE "sourceJobIdentifier" IS NOT NULL` |
+| No identifier | `one_raw_observation_per_content` | `("sourceId","contentHash") WHERE "sourceJobIdentifier" IS NULL` |
+
+An identifier-bearing record and a no-identifier record with the same content are
+**not** deduplicated against each other; they are different observation paths. This is
+a documented limitation, not an accident.
 
 ### Job — current state, one per source record
 
+`identityKey` is **NOT NULL**: a Job is only ever created from a record whose identity
+resolved (see *Degenerate records* above), so the constraint makes the policy structural
+rather than conventional — an identity-less Job cannot be inserted at all. Because
+`identityKey` is always present, the index is a **plain** unique index, not a partial one.
+
 ```sql
+ALTER TABLE "jobs" ADD COLUMN "identityKey" text NOT NULL;
+
 CREATE UNIQUE INDEX "one_job_per_source_identity"
-  ON "jobs" ("sourceId", "identityKey")
-  WHERE "identityKey" IS NOT NULL;
+  ON "jobs" ("sourceId", "identityKey");
 
 INSERT INTO "jobs" (...) VALUES (...)
 ON CONFLICT ("sourceId", "identityKey")
-  WHERE "identityKey" IS NOT NULL
 DO UPDATE SET
   "rawJobId" = EXCLUDED."rawJobId",   -- latest evidence version
   "title" = EXCLUDED."title",         -- refreshed normalized fields
@@ -170,10 +198,18 @@ DO UPDATE SET
 RETURNING ...;
 ```
 
+The partial-index alternative was tested and rejected on evidence: a unique index
+`ON ("sourceId","identityKey") WHERE "identityKey" IS NOT NULL` accepts two NULL rows in
+the same source (PostgreSQL treats NULLs as distinct), so it would **not** prevent
+accidental promotion of identity-less Jobs. It was also unnecessary once the column is
+NOT NULL. See §8.
+
 Changed content therefore **updates** the existing Job and repoints `rawJobId` at the
-new evidence row; it does not create a second Job. Because the index includes
-`sourceId`, two sources producing the same key stay separate — no silent cross-source
-merge.
+new evidence row; it does not create a second Job. The earlier capture is retained and
+is still reachable via `raw_jobs` by `(sourceId, sourceJobIdentifier)` ordered by
+`collectedAt`, so the Job's history remains reconstructable even though the FK points at
+the current version only. Because the index includes `sourceId`, two sources producing
+the same key stay separate — no silent cross-source merge.
 
 `Job(canonicalUrl)` and `Job(contentFingerprint)` remain **plain** indexes (§5.6).
 `canonicalUrl` is a duplicate *signal*, never a key: one generic careers URL can
@@ -203,11 +239,19 @@ unhealthy. Until a source has a recorded expectation, `collected == 0` is record
 These are additive and follow the same process used for `Job.provenance`. **The SRS is
 not edited here**; the owner adds the lines.
 
-| Attribute | Table | Why §5.2 does not already cover it |
-|-----------|-------|------------------------------------|
-| `contentHash` | `RawJob` | §5.2 lists no content hash; without one, "identical rerun" and "edited posting" cannot be told apart, so idempotency and ENG-002 cannot both hold |
-| `lastSeenAt` | `RawJob` | §5.2 lists only `collectedAt`; there is no way to distinguish a stale record from a recently observed one |
-| `identityKey` | `Job` | §5.2 lists `contentFingerprint` (content equality) but no source-record identity, so "update the Job on edit" is not representable |
+| Attribute | Table | Nullability | Why §5.2 does not already cover it |
+|-----------|-------|-------------|------------------------------------|
+| `contentHash` | `RawJob` | NOT NULL | §5.2 lists no content hash; without one, "identical rerun" and "edited posting" cannot be told apart, so idempotency and ENG-002 cannot both hold |
+| `lastSeenAt` | `RawJob` | NOT NULL | §5.2 lists only `collectedAt`; there is no way to distinguish a stale record from a recently observed one |
+| `identityKey` | `Job` | NOT NULL | §5.2 lists `contentFingerprint` (content equality) but no source-record identity, so "update the Job on edit" is not representable |
+
+Because all three are NOT NULL, the migration must be explicit about existing rows.
+`raw_jobs` and `jobs` have no production data and no writer yet, but there is also **no
+valid backfill**: `identityKey` and `contentHash` depend on data that was never recorded,
+so inventing values would fabricate identity and violate the data-quality rule. The
+migration therefore adds the columns directly and carries an **emptiness guard** that
+raises if either table already contains rows, so it fails loudly rather than silently
+fabricating identity for existing records.
 
 ## 6. What this policy explicitly does not do
 
@@ -218,28 +262,71 @@ not edited here**; the owner adds the lines.
 - No global unique `contentFingerprint`; it stays a lookup index.
 - No adapter implements any of this until the source approval record is signed.
 
-## 7. Open questions for review
+## 7. Sign-off
 
-1. `Job.identityKey` is defined here as the **source-scoped source-record identity**
-   (concept 1 applied to the Job). It is intentionally *not* the cross-source canonical
-   identity, which is deferred. Confirm, or specify that concept 1 and 3 need separate
-   columns now.
-2. Degenerate records (`identityKey = NULL`) are stored as evidence but not promoted to
-   a Job. Confirm.
-3. Fallback order places a trustworthy canonical URL **ahead of** the content fallback
-   fingerprint, but the reviewer's note also warns against canonical-URL-based
-   uniqueness. The URL is used only when the adapter declares it trustworthy, and never
-   as the sole cross-source signal. Confirm.
-4. `lastSeenAt` is advanced by the collection stage on re-observation, which is the only
-   write a re-observation performs. Confirm this reading of ENG-002.
+Approved by the reviewer on 2026-10-13. The four questions raised in the first draft are
+resolved:
 
-## 8. Verification obligations
+1. **`Job.identityKey` scope — approved.** Source-scoped for the MVP. Cross-source
+   canonical identity is deferred with ENG-005. No merging across sources based on title,
+   company or location. The one condition attached: a source-scoped key must not become a
+   cross-source identity by accident. It cannot here — the index includes `sourceId`, so
+   the same key in two sources is two Jobs and nothing ever unions them.
+2. **Degenerate records — approved.** Stored as evidence, counted `undeduplicable`, not
+   promoted. Enforced structurally by `identityKey NOT NULL`.
+3. **`RawJob.lastSeenAt` — approved provisionally.** Means *last observed by the
+   collection process*, explicitly not when the source last changed the posting. The
+   exact ENG-002 wording is quoted in §3 (constraint is on *downstream* stages).
+4. **Unknown source expectations — approved.** No unexpected-zero-results signal while a
+   source's expected behaviour is unknown; the outcome is still recorded and observable.
+   The expectation is defined explicitly in the source approval record.
 
-- Duplicate ingestion: a rerun of identical content creates no new RawJob and no new Job.
-- Legitimate changed content: a rerun with edited content creates one new RawJob and
-  **updates** the existing Job (no second Job).
-- Field-boundary ambiguity and missing-vs-empty are covered by unit tests on the
-  fingerprint.
-- Distinct sources with identical content stay separate Jobs.
-- Undeduplicable records are counted and never promoted.
-- A hand-written-index guard test covers each new partial index by name and predicate.
+Residual, to be settled when the first real adapter is approved: how a source's expected
+result behaviour is recorded (a value on `JobSource` versus the approval document), and
+which observable signal carries an unexpected zero.
+
+## 8. Verification
+
+### Pre-implementation probe (executed, real PostgreSQL 16, scratch schema)
+
+The exact DDL and statements above were run against the test database in a throwaway
+schema before being proposed. 16 checks, all passing:
+
+| Check | Result |
+|-------|--------|
+| First observation inserts exactly one row | pass |
+| Identical rerun inserts nothing | pass |
+| Re-observation advances `lastSeenAt` without adding a row | pass |
+| Changed content inserts a second capture, first one preserved | pass |
+| Null-identifier record lands via the second index, rerun deduped | pass |
+| Changed content updates the **same** Job and repoints `rawJobId` | pass |
+| Job count stays 1 across a content change | pass |
+| Both raw captures retained (evidence preserved) | pass |
+| Same `identityKey` in a different source stays a separate Job | pass |
+| `identityKey NOT NULL` rejects an identity-less Job | pass |
+| A **partial** index on a nullable key does *not* prevent that promotion | pass (rejected alternative) |
+| **Negative control:** a predicate that does not match its index errors `42P10` | pass |
+
+The negative control is the important one: it shows the other eleven results are
+evidence that the `ON CONFLICT` targets genuinely match their indexes, rather than
+statements that silently did nothing.
+
+### Tests to be written before the corresponding code
+
+1. `RawJobRepository`, on real PostgreSQL: duplicate ingestion is a no-op; changed
+   content adds one row; `lastSeenAt` advances on re-observation; the two insert paths
+   are both exercised; a no-identifier record never collides with an identifier-bearing
+   one.
+2. `JobRepository`: rerun with identical content leaves one Job; changed content updates
+   the same Job and repoints `rawJobId`; two sources with the same `identityKey` stay
+   separate; `identityKey` absent is rejected rather than promoted.
+3. Funnel counters (§7.8) across all of the above, including `undeduplicable`.
+4. Extension of `tests/failure/worker-kill.spec.ts` to the collection path: kill mid-run,
+   reap, rerun, and assert no duplicate `RawJob` or `Job` rows and consistent funnel
+   counts.
+5. `GUARDED_PARTIAL_INDEXES` in `tests/integration/partial-indexes.spec.ts` gains the two
+   new `raw_jobs` indexes by name *and* predicate; the Job index is asserted as a plain
+   unique index (it has no predicate by design).
+
+Index/page-level behaviour is Postgres's own; job-identity resolution logic is already
+covered by 24 unit tests in `tests/unit/job-identity.spec.ts`.
