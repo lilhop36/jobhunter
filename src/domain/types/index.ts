@@ -7,3 +7,4 @@ export * from './raw-job-evidence';
 export * from './normalized-job';
 export * from './source-health';
 export * from './work-task';
+export * from './source-run';

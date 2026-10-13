@@ -14,3 +14,5 @@ export * from './remote-status.enum';
 export * from './provenance-source.enum';
 export * from './health-status.enum';
 export * from './work-task-status.enum';
+export * from './source-run-status.enum';
+export * from './source-run-trigger.enum';
