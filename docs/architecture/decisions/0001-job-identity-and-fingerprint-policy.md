@@ -423,3 +423,74 @@ covered by 24 unit tests in `tests/unit/job-identity.spec.ts`.
   final report accompanying the change. The URL-trust tests are the guard for the
   declaration: removing it makes `resolveSourceRecordIdentity` fall through to `fp:` and the
   `uses the canonical url only when the adapter declares it trustworthy` test fails.
+
+## 9. The collection use case (`RunSourceCollection`)
+
+`src/application/ingestion/run-source-collection.ts` performs SRS 7.7 for one source and
+records the SRS 7.8 funnel. It computes every fingerprint and identity key here, in the
+domain, and passes them to the repositories; no repository invents one.
+
+### Deliberate deviation from the literal SRS 7.7 ordering
+
+SRS 7.7 numbers "acquire source content" (1) and "apply source rate limits" (2) before
+"create SourceRun" (3). This implementation **opens the run first**, for three reasons:
+
+1. SRS 7.6 requires source-level exclusivity *for collection*. The run row is that lock,
+   so it must be taken before any network work or two workers can collect one source.
+2. `CollectionContext.sourceRunId` is required by the reviewed adapter port, so the
+   adapter cannot be called without a run.
+3. An acquisition failure would otherwise leave no record at all, and the SRS 7.8 "HTTP
+   failures" metric could never be populated.
+
+The run is a plain row, never a long transaction: no transaction is held across the
+network call or across records. This is recorded as a deviation rather than hidden.
+
+### Step 10 is not performed
+
+"Schedul[ing] enrichment/matching work" is deferred: those stages do not exist yet, and
+enqueueing work for an unregistered handler produces guaranteed permanent failures. A
+documented gap is better than invented failures.
+
+### Funnel mapping
+
+| SRS 7.8 stage | Source | Persisted as |
+|---------------|--------|--------------|
+| `collected` | records the adapter returned | `jobsDiscovered` |
+| `parsed` | records whose `normalize` did not throw | derived: `jobsDiscovered - parseFailures` |
+| `valid` | records passing collection-time validation (`= parsed` today) | not persisted; equals `parsed` |
+| `unique` | records that created a Job | `jobsAccepted` |
+| — | records deduped into an existing Job | `jobsDuplicate` |
+| — | identity-less records | `undeduplicable` |
+| — | identity on the `fp:` basis | `fallbackIdentities` |
+
+The arithmetic `collected = parsed + parseFailures` and
+`parsed = valid = unique + duplicates + undeduplicable` is asserted in
+`tests/integration/collection-idempotency.spec.ts`, so a record cannot vanish between
+stages.
+
+`jobsRejected` is always `0`: the SRS defines no collection-time rejection rule, and
+Appendix E is explicit that an `UNUSABLE` description is persisted "for traceability and
+funnel metrics". Collection must not discard it.
+
+### Status derivation
+
+| Condition | Status |
+|-----------|--------|
+| acquisition failed | `FAILED`, `httpFailures = 1`, concrete error in `errorSummary` |
+| aborted by worker shutdown (during acquisition or mid-loop) | `PARTIAL`, no HTTP failure claimed, so no false source fault |
+| zero collected and the source declared `RESULTS_EXPECTED` | `PARTIAL`, `unexpectedZeroResults = true` |
+| one or more records failed to normalize | `PARTIAL` |
+| otherwise | `SUCCEEDED` |
+
+An identity-less record does **not** by itself make a run `PARTIAL`. The SRS defines no
+such acceptance criterion; the outcome is carried by the `undeduplicable` counter
+instead, which avoids inventing a health rule.
+
+### Crash safety
+
+An abandoned run is recovered by reaping runs still active beyond `staleRunSeconds`
+*before* opening the new one (ENG-025, SRS 7.6), which is why that input is required.
+Recovery is also what makes a retried attempt idempotent: identical evidence conflicts on
+the partial indexes and only `lastSeenAt` advances, and a Job keyed by the same identity
+is refreshed rather than duplicated.
+
