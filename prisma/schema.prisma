@@ -1,0 +1,331 @@
+// JobHunter v1.0 — Prisma schema (Milestone 1: ingestion data model)
+//
+// Source of truth: docs/SRS/JobHunter-v1.0-SRS.md
+//   - 5.2 Entity Attributes (JobSource, SourceRun, RawJob, Job, SystemLog)
+//   - 5.6 Index requirements
+//   - 7.5 Durable work and locking
+//
+// NOTE: `one_active_run_per_source` (partial unique index) and the work-queue
+// claim helpers are NOT expressible in the Prisma schema. They live in
+// prisma/migrations/**/migration.sql as raw SQL. Do not let `prisma migrate`
+// drop them: review generated SQL before applying.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums (mirror src/domain/enums/*)
+// ---------------------------------------------------------------------------
+
+enum LifecycleStatus {
+  ACTIVE
+  EXPIRED
+  REMOVED
+  NOT_FOUND
+}
+
+enum CalendarType {
+  GREGORIAN
+  ETHIOPIAN
+  UNKNOWN
+}
+
+enum SalaryType {
+  EXACT
+  RANGE
+  STARTING_FROM
+  UP_TO
+  NEGOTIABLE
+  NOT_DISCLOSED
+  AS_PER_SCALE
+  UNKNOWN
+}
+
+enum SalaryPeriod {
+  HOUR
+  DAY
+  WEEK
+  MONTH
+  YEAR
+  OTHER
+  UNKNOWN
+}
+
+enum LocationCategory {
+  ADDIS_ABABA
+  ETHIOPIA_CITY
+  ETHIOPIA_REGION
+  ETHIOPIA_REMOTE
+  INTERNATIONAL_REMOTE
+  INTERNATIONAL_ON_SITE
+  HYBRID
+  UNKNOWN
+}
+
+enum EvidenceState {
+  KNOWN
+  UNKNOWN
+  CONFLICTING
+}
+
+enum SkillEvidence {
+  EXACT_MATCH
+  CANONICAL_ALIAS
+  RELATED_SKILL
+  TRANSFERABLE
+  AI_SUGGESTED
+  UNKNOWN
+}
+
+enum AIStatus {
+  SUCCESS
+  TIMEOUT
+  UNAVAILABLE
+  INVALID_OUTPUT
+  SCHEMA_ERROR
+  PROVIDER_ERROR
+  FALLBACK
+}
+
+enum NotificationStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum ApplicationMethod {
+  ONLINE_URL
+  EMAIL
+  SOURCE_ACCOUNT
+  PDF_FORM
+  IN_PERSON
+  INSTRUCTIONS
+  UNKNOWN
+}
+
+enum DescriptionQuality {
+  SUFFICIENT
+  PARTIAL
+  UNUSABLE
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+  TEMPORARY
+  FREELANCE
+  UNKNOWN
+}
+
+enum RemoteStatus {
+  ONSITE
+  REMOTE
+  HYBRID
+  UNKNOWN
+}
+
+enum ProvenanceSource {
+  SOURCE
+  DETERMINISTIC
+  AI
+}
+
+// Engineering-owned state machines (not defined in the SRS).
+enum HealthStatus {
+  HEALTHY
+  DEGRADED
+  FAILING
+  UNKNOWN
+}
+
+enum SourceRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  PARTIAL
+}
+
+enum SourceRunTrigger {
+  SCHEDULE
+  MANUAL
+  STARTUP
+}
+
+enum WorkTaskStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DEAD_LETTER
+}
+
+// ---------------------------------------------------------------------------
+// M1 tables
+// ---------------------------------------------------------------------------
+
+model JobSource {
+  id                  String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                String       @unique
+  adapterType         String
+  adapterVersion      String
+  enabled             Boolean      @default(true)
+  accessPolicy        Json?
+  schedule            String?
+  healthStatus        HealthStatus @default(UNKNOWN)
+  lastSuccessfulRunAt DateTime?
+  lastErrorAt         DateTime?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  runs SourceRun[]
+  raw  RawJob[]
+  jobs Job[]
+
+  @@map("job_sources")
+}
+
+model SourceRun {
+  id                    String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceId              String           @db.Uuid
+  status                SourceRunStatus  @default(RUNNING)
+  trigger               SourceRunTrigger @default(SCHEDULE)
+  startedAt             DateTime         @default(now())
+  finishedAt            DateTime?
+  durationMs            Int?
+  jobsDiscovered        Int              @default(0)
+  jobsAccepted          Int              @default(0)
+  jobsDuplicate         Int              @default(0)
+  jobsRejected          Int              @default(0)
+  parseFailures         Int              @default(0)
+  httpFailures          Int              @default(0)
+  unexpectedZeroResults Boolean          @default(false)
+  errorSummary          String?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  source  JobSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  rawJobs RawJob[]
+  tasks   WorkTask[]
+
+  @@index([sourceId, startedAt])
+  @@map("source_runs")
+}
+
+model RawJob {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceId             String   @db.Uuid
+  sourceRunId          String?  @db.Uuid
+  sourceJobIdentifier  String?
+  sourceUrl            String?
+  rawTitle             String?
+  rawCompany           String?
+  rawLocation          String?
+  rawDescription       String?
+  rawPublishedDateText String?
+  rawSalaryText        String?
+  rawPayload           Json?
+  collectedAt          DateTime @default(now())
+  createdAt            DateTime @default(now())
+
+  source    JobSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  sourceRun SourceRun? @relation(fields: [sourceRunId], references: [id], onDelete: SetNull)
+  jobs      Job[]
+
+  @@index([sourceId, sourceJobIdentifier])
+  @@index([sourceRunId])
+  @@map("raw_jobs")
+}
+
+model Job {
+  id                        String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceId                  String              @db.Uuid
+  rawJobId                  String?             @db.Uuid
+  canonicalUrl              String?
+  title                     String?
+  company                   String?
+  description               String?
+  descriptionQuality        DescriptionQuality
+  locationText              String?
+  locationCategory          LocationCategory    @default(UNKNOWN)
+  publishedCalendar         CalendarType        @default(UNKNOWN)
+  originalPublishedDateText String?
+  publishedAt               DateTime?
+  dateConfidence            Decimal?            @db.Decimal(4, 3)
+  salaryType                SalaryType          @default(UNKNOWN)
+  salaryMin                 Decimal?            @db.Decimal(14, 2)
+  salaryMax                 Decimal?            @db.Decimal(14, 2)
+  salaryCurrency            String?
+  salaryPeriod              SalaryPeriod        @default(UNKNOWN)
+  salaryEvidence            String?
+  salaryConfidence          Decimal?            @db.Decimal(4, 3)
+  employmentType            EmploymentType      @default(UNKNOWN)
+  remoteStatus              RemoteStatus        @default(UNKNOWN)
+  applicationMethod         ApplicationMethod   @default(UNKNOWN)
+  applyUrl                  String?
+  applyEmail                String?
+  lifecycleStatus           LifecycleStatus     @default(ACTIVE)
+  contentFingerprint        String?
+  createdAt                 DateTime            @default(now())
+  updatedAt                 DateTime            @updatedAt
+
+  source JobSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  rawJob RawJob?   @relation(fields: [rawJobId], references: [id], onDelete: SetNull)
+
+  // SRS 5.6 index requirements.
+  @@index([canonicalUrl])
+  @@index([contentFingerprint])
+  @@index([sourceId, lifecycleStatus])
+  @@index([publishedAt])
+  @@map("jobs")
+}
+
+model WorkTask {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type           String
+  payload        Json?
+  dedupeKey      String?        @unique
+  status         WorkTaskStatus @default(PENDING)
+  priority       Int            @default(0)
+  attempts       Int            @default(0)
+  maxAttempts    Int            @default(5)
+  runAfter       DateTime       @default(now())
+  lockedAt       DateTime?
+  lockedBy       String?
+  leaseExpiresAt DateTime?
+  sourceRunId    String?        @db.Uuid
+  lastError      String?
+  lastErrorAt    DateTime?
+  createdAt      DateTime       @default(now())
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  updatedAt      DateTime       @updatedAt
+
+  sourceRun SourceRun? @relation(fields: [sourceRunId], references: [id], onDelete: SetNull)
+
+  @@index([status, runAfter, priority])
+  @@index([leaseExpiresAt])
+  @@map("work_tasks")
+}
+
+model SystemLog {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  level     String
+  area      String
+  message   String
+  context   Json?
+  createdAt DateTime @default(now())
+
+  @@index([level, createdAt])
+  @@index([area, createdAt])
+  @@map("system_logs")
+}
