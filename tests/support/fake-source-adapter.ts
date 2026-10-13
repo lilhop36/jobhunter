@@ -7,8 +7,8 @@ import {
   ProvenanceSource,
   SalaryType,
 } from '@domain/enums';
-import type { DateParsed, HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
-import { asProbability } from '@domain/types';
+import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
+import { parseDate } from '@domain/normalizers/calendar';
 import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
 import { canonicalizeUrl, contentFingerprint } from '@domain/normalizers/url-normalizer';
@@ -27,6 +27,7 @@ export function makeFakeConfig(overrides: Partial<SourceAdapterConfig> = {}): So
     adapterVersion: '1.0.0',
     accessMechanism: 'API',
     declaredCalendar: CalendarType.UNKNOWN,
+    declaredDateFormat: null,
     declaredCurrency: null,
     options: {},
     ...overrides,
@@ -81,15 +82,14 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       .join(' ');
     const fingerprint = fingerprintInput ? contentFingerprint(fingerprintInput) : null;
 
-    // No Gregorian parser exists yet, so dates are not guessed. This exercises
-    // the "UNKNOWN is a valid state" path (ENG-001).
-    const publishedDate: DateParsed = {
-      calendar: CalendarType.UNKNOWN,
-      publishedAt: null,
-      originalText: raw.rawPublishedDateText,
-      confidence: asProbability(0),
-      conversionMethod: null,
-    };
+    // Delegated to the shared date normalizer (ENG-016); no calendar is guessed
+    // without an explicit signal, so this exercises "UNKNOWN is a valid state".
+    const publishedDate = parseDate({
+      text: raw.rawPublishedDateText,
+      sourceCalendarHint: this.config.declaredCalendar,
+      declaredDateFormat: this.config.declaredDateFormat,
+      collectedAt: raw.collectedAt,
+    });
 
     const provenance: NormalizedJob['provenance'] = {};
     if (canonicalUrl) {
@@ -131,6 +131,25 @@ export class FakeSourceAdapter implements JobSourceAdapter {
         conversionMethod: 'LOCATION_GAZETTEER_V1',
         evidence: raw.rawLocation,
       };
+    }
+    if (publishedDate.calendar !== CalendarType.UNKNOWN) {
+      provenance.originalPublishedDateText = {
+        provenance: ProvenanceSource.SOURCE,
+        conversionMethod: null,
+        evidence: raw.rawPublishedDateText,
+      };
+      provenance.publishedCalendar = {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: publishedDate.conversionMethod,
+        evidence: raw.rawPublishedDateText,
+      };
+      if (publishedDate.publishedAt) {
+        provenance.publishedAt = {
+          provenance: ProvenanceSource.DETERMINISTIC,
+          conversionMethod: publishedDate.conversionMethod,
+          evidence: raw.rawPublishedDateText,
+        };
+      }
     }
     if (salary.type !== SalaryType.UNKNOWN) {
       provenance.salaryType = {

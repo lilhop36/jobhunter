@@ -1,5 +1,5 @@
 import { CalendarType } from '@domain/enums';
-import { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
+import { DeclaredDateFormat, HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
 import { WorkerLogger } from './worker-logger';
 
 /**
@@ -26,6 +26,13 @@ export interface SourceAdapterConfig {
    * overrides per-item evidence (SRS Appendix E, "Calendar detection").
    */
   declaredCalendar: CalendarType;
+  /**
+   * Declared numeric date format used only as an explicit signal for
+   * otherwise-ambiguous numeric dates, or null when the source declares none
+   * (SRS Appendix E, "Calendar detection"). Requires `declaredCalendar` to be
+   * declared as well; the shared date normalizer never guesses the order.
+   */
+  declaredDateFormat: DeclaredDateFormat | null;
   /**
    * Declared ISO-4217 currency used only as an explicit signal, or null when
    * the source declares none (SRS Appendix E, "Salary currency and period").

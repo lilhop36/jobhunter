@@ -121,6 +121,20 @@ function monthFromText(text: string, lower: string): number | null {
 }
 
 /**
+ * True when the text carries an explicit Ethiopian-calendar signal: an
+ * Ethiopian month name, or an era marker such as E.C. / ዓ.ም. Shared with the
+ * date facade so calendar routing uses exactly one definition (SRS Appendix E).
+ */
+export function hasEthiopianTextSignal(text: string | null | undefined): boolean {
+  if (text === null || text === undefined) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  const hasEraMarker = /(?:^|\b)e\.?c\.?\b|ዓ\.ም|ዓም/i.test(lower);
+  return hasEraMarker || hasAmharicMonthName(trimmed) || hasLatinMonthName(lower);
+}
+
+/**
  * Deterministically convert an Ethiopian-calendar date string to Gregorian.
  * Only explicit signals (month name, era marker, source hint) qualify; anything
  * else returns UNKNOWN. Invalid dates return UNKNOWN. Never throws.
@@ -131,11 +145,8 @@ export function parseEthiopianDate(input: EthiopianParseInput): DateParsed {
   if (!originalText) return unknownResult(null);
 
   const lower = originalText.toLowerCase();
-  const hasEraMarker = /(?:^|\b)e\.?c\.?\b|ዓ\.ም|ዓም/i.test(lower);
-  const hasAmharicMonth = hasAmharicMonthName(originalText);
-  const hasLatinMonth = hasLatinMonthName(lower);
   const hasSourceHint = input.sourceCalendarHint === CalendarType.ETHIOPIAN;
-  const hasExplicit = hasEraMarker || hasAmharicMonth || hasLatinMonth || hasSourceHint;
+  const hasExplicit = hasEthiopianTextSignal(originalText) || hasSourceHint;
 
   if (!hasExplicit) return unknownResult(originalText);
 

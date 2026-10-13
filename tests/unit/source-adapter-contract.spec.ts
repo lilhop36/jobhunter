@@ -1,3 +1,4 @@
+import { CalendarType } from '@domain/enums';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 
@@ -57,6 +58,18 @@ describe('JobSourceAdapter contract', () => {
     expect(job.provenance.canonicalUrl?.provenance).toBe('DETERMINISTIC');
     expect(job.provenance.locationCategory?.conversionMethod).toBe('LOCATION_GAZETTEER_V1');
     expect(job.provenance.salaryType?.provenance).toBe('DETERMINISTIC');
+  });
+
+  it('delegates dates to the shared normalizer and records their provenance', async () => {
+    const adapter = new FakeSourceAdapter(
+      makeFakeConfig({ declaredCalendar: CalendarType.GREGORIAN, declaredDateFormat: 'DD/MM/YYYY' }),
+    );
+    const job = await adapter.normalize(makeRawJob({ rawPublishedDateText: '05/01/2025' }));
+
+    expect(job.publishedDate.calendar).toBe('GREGORIAN');
+    expect(job.publishedDate.publishedAt?.toISOString()).toBe('2025-01-05T00:00:00.000Z');
+    expect(job.provenance.publishedCalendar?.provenance).toBe('DETERMINISTIC');
+    expect(job.provenance.originalPublishedDateText?.provenance).toBe('SOURCE');
   });
 
   it('never fabricates: absent evidence stays UNKNOWN / null', async () => {
