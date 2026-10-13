@@ -275,13 +275,16 @@ model Job {
   applyEmail                String?
   lifecycleStatus           LifecycleStatus     @default(ACTIVE)
   contentFingerprint        String?
+  // Per-field origin map: field name -> { provenance, conversionMethod, evidence }
+  // (SRS ENG-003 / Appendix E). Written by the ingestion pipeline.
+  provenance                Json?
   createdAt                 DateTime            @default(now())
   updatedAt                 DateTime            @updatedAt
 
   source JobSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
   rawJob RawJob?   @relation(fields: [rawJobId], references: [id], onDelete: SetNull)
 
-  // SRS 5.6 index requirements.
+  // SRS 5.6 database requirements.
   @@index([canonicalUrl])
   @@index([contentFingerprint])
   @@index([sourceId, lifecycleStatus])
