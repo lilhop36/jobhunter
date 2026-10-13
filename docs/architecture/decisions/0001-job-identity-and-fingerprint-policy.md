@@ -412,17 +412,34 @@ covered by 24 unit tests in `tests/unit/job-identity.spec.ts`.
 
 ### What has actually been implemented
 
-- **Increment 1 — schema and repositories** (`0f60ae8`, `c6539da`): the migration, both
+- **Increment 1 - schema and repositories** (`0f60ae8`, `c6539da`): the migration, both
   repositories, and the extended index guard. `partial-indexes.spec.ts` now guards the two
   `raw_jobs` partial indexes by name *and* predicate, and asserts
   `one_job_per_source_identity` is a **plain** unique index with no predicate.
-  Mutation-checked: pointing the identifier insert's `ON CONFLICT` at the other predicate
-  fails with `42P10 (*no unique or exclusion constraint matching the ON CONFLICT
-  specification*)`; swapping the Job index for a partial one fails the guard.
-- **Increment 2 — URL trust, identity resolution and the collection pipeline**: see the
-  final report accompanying the change. The URL-trust tests are the guard for the
-  declaration: removing it makes `resolveSourceRecordIdentity` fall through to `fp:` and the
-  `uses the canonical url only when the adapter declares it trustworthy` test fails.
+  Mutation-checked, twice, and the results differ in a way worth recording:
+  - pointing the identifier insert's `ON CONFLICT` at the *other* predicate
+    (`("sourceId","contentHash") WHERE "sourceJobIdentifier" IS NULL`) does **not** raise
+    `42P10`. That arbiter *does* match `one_raw_observation_per_content`, so the statement
+    is accepted, the identifier-bearing row is simply not deduplicated, and PostgreSQL
+    reports `23505` on `one_raw_observation_per_identifier`. Two tests fail. This is a
+    stronger demonstration than a syntax-level error: the two insert paths must each be
+    paired with their own index, and mispairing them silently loses the guarantee.
+  - pointing the arbiter at a column set that matches **no** index
+    (`ON CONFLICT ("sourceId")`) raises `42P10 (*there is no unique or exclusion constraint
+    matching the ON CONFLICT specification*)`. Four tests fail.
+  - swapping the Job index for a partial one fails the guard
+    (`one_job_per_source_identity must not be partial: a unique index on a nullable column
+    accepts repeated NULLs`).
+- **Increment 2 - URL trust, identity resolution and the collection pipeline**
+  (`1a9fadd`, `e20c5df`, `bcf00f4`, `82fab16`, `52c945e`): see section 9 and the final
+  report accompanying the change. Mutation-checked as well:
+  - removing the URL-trust gate (`trustworthyCanonicalUrl: request.job.canonicalUrl`)
+    fails 3 tests across 2 files, including the end-to-end
+    `uses the canonical url as identity only when the adapter declares it trustworthy`;
+  - weakening the sparse-identity rule (dropping `nonEmptyFieldCount < 2`) fails 3 tests;
+  - persisting raw evidence only after a record parses - the shape a wrong implementation
+    would actually take - fails with `expected 1 to be 2` and `expected 3 to be 4`, i.e.
+    the funnel and evidence counts, not a crash.
 
 ## 9. The collection use case (`RunSourceCollection`)
 
@@ -493,4 +510,32 @@ An abandoned run is recovered by reaping runs still active beyond `staleRunSecon
 Recovery is also what makes a retried attempt idempotent: identical evidence conflicts on
 the partial indexes and only `lastSeenAt` advances, and a Job keyed by the same identity
 is refreshed rather than duplicated.
+
+`tests/failure/collection-crash.spec.ts` demonstrates this against a real process rather
+than a simulation. The real worker and the real use case run in a child process, and the
+child is killed with `SIGKILL` while its adapter is blocked normalizing the third of four
+records. The block point is chosen so the durable state is unambiguous instead of
+timing-based: raw evidence is written before `normalize` is entered, so the observed state
+is exactly "3 raw captures, 2 Jobs, run still RUNNING". Synchronization is on that state
+and on database-clock expiry; no sleeps are used. The state is also reachable only once,
+which is what makes the kill deterministic: raw row 3 is inserted, then the promise never
+settles, so the process stays at that state until it is killed.
+
+What the test asserts, after the kill:
+
+- the run is still `RUNNING` with `finishedAt = NULL` - wedged, not falsely completed - and
+  the work task still belongs to the dead worker;
+- the blocked record's raw evidence is durable while its Job is absent, so the crash lost
+  nothing and claimed nothing;
+- recovery proceeds only after the run genuinely exceeds its safety bound *and* the dead
+  lease lapses, both evaluated on the database clock;
+- the abandoned run ends `FAILED` / `LEASE_EXPIRED`, exactly one further run records
+  `jobsDiscovered 4, jobsAccepted 2, jobsDuplicate 2` (the crashed attempt's two promoted
+  Jobs are correctly seen as duplicates), and the task ends `SUCCEEDED` on attempt 2;
+- `raw_jobs` and `jobs` each end with exactly 4 rows, so the partial first attempt did not
+  duplicate anything.
+
+Stage 6 of the harness extends the existing `worker-kill` child-process pattern rather
+than inventing a new one, and `afterEach` kills and awaits the child so a failing
+assertion cannot leak the process. The file passed on three consecutive runs.
 
