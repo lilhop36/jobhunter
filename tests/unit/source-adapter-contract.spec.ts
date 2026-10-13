@@ -1,4 +1,5 @@
 import { CalendarType } from '@domain/enums';
+import { contentFingerprintV1 } from '@domain/normalizers/job-identity';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 
@@ -92,6 +93,31 @@ describe('JobSourceAdapter contract', () => {
     expect(job.application.method).toBe('UNKNOWN');
     expect(job.contentFingerprint).toBeNull();
     expect(job.provenance).toEqual({});
+  });
+
+  it('derives the content fingerprint from the versioned module, not the legacy hash', async () => {
+    const adapter = new FakeSourceAdapter(makeFakeConfig());
+    const job = await adapter.normalize(
+      makeRawJob({
+        sourceUrl: 'https://example.com/jobs/9',
+        rawTitle: 'Backend Engineer',
+        rawCompany: 'Acme',
+      }),
+    );
+
+    // The legacy value was a short 32-bit base36 hash (unknown-collision-prone); the
+    // versioned one is tagged and a full SHA-256 digest, so a reintroduction of the legacy
+    // function cannot satisfy this assertion.
+    expect(job.contentFingerprint).toMatch(/^v1:content:[0-9a-f]{64}$/);
+    expect(job.contentFingerprint).toBe(
+      contentFingerprintV1({
+        title: 'Backend Engineer',
+        company: 'Acme',
+        locationText: null,
+        description: null,
+        canonicalUrl: 'https://example.com/jobs/9',
+      }),
+    );
   });
 
   it('healthCheck uses the injected clock and reports the sample it saw', async () => {

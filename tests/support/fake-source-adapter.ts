@@ -11,7 +11,8 @@ import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types'
 import { parseDate } from '@domain/normalizers/calendar';
 import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
-import { canonicalizeUrl, contentFingerprint } from '@domain/normalizers/url-normalizer';
+import { contentFingerprintV1 } from '@domain/normalizers/job-identity';
+import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type {
   CollectionContext,
   HealthCheckContext,
@@ -79,10 +80,29 @@ export class FakeSourceAdapter implements JobSourceAdapter {
     const location = classifyLocation({ text: raw.rawLocation });
     const salary = parseSalary(raw.rawSalaryText);
 
-    const fingerprintInput = [raw.rawTitle, raw.rawCompany, raw.rawDescription]
-      .filter((value): value is string => Boolean(value))
-      .join(' ');
-    const fingerprint = fingerprintInput ? contentFingerprint(fingerprintInput) : null;
+    // Delegated to the shared versioned fingerprint module (ENG-016, ADR-0001). The legacy
+    // 32-bit `contentFingerprint` in url-normalizer.ts is unsafe even as a lookup key and
+    // must not reappear here.
+    //
+    // Unlike `rawContentHash`, an all-absent record yields null rather than a digest of
+    // nothing: `Job.contentFingerprint` is nullable and "no evidence" must stay
+    // distinguishable from "evidence that happens to be empty" (ENG-001).
+    const hasFingerprintInput = [
+      raw.rawTitle,
+      raw.rawCompany,
+      raw.rawLocation,
+      raw.rawDescription,
+      canonicalUrl,
+    ].some((value) => Boolean(value && value.trim()));
+    const fingerprint = hasFingerprintInput
+      ? contentFingerprintV1({
+          title: raw.rawTitle,
+          company: raw.rawCompany,
+          locationText: raw.rawLocation,
+          description: raw.rawDescription,
+          canonicalUrl,
+        })
+      : null;
 
     // Delegated to the shared date normalizer (ENG-016); no calendar is guessed
     // without an explicit signal, so this exercises "UNKNOWN is a valid state".
