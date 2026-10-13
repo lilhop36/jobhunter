@@ -135,6 +135,31 @@ class AbortAfterCollectAdapter implements JobSourceAdapter {
   }
 }
 
+/** Aborts the run's signal and then fails acquisition - i.e. shutdown during acquisition. */
+class AbortDuringCollectAdapter implements JobSourceAdapter {
+  constructor(
+    private readonly inner: JobSourceAdapter,
+    private readonly controller: AbortController,
+  ) {}
+
+  get config() {
+    return this.inner.config;
+  }
+
+  async collect(): Promise<RawJobEvidence[]> {
+    this.controller.abort();
+    throw new Error('socket closed during shutdown');
+  }
+
+  normalize(raw: RawJobEvidence) {
+    return this.inner.normalize(raw);
+  }
+
+  healthCheck(context: HealthCheckContext) {
+    return this.inner.healthCheck(context);
+  }
+}
+
 /** Fails acquisition outright. */
 class FailingCollectAdapter implements JobSourceAdapter {
   constructor(
@@ -414,6 +439,28 @@ describe('RunSourceCollection', () => {
     expect(result.status).toBe(SourceRunStatus.PARTIAL);
     expect(result.funnel).toMatchObject({ collected: 1, unique: 0, httpFailures: 0 });
     expect(result.run?.errorSummary).toContain('abort');
+    expect(await countEvidence(sourceId)).toBe(0);
+  });
+
+  it('treats an acquisition abort as PARTIAL without claiming a source fault', async () => {
+    const sourceId = await createSource();
+    const controller = new AbortController();
+    const adapter = new AbortDuringCollectAdapter(makeAdapter(sourceId, []), controller);
+
+    const result = await collection.run({
+      adapter,
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      signal: controller.signal,
+    });
+
+    // Contrast with the acquisition-failure case above: shutdown is not the source's
+    // fault, so no HTTP failure is recorded even though collect threw.
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.funnel.httpFailures).toBe(0);
+    expect(result.run?.httpFailures).toBe(0);
+    expect(result.run?.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.run?.errorSummary).toContain('aborted during acquisition');
     expect(await countEvidence(sourceId)).toBe(0);
   });
 
