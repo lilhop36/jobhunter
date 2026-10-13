@@ -28,6 +28,8 @@ const HEALTHY_RUN: SourceRunOutcome = {
   jobsAccepted: 7,
   jobsDuplicate: 3,
   jobsRejected: 2,
+  undeduplicable: 0,
+  fallbackIdentities: 0,
   parseFailures: 1,
   httpFailures: 0,
   unexpectedZeroResults: false,

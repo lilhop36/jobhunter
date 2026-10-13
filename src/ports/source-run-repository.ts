@@ -21,6 +21,10 @@ export interface SourceRunOutcome {
   jobsAccepted: number;
   jobsDuplicate: number;
   jobsRejected: number;
+  /** Records preserved as raw evidence but not promoted because no identity resolved. */
+  undeduplicable: number;
+  /** Records whose resolved identity rests on the `fp:` fallback basis. */
+  fallbackIdentities: number;
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;

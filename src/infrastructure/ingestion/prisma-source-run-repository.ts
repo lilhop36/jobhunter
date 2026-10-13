@@ -38,7 +38,8 @@ const DURATION_MS = Prisma.raw(
 const SOURCE_RUN_COLUMNS = Prisma.raw(`
   "id", "sourceId", "status"::text AS "status", "trigger"::text AS "trigger",
   "startedAt", "finishedAt", "durationMs", "jobsDiscovered", "jobsAccepted",
-  "jobsDuplicate", "jobsRejected", "parseFailures", "httpFailures",
+  "jobsDuplicate", "jobsRejected", "undeduplicable", "fallbackIdentities",
+  "parseFailures", "httpFailures",
   "unexpectedZeroResults", "errorSummary"
 `);
 
@@ -58,6 +59,8 @@ interface SourceRunRow {
   jobsAccepted: number;
   jobsDuplicate: number;
   jobsRejected: number;
+  undeduplicable: number;
+  fallbackIdentities: number;
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
@@ -81,6 +84,8 @@ function toRecord(row: SourceRunRow): SourceRunRecord {
     jobsAccepted: row.jobsAccepted,
     jobsDuplicate: row.jobsDuplicate,
     jobsRejected: row.jobsRejected,
+    undeduplicable: row.undeduplicable,
+    fallbackIdentities: row.fallbackIdentities,
     parseFailures: row.parseFailures,
     httpFailures: row.httpFailures,
     unexpectedZeroResults: row.unexpectedZeroResults,
@@ -145,6 +150,8 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
           "jobsAccepted" = ${outcome.jobsAccepted},
           "jobsDuplicate" = ${outcome.jobsDuplicate},
           "jobsRejected" = ${outcome.jobsRejected},
+          "undeduplicable" = ${outcome.undeduplicable},
+          "fallbackIdentities" = ${outcome.fallbackIdentities},
           "parseFailures" = ${outcome.parseFailures},
           "httpFailures" = ${outcome.httpFailures},
           "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},

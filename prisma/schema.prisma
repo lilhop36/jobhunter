@@ -206,6 +206,8 @@ model SourceRun {
   jobsAccepted          Int              @default(0)
   jobsDuplicate         Int              @default(0)
   jobsRejected          Int              @default(0)
+  undeduplicable        Int              @default(0)
+  fallbackIdentities    Int              @default(0)
   parseFailures         Int              @default(0)
   httpFailures          Int              @default(0)
   unexpectedZeroResults Boolean          @default(false)
