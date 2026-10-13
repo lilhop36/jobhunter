@@ -12,4 +12,5 @@ export * from './description-quality.enum';
 export * from './employment-type.enum';
 export * from './remote-status.enum';
 export * from './provenance-source.enum';
+export * from './health-status.enum';
 export * from './work-task-status.enum';
