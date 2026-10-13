@@ -29,6 +29,8 @@ export function makeFakeConfig(overrides: Partial<SourceAdapterConfig> = {}): So
     declaredCalendar: CalendarType.UNKNOWN,
     declaredDateFormat: null,
     declaredCurrency: null,
+    // Conservative default: URL identity is never inherited, it must be declared.
+    canonicalUrlIdentityTrusted: false,
     options: {},
     ...overrides,
   };

@@ -38,6 +38,20 @@ export interface SourceAdapterConfig {
    * the source declares none (SRS Appendix E, "Salary currency and period").
    */
   declaredCurrency: string | null;
+  /**
+   * Declares whether this source's job URLs are canonical *job-detail* URLs suitable as a
+   * source-record identity basis (ADR-0001 concept 1).
+   *
+   * Set this only from a signed source approval record that has verified the adapter's
+   * `sourceUrl` is stable across re-collection for the same posting, and is not a listing
+   * page, a paginated page, or a shared careers URL fronting many postings. When false the
+   * pipeline skips URL identity entirely and moves to the title/company/location fallback.
+   *
+   * Required, and with no default, so a source cannot silently inherit URL trust it never
+   * verified. It is the declaration the identity resolver will not assume (see
+   * `resolveSourceRecordIdentity`).
+   */
+  canonicalUrlIdentityTrusted: boolean;
   /** Adapter-specific options (feed URL, selectors, ...); opaque to the pipeline. */
   options: Readonly<Record<string, unknown>>;
 }

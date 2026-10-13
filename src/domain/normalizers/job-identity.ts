@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import type { NormalizedJob } from '../types';
+import { urlIdentityValue } from './url-normalizer';
 
 /**
  * Versioned job fingerprints (ADR-0001).
@@ -146,6 +148,52 @@ export function contentFingerprintV1(input: JobContentFingerprintInput): string 
 }
 
 /**
+ * Text markers that stand in for "no value" in a structured field.
+ *
+ * Conservative on purpose: only values that are unambiguously placeholders appear here,
+ * because discarding a real title or employer would make a genuine posting undeduplicable
+ * and lose it. A placeholder is treated as *absent* rather than as a discriminator: a
+ * shared value like `N/A` in a company field would otherwise make two different employers'
+ * postings with the same title look identical.
+ *
+ * The list is compared after normalisation (`identityTextField`), so casing, internal
+ * whitespace and surrounding spaces do not defeat it.
+ */
+const PLACEHOLDER_TEXT_VALUES = new Set([
+  '-',
+  '--',
+  '---',
+  '?',
+  'n/a',
+  'n.a.',
+  'n.a',
+  'na',
+  'none',
+  'null',
+  'undefined',
+  'unknown',
+  'tbd',
+  'tba',
+  'to be determined',
+  'not specified',
+  'not available',
+  'not applicable',
+]);
+
+/**
+ * Identity value of one text field: normalised, with placeholders folded to absent.
+ *
+ * Deliberately different from the content fingerprints, which keep placeholder text
+ * because it was really collected. Captured text is evidence even when it carries no
+ * identity value.
+ */
+function identityTextField(value: string | null | undefined): string | null {
+  const normalized = normalizeTextField(value);
+  if (normalized === null || normalized === '') return null;
+  return PLACEHOLDER_TEXT_VALUES.has(normalized) ? null : normalized;
+}
+
+/**
  * Last-resort identity basis: title + company + location only.
  *
  * The description is excluded on purpose. Descriptions are edited in place, and if
@@ -153,7 +201,15 @@ export function contentFingerprintV1(input: JobContentFingerprintInput): string 
  * `canonicalUrl` is excluded too, so a re-post with a changed URL does not fork the
  * identity.
  *
- * Returns null when no basis exists, which is the signal for "undeduplicable".
+ * Minimum evidence: a real title plus at least one other real field. One field is not a
+ * discriminator - every "Software Engineer" on a source would collide into a single
+ * posting and the rest would be silently discarded - and a title-less pair names an
+ * employer/location group rather than a posting. When the evidence cannot distinguish
+ * records this returns null, the signal for "undeduplicable", instead of guessing.
+ *
+ * This is a deduplication convenience, not proof of identity: two genuinely different
+ * postings with identical normalised fields still collide (ADR-0001). The `fp:` prefix
+ * keeps that weakness visible rather than making it look like a real identifier.
  */
 function identityFallbackFingerprint(input: SourceRecordIdentityInput): string | null {
   const { value, nonEmptyFieldCount } = fingerprintFromSegments(
@@ -163,10 +219,11 @@ function identityFallbackFingerprint(input: SourceRecordIdentityInput): string |
       ['c', input.company],
       ['l', input.locationText],
     ],
-    normalizeTextField,
+    identityTextField,
   );
-  // Whitespace-only text is not usable text: UNKNOWN is not a basis for identity.
-  return nonEmptyFieldCount === 0 ? null : value;
+  if (nonEmptyFieldCount < 2) return null;
+  if (identityTextField(input.title) === null) return null;
+  return value;
 }
 
 /**
@@ -179,13 +236,85 @@ function identityFallbackFingerprint(input: SourceRecordIdentityInput): string |
  * never collide with a source-provided identifier and the weakest basis is
  * identifiable by inspection rather than assumed equivalent to a real identifier.
  */
-export function sourceRecordIdentityKey(input: SourceRecordIdentityInput): string | null {
+function resolveIdentity(input: SourceRecordIdentityInput): SourceRecordIdentity {
   const identifier = normalizeOpaqueField(input.stableSourceJobIdentifier);
-  if (identifier) return `sid:${identifier}`;
+  if (identifier) return { key: `sid:${identifier}`, basis: 'sid' };
 
-  const url = normalizeOpaqueField(input.trustworthyCanonicalUrl);
-  if (url) return `url:${url}`;
+  // A URL is only a basis when it provably addresses a resource; see `urlIdentityValue`.
+  const url = urlIdentityValue(input.trustworthyCanonicalUrl);
+  if (url) return { key: `url:${url}`, basis: 'url' };
 
   const fallback = identityFallbackFingerprint(input);
-  return fallback === null ? null : `fp:${fallback}`;
+  if (fallback === null) return { key: null, basis: null };
+  return { key: `fp:${fallback}`, basis: 'fallback' };
+}
+
+export function sourceRecordIdentityKey(input: SourceRecordIdentityInput): string | null {
+  return resolveIdentity(input).key;
+}
+
+/**
+ * Resolve the source-record identity of a normalized record, applying the source's
+ * declared policy (ADR-0001 concept 1).
+ *
+ * The URL basis is gated on an explicit declaration on purpose. A `sourceUrl` is present
+ * on most records and is frequently *not* identity-worthy: a shared careers URL or a
+ * paginated listing page would collapse many distinct postings into one identity and
+ * silently discard all but the first. The pipeline does not assume that trust; the adapter
+ * declares it. This is why the declaration is a domain-level policy type rather than
+ * something the resolver infers from the URL.
+ *
+ * Deterministic and pure: it reads no clock or random source (ENG-012).
+ */
+export function resolveSourceRecordIdentity(
+  request: SourceRecordIdentityRequest,
+): SourceRecordIdentity {
+  return resolveIdentity({
+    // The identifier contract is what makes populating this field a declaration of
+    // stability: `RawJobEvidence.sourceJobIdentifier` is documented as a *stable*
+    // identifier, so an adapter that cannot verify stability leaves it null. That is why
+    // there is no separate "identifier is stable" flag, while URL trust one is needed.
+    stableSourceJobIdentifier: request.stableSourceJobIdentifier,
+    trustworthyCanonicalUrl: request.policy.canonicalUrlIdentityTrusted
+      ? request.job.canonicalUrl
+      : null,
+    title: request.job.title,
+    company: request.job.company,
+    locationText: request.job.locationText,
+  });
+}
+
+/**
+ * What the adapter has declared about a source's records (ADR-0001 concept 1).
+ *
+ * A domain type, not `SourceAdapterConfig`: the domain must not depend on the ports layer.
+ * `SourceAdapterConfig` satisfies this structurally.
+ */
+export interface SourceIdentityPolicy {
+  /**
+   * True only when the source approval record has verified that the adapter's job URLs are
+   * canonical *job-detail* URLs: stable across re-collection, not a listing or paginated
+   * page, and not a shared careers URL fronting many postings.
+   */
+  canonicalUrlIdentityTrusted: boolean;
+}
+
+/** Which declared basis an identity came from, so the weakest basis stays observable. */
+export type IdentityBasis = 'sid' | 'url' | 'fallback';
+
+export interface SourceRecordIdentityRequest {
+  /** Canonical fields of the normalized record. */
+  job: Pick<NormalizedJob, 'canonicalUrl' | 'title' | 'company' | 'locationText'>;
+  /**
+   * Source-assigned identifier, present only when the adapter declares it stable. See
+   * `RawJobEvidence.sourceJobIdentifier`.
+   */
+  stableSourceJobIdentifier: string | null;
+  policy: SourceIdentityPolicy;
+}
+
+export interface SourceRecordIdentity {
+  /** `sid:<id>` | `url:<canonical url>` | `fp:<digest>`, or null when undeduplicable. */
+  key: string | null;
+  basis: IdentityBasis | null;
 }

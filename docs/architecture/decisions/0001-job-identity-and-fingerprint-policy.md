@@ -1,6 +1,6 @@
 # ADR-0001: Job identity, content fingerprints, and duplicate handling
 
-- **Status:** Approved by the reviewer on 2026-10-13; migration not yet written
+- **Status:** Approved by the reviewer on 2026-10-13; implemented in increments (schema, repositories, URL-trust declaration, identity resolver, collection pipeline)
 - **Date:** 2026-10-13
 - **Relates to:** SRS v1.1 §5.2, §5.3, §5.4, §5.6, §7.7, §7.8; ENG-002, ENG-005, ENG-025
 - **Blocks:** the collection slice (`RawJob`/`Job` persistence, `RunSourceCollection`)
@@ -49,6 +49,43 @@ supply an identifier that is not stable (a view counter, a per-request token). O
 adapter that has verified the field may set it, and that verification belongs in the
 source approval record.
 
+### URL trust is declared, not inferred
+
+The `url:` basis (order 2) is gated on an explicit declaration —
+`SourceAdapterConfig.canonicalUrlIdentityTrusted` — supplied from the source approval
+record. A `sourceUrl` is present on most records and is frequently *not* identity-worthy:
+a shared careers URL or a paginated listing page would collapse many distinct postings
+into one identity and silently discard all but the first. The pipeline therefore does not
+assume URL trust, and the field is **required with no default**, so a source cannot
+inherit trust it never verified.
+
+There is deliberately **no** matching "identifier is stable" flag: the
+`RawJobEvidence.sourceJobIdentifier` contract already *is* that declaration ("Stable
+identifier assigned by the source"), so an adapter that cannot verify stability leaves
+the field `null`. URL trust needs its own flag because the URL field is routinely present
+without being identity-worthy.
+
+### URL canonicalisation for identity
+
+`urlIdentityValue` (`src/domain/normalizers/url-normalizer.ts`) prepares the URL basis. It
+delegates to `canonicalizeUrl` so the identity and the stored `Job.canonicalUrl` agree,
+then applies the two rules identity needs on top.
+
+| Aspect | Handling |
+|--------|----------|
+| scheme | must resolve to `http`/`https`. A value carrying a non-HTTP `scheme://`, or an opaque scheme (`mailto:`, `tel:`, `data:`), is rejected rather than rewritten into HTTPS. A schemeless value or `//host/...` is resolved by `canonicalizeUrl` — that is how relative links in scraped HTML are handled |
+| host | lower-cased |
+| port | preserved |
+| path | case preserved; only a trailing slash is removed. The path is never rewritten |
+| query | preserved, except the tracking parameters `canonicalizeUrl` already removes (`utm_*`, `gclid`, `fbclid`); that removal is documented in that function |
+| fragment | removed — `#apply` is client-side navigation, not a different resource, so keeping it would fork one posting's identity |
+| missing / blank | rejected (`null`) |
+| malformed / unparseable | rejected (`null`) |
+| bare host / site root | rejected — it addresses no resource, so every posting reachable from it would otherwise share one identity |
+| redirects | **never resolved.** Resolving one needs a network call, and identity resolution is a pure function (ENG-012). A source whose job URLs redirect must be declared untrustworthy, or have its URLs canonicalised by the adapter |
+| listing / pagination URLs | **not detected here.** Recognising them needs source-specific knowledge, and guessing would put source assumptions into shared domain code (ENG-016). `canonicalUrlIdentityTrusted` is the declaration that a source's URLs are job-detail URLs; this function enforces only what is provable from the URL alone |
+| a changed URL for the same posting | yields a different `url:` key. This is why the URL basis is weaker than a stable identifier, and why trust must be declared |
+
 ### Limitation of the `fp:` fallback
 
 The `fp:` fallback is a **deduplication convenience, not proof of identity**:
@@ -63,6 +100,19 @@ trustworthy URL. The funnel counts records resolved this way so the affected vol
 always visible, and `docs`/the source approval record must state the limitation for any
 source in that class. A source in that class is a candidate for re-review, not a
 permanent state.
+
+**Minimum evidence.** The fallback fires only on evidence that can distinguish one posting
+from another: a real **title** plus at least one other real field (company or location).
+One field is not a discriminator — every "Software Engineer" on a source would collide
+into a single posting and the rest would be silently discarded — and a title-less pair
+names an employer/location group rather than a posting. When the evidence cannot
+distinguish records the resolver returns `NULL` (undeduplicable) rather than guessing.
+
+**Placeholder text** (`n/a`, `none`, `unknown`, `-`, `tbd`, …) is treated as **absent** in
+the identity path, because a shared placeholder cannot distinguish employers: "Engineer @
+N/A" at two employers would otherwise look like one posting. The list holds only
+unambiguously non-values, and it applies to identity only — the content fingerprints still
+keep placeholder text, because it was really collected.
 
 ### Degenerate records
 
@@ -234,6 +284,33 @@ unhealthy. Until a source has a recorded expectation, `collected == 0` is record
 `SUCCEEDED` with the zero visible in the funnel, and no health signal is raised —
 "unknown expectation" is not evidence of breakage.
 
+The expectation is modelled explicitly as `SourceResultExpectation`
+(`UNKNOWN | RESULTS_EXPECTED | ZERO_EXPECTED`) and passed to the collection use case.
+`UNKNOWN` is the default and never raises the signal; only `RESULTS_EXPECTED` can. Where
+the value is *stored* (a `JobSource` column versus the approval document) remains the
+residual question in §7, so it is an explicit input rather than an invented column.
+
+### Recording the funnel
+
+§7.8 defines the funnel `collected → parsed → valid → unique → active → matched →
+notified`; a run owns everything up to and including deduplication. Those stages are
+already persisted or derivable — `collected` = `jobsDiscovered`, `parsed` =
+`jobsDiscovered - parseFailures`, `valid` excludes `jobsRejected`, `unique` =
+`jobsAccepted` — so the funnel itself needs no new column. Two *outcomes* do, because
+they are not derivable from any other counter:
+
+| Column | Why it is needed |
+|--------|------------------|
+| `undeduplicable` | a record that resolved no identity is preserved but belongs to no Job; without the count the funnel arithmetic (`collected = parsed + parseFailures`, `parsed = unique + jobsDuplicate + jobsRejected + undeduplicable`) does not close |
+| `fallbackIdentities` | the volume resting on the weakest (`fp:`) basis must stay visible, per the §1 limitation |
+
+Both are `INTEGER NOT NULL DEFAULT 0` on `source_runs`. `SourceRun` is **engineering-owned**
+— the SRS data model fixes only `SourceRun(sourceId, startedAt)` — so these are additive
+engineering observability, in the same class as the counters already there, and are **not**
+§5.2 attributes. `jobsRejected` stays `0` for now: the SRS defines no collection-time
+rejection rule, and Appendix E is explicit that a Job with `UNUSABLE` description quality
+is *persisted* "for traceability and funnel metrics", so collection must not discard it.
+
 ## 5. New attributes requiring an SRS §5.2 update
 
 These are additive and follow the same process used for `Job.provenance`. **The SRS is
@@ -260,6 +337,8 @@ fabricating identity for existing records.
 - No deletion or overwrite of captured evidence.
 - No assumption that a content hash proves two postings are the same job.
 - No global unique `contentFingerprint`; it stays a lookup index.
+- No automatic detection of listing or pagination URLs: that needs source knowledge and is
+  a declaration, not a guess (§1).
 - No adapter implements any of this until the source approval record is signed.
 
 ## 7. Sign-off
@@ -330,3 +409,17 @@ statements that silently did nothing.
 
 Index/page-level behaviour is Postgres's own; job-identity resolution logic is already
 covered by 24 unit tests in `tests/unit/job-identity.spec.ts`.
+
+### What has actually been implemented
+
+- **Increment 1 — schema and repositories** (`0f60ae8`, `c6539da`): the migration, both
+  repositories, and the extended index guard. `partial-indexes.spec.ts` now guards the two
+  `raw_jobs` partial indexes by name *and* predicate, and asserts
+  `one_job_per_source_identity` is a **plain** unique index with no predicate.
+  Mutation-checked: pointing the identifier insert's `ON CONFLICT` at the other predicate
+  fails with `42P10 (*no unique or exclusion constraint matching the ON CONFLICT
+  specification*)`; swapping the Job index for a partial one fails the guard.
+- **Increment 2 — URL trust, identity resolution and the collection pipeline**: see the
+  final report accompanying the change. The URL-trust tests are the guard for the
+  declaration: removing it makes `resolveSourceRecordIdentity` fall through to `fp:` and the
+  `uses the canonical url only when the adapter declares it trustworthy` test fails.
