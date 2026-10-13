@@ -1,5 +1,5 @@
 import { SalaryPeriod, SalaryType } from '../enums';
-import { SalaryParsed } from '../types';
+import { asProbability, Probability, SalaryParsed } from '../types';
 
 // Currency recognition. Codes are validated strings; we never invent an amount.
 const CURRENCY_ALIASES: Array<{ pattern: RegExp; code: string }> = [
@@ -65,11 +65,11 @@ function unknown(raw: string | null): SalaryParsed {
     currency: null,
     period: SalaryPeriod.UNKNOWN,
     evidence: raw,
-    confidence: 0,
+    confidence: asProbability(0),
   };
 }
 
-function nonNumeric(type: SalaryType, raw: string, confidence: number): SalaryParsed {
+function nonNumeric(type: SalaryType, raw: string, confidence: Probability): SalaryParsed {
   return {
     type,
     min: null,
@@ -113,7 +113,7 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
         currency,
         period,
         evidence: raw,
-        confidence: negotiable ? 0.6 : 0.9,
+        confidence: asProbability(negotiable ? 0.6 : 0.9),
       };
     }
 
@@ -131,15 +131,15 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
       currency,
       period,
       evidence: raw,
-      confidence: negotiable ? 0.6 : 0.9,
+      confidence: asProbability(negotiable ? 0.6 : 0.9),
     };
   }
 
   // No concrete amount: represent the non-numeric salary states (AC-007).
-  if (negotiable) return nonNumeric(SalaryType.NEGOTIABLE, raw, 0.9);
-  if (/as\s+per\s+scale|scale/i.test(lower)) return nonNumeric(SalaryType.AS_PER_SCALE, raw, 0.9);
+  if (negotiable) return nonNumeric(SalaryType.NEGOTIABLE, raw, asProbability(0.9));
+  if (/as\s+per\s+scale|scale/i.test(lower)) return nonNumeric(SalaryType.AS_PER_SCALE, raw, asProbability(0.9));
   if (/not\s+disclosed|undisclosed|confidential|not\s+specified/i.test(lower)) {
-    return nonNumeric(SalaryType.NOT_DISCLOSED, raw, 0.9);
+    return nonNumeric(SalaryType.NOT_DISCLOSED, raw, asProbability(0.9));
   }
   return unknown(raw);
 }

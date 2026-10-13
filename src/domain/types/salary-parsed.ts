@@ -1,4 +1,5 @@
 import { SalaryType, SalaryPeriod } from '../enums';
+import { Probability } from './numeric-units';
 
 export interface SalaryParsed {
   type: SalaryType;
@@ -7,5 +8,6 @@ export interface SalaryParsed {
   currency: string | null;
   period: SalaryPeriod | null;
   evidence: string | null;
-  confidence: number; // 0..1 extraction confidence (SRS B.1)
+  /** Per-field extraction confidence in [0, 1] (SRS B.1). Not a match score. */
+  confidence: Probability;
 }

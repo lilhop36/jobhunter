@@ -1,4 +1,5 @@
 import { LocationCategory, RemoteStatus } from '@domain/enums';
+import { asProbability, Probability } from '@domain/types';
 import {
   ADDIS_ABABA_ALIASES,
   ETHIOPIAN_CITIES,
@@ -14,7 +15,7 @@ export interface LocationClassified {
   category: LocationCategory;
   remoteStatus: RemoteStatus;
   /** Extraction confidence in [0, 1] (SRS B.1/B.2 convention). Not a match score. */
-  confidence: number;
+  confidence: Probability;
   evidence: string | null;
   signals: string[];
 }
@@ -47,7 +48,7 @@ function emptyResult(evidence: string | null, signals: string[] = []): LocationC
   return {
     category: LocationCategory.UNKNOWN,
     remoteStatus: RemoteStatus.UNKNOWN,
-    confidence: 0,
+    confidence: asProbability(0),
     evidence,
     signals,
   };
@@ -81,7 +82,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: LocationCategory.HYBRID,
       remoteStatus: RemoteStatus.HYBRID,
-      confidence: 0.9,
+      confidence: asProbability(0.9),
       evidence: raw,
       signals,
     };
@@ -93,7 +94,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: LocationCategory.UNKNOWN,
       remoteStatus: RemoteStatus.UNKNOWN,
-      confidence: 0,
+      confidence: asProbability(0),
       evidence: raw,
       signals,
     };
@@ -106,7 +107,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
       return {
         category: LocationCategory.ETHIOPIA_REMOTE,
         remoteStatus: RemoteStatus.REMOTE,
-        confidence: 0.85,
+        confidence: asProbability(0.85),
         evidence: raw,
         signals,
       };
@@ -116,7 +117,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
       return {
         category: LocationCategory.INTERNATIONAL_REMOTE,
         remoteStatus: RemoteStatus.REMOTE,
-        confidence: 0.85,
+        confidence: asProbability(0.85),
         evidence: raw,
         signals,
       };
@@ -125,7 +126,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: LocationCategory.UNKNOWN,
       remoteStatus: RemoteStatus.REMOTE,
-      confidence: 0.6,
+      confidence: asProbability(0.6),
       evidence: raw,
       signals,
     };
@@ -137,7 +138,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: LocationCategory.ADDIS_ABABA,
       remoteStatus: RemoteStatus.ONSITE,
-      confidence: 0.95,
+      confidence: asProbability(0.95),
       evidence: raw,
       signals,
     };
@@ -150,7 +151,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: cityHits.length > 0 ? LocationCategory.ETHIOPIA_CITY : LocationCategory.ETHIOPIA_REGION,
       remoteStatus: RemoteStatus.ONSITE,
-      confidence: multiple ? 0.6 : 0.8,
+      confidence: asProbability(multiple ? 0.6 : 0.8),
       evidence: raw,
       signals,
     };
@@ -162,7 +163,7 @@ export function classifyLocation(input: LocationClassifyInput): LocationClassifi
     return {
       category: LocationCategory.INTERNATIONAL_ON_SITE,
       remoteStatus: RemoteStatus.ONSITE,
-      confidence: 0.75,
+      confidence: asProbability(0.75),
       evidence: raw,
       signals,
     };

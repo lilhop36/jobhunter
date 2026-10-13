@@ -1,5 +1,5 @@
 import { CalendarType } from '@domain/enums';
-import { DateParsed } from '@domain/types';
+import { asProbability, DateParsed } from '@domain/types';
 
 export interface EthiopianMonthName {
   month: number;
@@ -81,7 +81,7 @@ function unknownResult(originalText: string | null): DateParsed {
     calendar: CalendarType.UNKNOWN,
     publishedAt: null,
     originalText,
-    confidence: 0,
+    confidence: asProbability(0),
     conversionMethod: null,
   };
 }
@@ -91,7 +91,7 @@ function invalidEthiopian(originalText: string): DateParsed {
     calendar: CalendarType.ETHIOPIAN,
     publishedAt: null,
     originalText,
-    confidence: 0,
+    confidence: asProbability(0),
     conversionMethod: ETHIOPIAN_CALENDAR_VERSION,
   };
 }
@@ -180,7 +180,7 @@ export function parseEthiopianDate(input: EthiopianParseInput): DateParsed {
     calendar: CalendarType.ETHIOPIAN,
     publishedAt,
     originalText,
-    confidence: 0.9,
+    confidence: asProbability(0.9),
     conversionMethod: ETHIOPIAN_CALENDAR_VERSION,
   };
 }
