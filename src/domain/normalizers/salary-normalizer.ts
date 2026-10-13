@@ -1,5 +1,12 @@
 import { SalaryPeriod, SalaryType } from '../enums';
-import { asProbability, Probability, SalaryParsed } from '../types';
+import {
+  asProbability,
+  compareDecimalAmount,
+  DecimalAmount,
+  isDecimalAmount,
+  Probability,
+  SalaryParsed,
+} from '../types';
 
 // Currency recognition. Codes are validated strings; we never invent an amount.
 const CURRENCY_ALIASES: Array<{ pattern: RegExp; code: string }> = [
@@ -36,22 +43,38 @@ function detectPeriod(lower: string): SalaryPeriod {
   return SalaryPeriod.UNKNOWN;
 }
 
-function normalizeNumber(token: string): number | null {
-  const cleaned = token.replace(/[,\s]/g, '').toLowerCase();
-  const isK = cleaned.endsWith('k');
-  const numeric = isK ? cleaned.slice(0, -1) : cleaned;
-  if (!/^\d+(?:\.\d+)?$/.test(numeric)) return null;
-  const value = parseFloat(numeric);
-  if (!Number.isFinite(value)) return null;
-  return isK ? value * 1000 : value;
+/** Move a decimal point `places` digits to the right as an exact string operation. */
+function shiftDecimalRight(value: string, places: number): string {
+  const [integer, fraction = ''] = value.split('.');
+  const digits = integer + fraction;
+  const point = integer.length + places;
+  if (point >= digits.length) return digits + '0'.repeat(point - digits.length);
+  return `${digits.slice(0, point)}.${digits.slice(point)}`;
 }
 
-function extractNumbers(lower: string): number[] {
+/**
+ * Canonicalize a matched numeric token into an exact `DecimalAmount` (ENG-006),
+ * never a binary float. Returns null for tokens the canonical `DECIMAL(14,2)`
+ * storage cannot represent — notably more than two fractional digits, which are
+ * rejected rather than silently rounded.
+ */
+function normalizeAmount(token: string): DecimalAmount | null {
+  let cleaned = token.replace(/[,\s]/g, '').toLowerCase();
+  if (cleaned.endsWith('k')) cleaned = shiftDecimalRight(cleaned.slice(0, -1), 3);
+
+  const [integer, fraction = ''] = cleaned.split('.');
+  if (!/^\d+$/.test(integer)) return null;
+  if (fraction && !/^\d{1,2}$/.test(fraction)) return null;
+  const canonical = fraction ? `${integer.replace(/^0+(?=\d)/, '')}.${fraction}` : integer.replace(/^0+(?=\d)/, '');
+  return isDecimalAmount(canonical) ? canonical : null;
+}
+
+function extractAmounts(lower: string): DecimalAmount[] {
   const matches = lower.match(/\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?k?|\d+(?:\.\d+)?k?/gi);
   if (!matches) return [];
-  const out: number[] = [];
+  const out: DecimalAmount[] = [];
   for (const m of matches) {
-    const value = normalizeNumber(m);
+    const value = normalizeAmount(m);
     if (value !== null) out.push(value);
   }
   return out;
@@ -95,17 +118,17 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
   const currency = detectCurrency(lower);
   const period = detectPeriod(lower);
   const hasKeyword = SALARY_KEYWORDS.test(lower);
-  const numbers = extractNumbers(lower);
+  const amounts = extractAmounts(lower);
   const hasAmountContext = currency !== null || hasKeyword;
   const negotiable = /negotia/i.test(lower);
 
   // Numeric extraction only when a currency token or salary keyword is present,
   // so plain years (2018) and phone numbers never become salaries.
-  if (numbers.length > 0 && hasAmountContext) {
-    if (numbers.length >= 2 && hasRangeSeparator(lower)) {
-      const min = numbers[0];
-      const max = numbers[1];
-      if (min > max) return unknown(raw); // conflicting; never silently swap
+  if (amounts.length > 0 && hasAmountContext) {
+    if (amounts.length >= 2 && hasRangeSeparator(lower)) {
+      const min = amounts[0];
+      const max = amounts[1];
+      if (compareDecimalAmount(min, max) > 0) return unknown(raw); // conflicting; never silently swap
       return {
         type: SalaryType.RANGE,
         min,
@@ -117,7 +140,7 @@ export function parseSalary(text: string | null | undefined): SalaryParsed {
       };
     }
 
-    const value = numbers[0];
+    const value = amounts[0];
     let type: SalaryType = SalaryType.EXACT;
     if (/starting|from|minimum|\bmin\b/i.test(lower)) type = SalaryType.STARTING_FROM;
     else if (/up\s*to|maximum|\bmax\b/i.test(lower)) type = SalaryType.UP_TO;

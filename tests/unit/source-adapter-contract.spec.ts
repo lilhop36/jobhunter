@@ -36,7 +36,7 @@ describe('JobSourceAdapter contract', () => {
     expect(job.canonicalUrl).toBe('https://example.com/jobs/1');
     expect(job.locationCategory).toBe('ADDIS_ABABA');
     expect(job.salary.type).toBe('EXACT');
-    expect(job.salary.min).toBe(30000);
+    expect(job.salary.min).toBe('30000');
     expect(job.salary.currency).toBe('ETB');
     expect(job.salary.period).toBe('MONTH');
     expect(job.contentFingerprint).toBeTruthy();

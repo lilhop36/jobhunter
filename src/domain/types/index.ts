@@ -1,4 +1,5 @@
 export * from './numeric-units';
+export * from './decimal-amount';
 export * from './salary-parsed';
 export * from './date-parsed';
 export * from './field-provenance';

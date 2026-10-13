@@ -1,10 +1,12 @@
 import { SalaryType, SalaryPeriod } from '../enums';
+import { DecimalAmount } from './decimal-amount';
 import { Probability } from './numeric-units';
 
 export interface SalaryParsed {
   type: SalaryType;
-  min: number | null;
-  max: number | null;
+  /** Exact monetary amounts (SRS ENG-006); null when unknown or not applicable. */
+  min: DecimalAmount | null;
+  max: DecimalAmount | null;
   currency: string | null;
   period: SalaryPeriod | null;
   evidence: string | null;
