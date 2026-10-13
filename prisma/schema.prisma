@@ -225,6 +225,11 @@ model RawJob {
   id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   sourceId             String   @db.Uuid
   sourceRunId          String?  @db.Uuid
+  /// Deduplication scope is intentionally not a plain @unique: a capture is identified
+  /// by source + identifier + content hash, and only when an identifier exists. Two
+  /// hand-written partial unique indexes (`one_raw_observation_per_identifier`,
+  /// `one_raw_observation_per_content`) enforce it because Prisma cannot express partial
+  /// indexes. Keep in sync with the ON CONFLICT targets in PrismaRawJobRepository.
   sourceJobIdentifier  String?
   sourceUrl            String?
   rawTitle             String?
@@ -234,7 +239,14 @@ model RawJob {
   rawPublishedDateText String?
   rawSalaryText        String?
   rawPayload           Json?
+  /// Versioned SHA-256 of the captured raw fields (`rawContentHash` in
+  /// @domain/normalizers/job-identity). Derived, never supplied by the source.
+  contentHash          String
   collectedAt          DateTime @default(now())
+  /// Last observed by the collection process - never the source's content-update time.
+  /// Written only by collection, which produces the row, so this does not mutate source
+  /// evidence (ENG-002 constrains *downstream* stages).
+  lastSeenAt           DateTime @default(now())
   createdAt            DateTime @default(now())
 
   source    JobSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
@@ -250,6 +262,12 @@ model Job {
   id                        String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   sourceId                  String              @db.Uuid
   rawJobId                  String?             @db.Uuid
+  /// Source-scoped source-record identity (ADR-0001), computed by the domain layer from
+  /// the raw record. NOT NULL: a Job exists only for a record whose identity resolved,
+  /// so undeduplicable evidence is counted but never promoted. Never a cross-source
+  /// canonical identity - that stays deferred to ENG-005, and the unique index below
+  /// includes sourceId precisely so the same key in two sources stays two Jobs.
+  identityKey               String
   canonicalUrl              String?
   title                     String?
   company                   String?
@@ -289,6 +307,10 @@ model Job {
   @@index([contentFingerprint])
   @@index([sourceId, lifecycleStatus])
   @@index([publishedAt])
+  // One Job per source-scoped identity. Plain (never partial): a partial index over a
+  // nullable column would accept repeated NULLs and stop preventing promotion of
+  // identity-less Jobs. The name is fixed to match the hand-written migration index.
+  @@unique([sourceId, identityKey], map: "one_job_per_source_identity")
   @@map("jobs")
 }
 

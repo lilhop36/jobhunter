@@ -36,6 +36,42 @@ const GUARDED_PARTIAL_INDEXES: PartialIndexGuard[] = [
     ],
     protects: 'at most one active WorkTask per dedupeKey (SRS 7.5)',
   },
+  {
+    name: 'one_raw_observation_per_identifier',
+    table: 'raw_jobs',
+    predicateIncludes: [`"sourceJobIdentifier" IS NOT NULL`],
+    protects:
+      'one capture per (source, source identifier, content hash): identical re-capture is a no-op and changed content adds a row (ADR-0001)',
+  },
+  {
+    name: 'one_raw_observation_per_content',
+    table: 'raw_jobs',
+    predicateIncludes: [`"sourceJobIdentifier" IS NULL`],
+    protects:
+      'one capture per (source, content hash) when the source supplies no stable identifier (ADR-0001)',
+  },
+];
+
+/**
+ * Plain unique indexes that must NOT acquire a predicate. A unique index on a nullable
+ * column accepts repeated NULLs, so making `one_job_per_source_identity` partial would
+ * silently stop preventing identity-less Jobs from being promoted.
+ */
+interface PlainUniqueIndexGuard {
+  name: string;
+  table: string;
+  definitionIncludes: string[];
+  protects: string;
+}
+
+const GUARDED_PLAIN_UNIQUE_INDEXES: PlainUniqueIndexGuard[] = [
+  {
+    name: 'one_job_per_source_identity',
+    table: 'jobs',
+    definitionIncludes: [`USING btree ("sourceId", "identityKey")`],
+    protects:
+      'one Job per source-scoped source-record identity, and no identity-less Job at all (ADR-0001)',
+  },
 ];
 
 const prisma = createTestPrismaClient();
@@ -57,6 +93,19 @@ const PARTIAL_UNIQUE_INDEXES = `
   WHERE n.nspname = 'public'
     AND ix.indisunique
     AND ix.indpred IS NOT NULL
+`;
+
+const PLAIN_UNIQUE_INDEXES = `
+  SELECT i.relname AS index_name,
+         t.relname AS table_name,
+         (ix.indpred IS NOT NULL) AS is_partial,
+         pg_get_indexdef(ix.indexrelid) AS definition
+  FROM pg_index ix
+  JOIN pg_class i ON i.oid = ix.indexrelid
+  JOIN pg_class t ON t.oid = ix.indrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+  WHERE n.nspname = 'public'
+    AND ix.indisunique
 `;
 
 beforeAll(() => {
@@ -89,6 +138,36 @@ describe('hand-written partial indexes', () => {
       const predicate = rows[0].predicate.replace(/\s+/g, ' ');
       for (const fragment of predicateIncludes) {
         expect(predicate, `predicate of ${name}`).toContain(fragment.replace(/\s+/g, ' '));
+      }
+    },
+  );
+});
+
+interface PlainIndexRow {
+  index_name: string;
+  table_name: string;
+  is_partial: boolean;
+  definition: string;
+}
+
+describe('guarded plain unique indexes', () => {
+  it.each(GUARDED_PLAIN_UNIQUE_INDEXES)(
+    'index $name is unique over the expected columns and has no predicate ($protects)',
+    async ({ name, table, definitionIncludes }) => {
+      const rows = await prisma.$queryRawUnsafe<PlainIndexRow[]>(
+        `${PLAIN_UNIQUE_INDEXES} AND i.relname = $1`,
+        name,
+      );
+
+      expect(rows, `guarded index ${name} is missing`).toHaveLength(1);
+      expect(rows[0].table_name).toBe(table);
+      expect(
+        rows[0].is_partial,
+        `${name} must not be partial: a unique index on a nullable column accepts repeated NULLs`,
+      ).toBe(false);
+      const definition = rows[0].definition.replace(/\s+/g, ' ');
+      for (const fragment of definitionIncludes) {
+        expect(definition, `definition of ${name}`).toContain(fragment.replace(/\s+/g, ' '));
       }
     },
   );
