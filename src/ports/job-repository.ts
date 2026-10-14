@@ -1,4 +1,4 @@
-import { DescriptionQuality } from '@domain/enums';
+import { DescriptionQuality, LifecycleStatus } from '@domain/enums';
 import { NormalizedJob } from '@domain/types';
 
 /**
@@ -42,6 +42,25 @@ export interface UpsertJobResult {
 }
 
 /**
+ * Everything the lifecycle policy needs about one Job (FR-019). Gathered by the store
+ * because the evidence spans `jobs`, `raw_jobs` and `source_runs`; the rule itself stays in
+ * `@domain/lifecycle`.
+ */
+export interface LifecycleCandidate {
+  jobId: string;
+  currentStatus: LifecycleStatus;
+  /** `lastSeenAt` of the Job's newest capture, or null when that capture is gone. */
+  lastObservedAt: Date | null;
+  /** Start of the source's most recent informative run, or null when it has none. */
+  latestQualifyingRunStartedAt: Date | null;
+}
+
+export interface LifecycleStatusUpdate {
+  jobId: string;
+  status: LifecycleStatus;
+}
+
+/**
  * Store for the canonical, evidence-derived Job (SRS 5.2).
  *
  * Uniqueness is `(sourceId, identityKey)` only. There is no cross-source identity and
@@ -54,4 +73,16 @@ export interface JobRepository {
   findById(id: string): Promise<JobRecord | null>;
 
   countForSource(sourceId: string): Promise<number>;
+
+  /**
+   * Jobs of one source that the lifecycle policy owns (see
+   * `RECONCILED_LIFECYCLE_STATUSES`), with the observation evidence to reconcile them.
+   */
+  listLifecycleCandidates(sourceId: string): Promise<LifecycleCandidate[]>;
+
+  /**
+   * Apply decided lifecycle statuses. Returns how many Jobs were actually written; callers
+   * pass only real changes, so a non-zero result means that many rows moved.
+   */
+  applyLifecycleStatuses(updates: readonly LifecycleStatusUpdate[]): Promise<number>;
 }

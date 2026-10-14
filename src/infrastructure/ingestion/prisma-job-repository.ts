@@ -1,6 +1,14 @@
 import { Prisma, PrismaClient } from '@prisma/client';
-import { DescriptionQuality } from '@domain/enums';
-import { JobRecord, JobRepository, UpsertJobInput, UpsertJobResult } from '@ports/job-repository';
+import { DescriptionQuality, LifecycleStatus, SourceRunStatus } from '@domain/enums';
+import { RECONCILED_LIFECYCLE_STATUSES } from '@domain/lifecycle/lifecycle-policy';
+import {
+  JobRecord,
+  JobRepository,
+  LifecycleCandidate,
+  LifecycleStatusUpdate,
+  UpsertJobInput,
+  UpsertJobResult,
+} from '@ports/job-repository';
 
 /** See PrismaSourceRunRepository for why the timestamp columns use the UTC clock. */
 const NOW_UTC = Prisma.raw("date_trunc('milliseconds', now() AT TIME ZONE 'UTC')");
@@ -62,6 +70,10 @@ function toDate(value: Date | string): Date {
   return value instanceof Date ? value : new Date(value);
 }
 
+function toNullableDate(value: Date | string | null): Date | null {
+  return value === null ? null : toDate(value);
+}
+
 function toRecord(row: JobRow): JobRecord {
   return {
     id: row.id,
@@ -84,6 +96,13 @@ function toRecord(row: JobRow): JobRecord {
 /** ISO-8601 text is stored as a UTC-naive `timestamp(3)`, matching the collection clock. */
 function asTimestamp(value: Date | null): string | null {
   return value === null ? null : value.toISOString();
+}
+
+interface LifecycleCandidateRow {
+  jobId: string;
+  lifecycleStatus: string;
+  lastObservedAt: Date | string | null;
+  latestQualifyingRunStartedAt: Date | string | null;
 }
 
 /**
@@ -176,5 +195,65 @@ export class PrismaJobRepository implements JobRepository {
       SELECT count(*)::int AS "n" FROM "jobs" WHERE "sourceId" = ${sourceId}::uuid
     `;
     return rows[0].n;
+  }
+
+  /**
+   * Read model for one source's lifecycle reconciliation (FR-019, SRS 4.4).
+   *
+   * The correlated subquery is the "informative collection" definition held by
+   * `@domain/lifecycle`: a run that finished `SUCCEEDED` and discovered at least one record.
+   * Enum columns are compared as text (`::text`) so the bound parameter is a plain string,
+   * exactly as the other stores do - a bare `enum = $1` has no Postgres operator.
+   *
+   * Only the statuses this policy owns are returned, so a Job whose state came from other
+   * evidence is never even loaded.
+   */
+  async listLifecycleCandidates(sourceId: string): Promise<LifecycleCandidate[]> {
+    const reconciledStatuses = Prisma.join(RECONCILED_LIFECYCLE_STATUSES);
+    const rows = await this.prisma.$queryRaw<LifecycleCandidateRow[]>`
+      SELECT j."id" AS "jobId",
+             j."lifecycleStatus"::text AS "lifecycleStatus",
+             rj."lastSeenAt" AS "lastObservedAt",
+             (SELECT max(r."startedAt")
+                FROM "source_runs" r
+               WHERE r."sourceId" = j."sourceId"
+                 AND r."status"::text = ${SourceRunStatus.SUCCEEDED}
+                 AND r."jobsDiscovered" > 0) AS "latestQualifyingRunStartedAt"
+        FROM "jobs" j
+        LEFT JOIN "raw_jobs" rj ON rj."id" = j."rawJobId"
+       WHERE j."sourceId" = ${sourceId}::uuid
+         AND j."lifecycleStatus"::text IN (${reconciledStatuses})
+    `;
+
+    return rows.map((row) => ({
+      jobId: row.jobId,
+      currentStatus: row.lifecycleStatus as LifecycleStatus,
+      lastObservedAt: toNullableDate(row.lastObservedAt),
+      latestQualifyingRunStartedAt: toNullableDate(row.latestQualifyingRunStartedAt),
+    }));
+  }
+
+  async applyLifecycleStatuses(updates: readonly LifecycleStatusUpdate[]): Promise<number> {
+    if (updates.length === 0) return 0;
+
+    // Grouped by target status so a sweep is at most two statements regardless of how many
+    // Jobs move. The client (not hand-written SQL) is used here so `@updatedAt` is
+    // maintained and uuid arrays need no cast.
+    const byStatus = new Map<LifecycleStatus, string[]>();
+    for (const { jobId, status } of updates) {
+      const ids = byStatus.get(status);
+      if (ids === undefined) byStatus.set(status, [jobId]);
+      else ids.push(jobId);
+    }
+
+    let applied = 0;
+    for (const [status, ids] of byStatus) {
+      const { count } = await this.prisma.job.updateMany({
+        where: { id: { in: ids } },
+        data: { lifecycleStatus: status },
+      });
+      applied += count;
+    }
+    return applied;
   }
 }
