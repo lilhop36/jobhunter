@@ -1,10 +1,14 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Prisma } from '@prisma/client';
-import { DescriptionQuality, EmploymentType, SalaryPeriod, SalaryType } from '@domain/enums';
+import { DescriptionQuality, EmploymentType, SalaryPeriod, SalaryType, ApplicationMethod } from '@domain/enums';
 import { asDecimalAmount, asProbability, type NormalizedJob } from '@domain/types';
 import { rawContentHash } from '@domain/normalizers/job-identity';
 import { DESCRIPTION_QUALITY_VERSION } from '@domain/normalizers/description-quality';
 import { EMPLOYMENT_TYPE_VERSION } from '@domain/normalizers/employment-type';
+import {
+  APPLICATION_TARGET_VERSION,
+  hasUsableApplicationPath,
+} from '@domain/normalizers/application-target';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
@@ -304,5 +308,34 @@ describe('job upsert', () => {
     );
     expect(rows[0].employmentType).toBe('CONTRACT');
     expect(rows[0].provenance.employmentType?.conversionMethod).toBe(EMPLOYMENT_TYPE_VERSION);
+  });
+
+  it('persists the resolved application target and its policy version (FR-006)', async () => {
+    const sourceId = await createSource('job-application-target');
+    const job = await normalize({
+      rawTitle: 'Backend Engineer',
+      rawDescription: 'Apply at https://jobs.example.com/apply/7 before the deadline.',
+    });
+    expect(job.application).toMatchObject({
+      method: ApplicationMethod.ONLINE_URL,
+      applyUrl: 'https://jobs.example.com/apply/7',
+      applyEmail: null,
+    });
+    expect(job.provenance.applicationMethod?.conversionMethod).toBe(APPLICATION_TARGET_VERSION);
+    // AC-004: a job with a resolved target is notifiable.
+    expect(hasUsableApplicationPath(job.application)).toBe(true);
+
+    const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job });
+
+    const rows = await prisma.$queryRawUnsafe<
+      { applicationMethod: string; applyUrl: string | null; applyEmail: string | null; provenance: Record<string, { conversionMethod?: string }> }[]
+    >(
+      'SELECT "applicationMethod"::text AS "applicationMethod", "applyUrl", "applyEmail", "provenance" FROM "jobs" WHERE "id" = $1::uuid',
+      stored.id,
+    );
+    expect(rows[0].applicationMethod).toBe('ONLINE_URL');
+    expect(rows[0].applyUrl).toBe('https://jobs.example.com/apply/7');
+    expect(rows[0].applyEmail).toBeNull();
+    expect(rows[0].provenance.applicationMethod?.conversionMethod).toBe(APPLICATION_TARGET_VERSION);
   });
 });

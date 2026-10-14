@@ -19,6 +19,10 @@ import {
   EMPLOYMENT_TYPE_VERSION,
   classifyEmploymentType,
 } from '@domain/normalizers/employment-type';
+import {
+  APPLICATION_TARGET_VERSION,
+  resolveApplicationTarget,
+} from '@domain/normalizers/application-target';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type {
   CollectionContext,
@@ -87,6 +91,10 @@ export class FakeSourceAdapter implements JobSourceAdapter {
     const location = classifyLocation({ text: raw.rawLocation });
     const salary = parseSalary(raw.rawSalaryText);
     const employment = classifyEmploymentType({
+      title: raw.rawTitle,
+      description: raw.rawDescription,
+    });
+    const application = resolveApplicationTarget({
       title: raw.rawTitle,
       description: raw.rawDescription,
     });
@@ -205,6 +213,27 @@ export class FakeSourceAdapter implements JobSourceAdapter {
         evidence: employment.evidence,
       };
     }
+    if (application.method !== ApplicationMethod.UNKNOWN) {
+      provenance.applicationMethod = {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: APPLICATION_TARGET_VERSION,
+        evidence: application.evidence,
+      };
+      if (application.applyUrl !== null) {
+        provenance.applyUrl = {
+          provenance: ProvenanceSource.DETERMINISTIC,
+          conversionMethod: APPLICATION_TARGET_VERSION,
+          evidence: application.evidence,
+        };
+      }
+      if (application.applyEmail !== null) {
+        provenance.applyEmail = {
+          provenance: ProvenanceSource.DETERMINISTIC,
+          conversionMethod: APPLICATION_TARGET_VERSION,
+          evidence: application.evidence,
+        };
+      }
+    }
     if (fingerprint) {
       provenance.contentFingerprint = {
         provenance: ProvenanceSource.DETERMINISTIC,
@@ -227,12 +256,9 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       publishedDate,
       salary,
       employmentType: employment.type,
-      application: {
-        method: ApplicationMethod.UNKNOWN,
-        applyUrl: null,
-        applyEmail: null,
-        evidence: null,
-      },
+      // Delegated to the shared, versioned resolver (ENG-016, FR-006) so this double
+      // exercises the real rules instead of a constant.
+      application,
       contentFingerprint: fingerprint,
       provenance,
     };
