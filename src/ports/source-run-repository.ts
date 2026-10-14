@@ -28,6 +28,8 @@ export interface SourceRunOutcome {
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
+  /** Whether downstream enrichment/matching work was scheduled (SRS 7.7 step 10). */
+  enrichmentScheduled: boolean;
   errorSummary?: string | null;
 }
 

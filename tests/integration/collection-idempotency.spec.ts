@@ -18,7 +18,7 @@ import type {
   HealthCheckContext,
   JobSourceAdapter,
 } from '@ports/source-adapter';
-import { silentWorkerLogger } from '@ports/worker-logger';
+import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
@@ -51,6 +51,26 @@ const collection = new RunSourceCollection({
 
 const NOW = new Date('2026-10-13T12:00:00.000Z');
 const STALE_SECONDS = 3600;
+/** Generous bound so the pre-existing cases never trip the acquisition timeout. */
+const ACQUISITION_TIMEOUT_MS = 30_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface LogEntry {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  meta?: unknown;
+}
+
+function makeCapturingLogger(sink: LogEntry[]): WorkerLogger {
+  return {
+    info: (message, meta) => sink.push({ level: 'info', message, meta }),
+    warn: (message, meta) => sink.push({ level: 'warn', message, meta }),
+    error: (message, meta) => sink.push({ level: 'error', message, meta }),
+  };
+}
 
 let sourceSeq = 0;
 
@@ -77,7 +97,13 @@ function collectOnce(
   adapter: JobSourceAdapter,
   overrides: Partial<Omit<RunSourceCollectionInput, 'adapter' | 'now' | 'staleRunSeconds'>> = {},
 ): Promise<RunSourceCollectionResult> {
-  return collection.run({ adapter, now: NOW, staleRunSeconds: STALE_SECONDS, ...overrides });
+  return collection.run({
+    adapter,
+    now: NOW,
+    staleRunSeconds: STALE_SECONDS,
+    acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+    ...overrides,
+  });
 }
 
 async function countEvidence(sourceId: string): Promise<number> {
@@ -173,6 +199,40 @@ class FailingCollectAdapter implements JobSourceAdapter {
 
   async collect(): Promise<RawJobEvidence[]> {
     throw this.error;
+  }
+
+  normalize(raw: RawJobEvidence) {
+    return this.inner.normalize(raw);
+  }
+
+  healthCheck(context: HealthCheckContext) {
+    return this.inner.healthCheck(context);
+  }
+}
+
+/**
+ * A source that is slow to answer and does not honour cancellation.
+ *
+ * `collect` records the signal it was handed and then resolves `delayMs` later
+ * regardless, which models the real hazard the acquisition bound exists for: an
+ * underlying operation that keeps running after the pipeline has stopped waiting.
+ */
+class SlowCollectAdapter implements JobSourceAdapter {
+  capturedSignal: AbortSignal | undefined;
+
+  constructor(
+    private readonly inner: JobSourceAdapter,
+    private readonly delayMs: number,
+  ) {}
+
+  get config() {
+    return this.inner.config;
+  }
+
+  async collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+    this.capturedSignal = context.signal;
+    await delay(this.delayMs);
+    return this.inner.collect(context);
   }
 
   normalize(raw: RawJobEvidence) {
@@ -433,6 +493,7 @@ describe('RunSourceCollection', () => {
       adapter,
       now: NOW,
       staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
       signal: controller.signal,
     });
 
@@ -451,6 +512,7 @@ describe('RunSourceCollection', () => {
       adapter,
       now: NOW,
       staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
       signal: controller.signal,
     });
 
@@ -462,6 +524,124 @@ describe('RunSourceCollection', () => {
     expect(result.run?.status).toBe(SourceRunStatus.PARTIAL);
     expect(result.run?.errorSummary).toContain('aborted during acquisition');
     expect(await countEvidence(sourceId)).toBe(0);
+  });
+
+  it('bounds acquisition: a slow source fails the run instead of hanging it', async () => {
+    const sourceId = await createSource();
+    const adapter = new SlowCollectAdapter(
+      makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 't-1', rawTitle: 'Backend Engineer' }),
+      ]),
+      150,
+    );
+
+    const result = await collectOnce(adapter, { acquisitionTimeoutMs: 25 });
+
+    expect(result.status).toBe(SourceRunStatus.FAILED);
+    expect(result.funnel).toMatchObject({ collected: 0, httpFailures: 1 });
+    expect(result.run?.status).toBe(SourceRunStatus.FAILED);
+    expect(result.run?.httpFailures).toBe(1);
+    expect(result.run?.errorSummary).toContain('timed out after 25ms');
+    // The run is finalized, not left RUNNING for the reaper to clean up.
+    expect(result.run?.finishedAt).not.toBeNull();
+    // The bound is enforced cooperatively: the adapter is asked to stop...
+    expect(adapter.capturedSignal?.aborted).toBe(true);
+    // ...and an acquisition that never completed cleanly persists nothing.
+    expect(await countEvidence(sourceId)).toBe(0);
+  });
+
+  it('does not claim a timed-out acquisition was cancelled when it later completes', async () => {
+    const sourceId = await createSource();
+    const logs: LogEntry[] = [];
+    const local = new RunSourceCollection({
+      sourceRuns,
+      rawJobs,
+      jobs,
+      logger: makeCapturingLogger(logs),
+    });
+    const adapter = new SlowCollectAdapter(
+      makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 'u-1', rawTitle: 'Backend Engineer' }),
+      ]),
+      150,
+    );
+
+    const result = await local.run({
+      adapter,
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: 25,
+    });
+
+    expect(result.status).toBe(SourceRunStatus.FAILED);
+    expect(adapter.capturedSignal?.aborted).toBe(true);
+
+    // Let the abandoned operation settle. It must be observed and logged - never
+    // silently mistaken for a completed acquisition, and never able to rewrite the run.
+    await delay(200);
+    expect(logs.some((entry) => /abandoned/i.test(entry.message))).toBe(true);
+
+    const run = await sourceRuns.findById(result.run!.id);
+    expect(run?.status).toBe(SourceRunStatus.FAILED);
+    expect(run?.jobsDiscovered).toBe(0);
+    expect(await countEvidence(sourceId)).toBe(0);
+  });
+
+  it('refuses a non-positive acquisition bound before opening a run', async () => {
+    const sourceId = await createSource();
+
+    await expect(
+      collectOnce(makeAdapter(sourceId, []), { acquisitionTimeoutMs: 0 }),
+    ).rejects.toThrow(/acquisitionTimeoutMs/);
+
+    // It failed before doing any work, so no run is left behind.
+    expect(await prisma.sourceRun.count({ where: { sourceId } })).toBe(0);
+  });
+
+  it('releases the source after a timeout so the next run can recover', async () => {
+    const sourceId = await createSource();
+    const timedOutAdapter = new SlowCollectAdapter(makeAdapter(sourceId, []), 150);
+
+    const timedOut = await collectOnce(timedOutAdapter, { acquisitionTimeoutMs: 25 });
+    expect(timedOut.status).toBe(SourceRunStatus.FAILED);
+
+    // Wait out the abandoned acquisition so it cannot interfere with the retry.
+    await delay(200);
+
+    const retry = await collectOnce(
+      makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 'v-1', rawTitle: 'Backend Engineer' }),
+      ]),
+    );
+    expect(retry.status).toBe(SourceRunStatus.SUCCEEDED);
+    expect(retry.funnel.unique).toBe(1);
+    expect(await prisma.sourceRun.count({ where: { sourceId } })).toBe(2);
+  });
+
+  it('treats a worker shutdown as PARTIAL, never as an acquisition timeout', async () => {
+    const sourceId = await createSource();
+    const controller = new AbortController();
+    const adapter = new SlowCollectAdapter(
+      makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 'w-1', rawTitle: 'Backend Engineer' }),
+      ]),
+      150,
+    );
+
+    const pending = collection.run({
+      adapter,
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      // Far longer than the shutdown, so only the shutdown can end the run.
+      acquisitionTimeoutMs: 60_000,
+      signal: controller.signal,
+    });
+    controller.abort();
+    const result = await pending;
+
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.funnel.httpFailures).toBe(0);
+    expect(result.run?.errorSummary).toContain('worker shutdown');
   });
 
   it('refuses to collect while a live run already holds the source', async () => {
@@ -536,5 +716,34 @@ describe('RunSourceCollection', () => {
       undeduplicable,
       parseFailures,
     });
+  });
+
+  it('records SRS 7.7 step 10 as deferred, never as performed', async () => {
+    const sourceId = await createSource();
+    const logs: LogEntry[] = [];
+    const local = new RunSourceCollection({
+      sourceRuns,
+      rawJobs,
+      jobs,
+      logger: makeCapturingLogger(logs),
+    });
+
+    const result = await local.run({
+      adapter: makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 'x-1', rawTitle: 'Backend Engineer' }),
+      ]),
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+    });
+
+    // Collection genuinely succeeded...
+    expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
+    // ...but SUCCEEDED must not read as "the whole pipeline ran": the run states that the
+    // downstream hand-off was not scheduled, and the remaining dependency is reported.
+    expect(result.run?.enrichmentScheduled).toBe(false);
+    expect(logs.some((entry) => /step 10.*deferred/i.test(entry.message))).toBe(true);
+    // Nothing was enqueued against the (unregistered) enrichment/matching handler.
+    expect(await prisma.workTask.count()).toBe(0);
   });
 });

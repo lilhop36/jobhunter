@@ -28,7 +28,7 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * rate limits" (2) before "create SourceRun" (3). This use case opens the run *first*,
  * deliberately:
  *
- *   - SRS 7.6 requires source-level exclusivity for collection ("Source collection
+ *   - SRS 7.5 requires source-level exclusivity for collection ("Source collection
  *     requires source-level exclusivity"). The run row is that lock, so it has to be
  *     taken before any network work, or two workers can collect one source at once.
  *   - `CollectionContext.sourceRunId` is required by the reviewed adapter port, so the
@@ -39,10 +39,19 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * The run is a plain row, never a long transaction: no transaction is held across the
  * network call or across records.
  *
- * Step 10 of the sequence ("schedule enrichment/matching work") is not performed here.
- * The enrichment and matching stages do not exist yet; enqueueing work for an
- * unregistered handler produces guaranteed permanent failures, which would be a worse
- * outcome than a documented gap.
+ * ## Bounded acquisition
+ *
+ * `collect` is bounded by `acquisitionTimeoutMs` (SRS 9.5, ENG-031). The bound is
+ * enforced here rather than trusted to the adapter: a slow operation is abandoned with
+ * the adapter's signal aborted, the run is finalized `FAILED`, and the abandoned
+ * operation's later settlement is logged and discarded. The run never claims the
+ * operation was cancelled - only that it was abandoned.
+ *
+ * Step 10 of the sequence ("schedule enrichment/matching work") is **not performed**: the
+ * enrichment and matching stages have no registered handler yet, and enqueueing work for
+ * an unregistered handler produces guaranteed permanent failures. Instead of a silent
+ * gap, every run records `enrichmentScheduled = false` and logs the remaining dependency,
+ * so a `SUCCEEDED` status never implies step 10 ran.
  *
  * ## Isolation and crash safety
  *
@@ -60,6 +69,27 @@ const MAX_ERROR_SUMMARY_LENGTH = 1000;
 
 /** How many distinct per-record failure notes are retained in `errorSummary`. */
 const MAX_RETAINED_FAILURE_NOTES = 5;
+
+/**
+ * SRS 7.7 step 10 ("schedule enrichment/matching work") is **deferred**: the enrichment
+ * and matching stages have no registered handler, and enqueueing work against an
+ * unregistered handler produces guaranteed permanent failures (the worker classifies it
+ * as non-retryable). Until that handler exists this is `false`, and it is recorded on
+ * every run so a `SUCCEEDED` collection status can never be read as "the whole pipeline
+ * ran".
+ */
+const ENRICHMENT_SCHEDULED = false;
+
+/**
+ * Raised when a source acquisition exceeds its bound (SRS 9.5). The bound is carried so
+ * the run's error summary and the abort reason handed to the adapter are self-describing.
+ */
+export class AcquisitionTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`source acquisition timed out after ${timeoutMs}ms`);
+    this.name = 'AcquisitionTimeoutError';
+  }
+}
 
 /**
  * Every SRS 7.8 funnel count the collection stage owns, plus the two identity outcomes
@@ -127,6 +157,13 @@ export interface RunSourceCollectionInput {
    * length an accident. It is not a run timeout: a live run is never reaped.
    */
   staleRunSeconds: number;
+  /**
+   * Upper bound, in milliseconds, on a single source acquisition (SRS 9.5, ENG-031).
+   * Required, and with no default, so the bound cannot become an accident. Unlike
+   * `staleRunSeconds` it bounds *this* attempt's `collect`, and it is enforced at this
+   * boundary so a non-cooperative adapter cannot hang the attempt forever.
+   */
+  acquisitionTimeoutMs: number;
   /** Defaults to SCHEDULE. */
   trigger?: SourceRunTrigger;
   /**
@@ -155,9 +192,19 @@ export class RunSourceCollection {
   constructor(private readonly deps: RunSourceCollectionDeps) {}
 
   async run(input: RunSourceCollectionInput): Promise<RunSourceCollectionResult> {
-    const { adapter, signal } = input;
+    const { adapter } = input;
+    const externalSignal = input.signal;
     const sourceId = adapter.config.sourceId;
     const expectation = input.resultExpectation ?? SourceResultExpectation.UNKNOWN;
+
+    // A bound that is not a positive number of milliseconds is meaningless. `0` would make
+    // the timeout race the acquisition, so the same input could sometimes succeed and
+    // sometimes fail. Reject it before any work, including before opening a run.
+    if (!Number.isFinite(input.acquisitionTimeoutMs) || input.acquisitionTimeoutMs <= 0) {
+      throw new RangeError(
+        `acquisitionTimeoutMs must be a positive number of milliseconds, received ${input.acquisitionTimeoutMs}`,
+      );
+    }
 
     const funnel: CollectionFunnel = {
       collected: 0,
@@ -173,7 +220,7 @@ export class RunSourceCollection {
     const notes: string[] = [];
 
     // Recovery before contention: a run abandoned by a crashed worker would otherwise
-    // hold the one-active-run lock forever and wedge the source (ENG-025, SRS 7.6).
+    // hold the one-active-run lock forever and wedge the source (ENG-025, SRS 7.5).
     const reaped = await this.deps.sourceRuns.reapStaleRuns(input.staleRunSeconds);
     if (reaped.length > 0) {
       this.deps.logger.warn('reaped stale collection runs before starting', {
@@ -191,15 +238,82 @@ export class RunSourceCollection {
     });
 
     let records: RawJobEvidence[];
+
+    // SRS 9.5 / ENG-031: acquisition is bounded. The bound is enforced here, at the
+    // boundary that owns run finalization, not inside the adapter, so a non-cooperative
+    // adapter cannot hang the attempt indefinitely.
+    //
+    // The controller is *linked*: it aborts on worker shutdown (the external signal) or
+    // when the bound elapses, so the adapter only ever observes one signal.
+    const controller = new AbortController();
+    const onExternalAbort = () => controller.abort(externalSignal?.reason);
+    if (externalSignal) {
+      if (externalSignal.aborted) onExternalAbort();
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort(new AcquisitionTimeoutError(input.acquisitionTimeoutMs));
+        reject(new AcquisitionTimeoutError(input.acquisitionTimeoutMs));
+      }, input.acquisitionTimeoutMs);
+    });
+
     try {
-      records = await adapter.collect({
+      const acquisition = adapter.collect({
         sourceRunId: run.id,
         now: input.now,
-        signal,
+        signal: controller.signal,
         logger: this.deps.logger,
       });
+      // A timed-out acquisition may keep running underneath. Its eventual settlement must
+      // be observed (so it can never become an unhandled rejection or be mistaken for a
+      // completed acquisition) and discarded. This is why the run records that the
+      // operation was *abandoned* with cancellation requested - never that it stopped.
+      const observed = acquisition.then(
+        (value) => {
+          if (timedOut) {
+            this.deps.logger.warn('abandoned acquisition concluded later (success discarded)', {
+              sourceId,
+              runId: run.id,
+              timeoutMs: input.acquisitionTimeoutMs,
+              records: value.length,
+            });
+            return [] as RawJobEvidence[];
+          }
+          return value;
+        },
+        (error) => {
+          if (timedOut) {
+            this.deps.logger.warn('abandoned acquisition concluded later (error discarded)', {
+              sourceId,
+              runId: run.id,
+              timeoutMs: input.acquisitionTimeoutMs,
+              error: describeError(error),
+            });
+            return [] as RawJobEvidence[];
+          }
+          throw error;
+        },
+      );
+      records = await Promise.race([observed, timeout]);
     } catch (error) {
-      if (signal?.aborted) {
+      if (timedOut) {
+        // The bound elapsed. It is an acquisition failure, so it is counted once in the
+        // closest SRS 7.8 metric, exactly like a thrown acquisition error.
+        funnel.httpFailures = 1;
+        return this.finish(run, funnel, {
+          status: SourceRunStatus.FAILED,
+          unexpectedZeroResults: false,
+          errorSummary:
+            `source acquisition timed out after ${input.acquisitionTimeoutMs}ms; ` +
+            'operation abandoned (cooperative cancellation requested)',
+        });
+      }
+      if (externalSignal?.aborted) {
         // Shutdown, not a source fault: no HTTP failure is claimed.
         return this.finish(run, funnel, {
           status: SourceRunStatus.PARTIAL,
@@ -216,13 +330,16 @@ export class RunSourceCollection {
         unexpectedZeroResults: false,
         errorSummary: `source acquisition failed: ${describeError(error)}`,
       });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
     }
 
     funnel.collected = records.length;
     let abortedAt: number | null = null;
 
     for (let index = 0; index < records.length; index += 1) {
-      if (signal?.aborted) {
+      if (externalSignal?.aborted) {
         abortedAt = index;
         break;
       }
@@ -342,6 +459,7 @@ export class RunSourceCollection {
       parseFailures: funnel.parseFailures,
       httpFailures: funnel.httpFailures,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
+      enrichmentScheduled: ENRICHMENT_SCHEDULED,
       errorSummary: outcome.errorSummary,
     };
 
@@ -351,6 +469,16 @@ export class RunSourceCollection {
         sourceId: run.sourceId,
         runId: run.id,
         intendedStatus: outcome.status,
+      });
+    }
+
+    // Report the remaining dependency explicitly (SRS 7.7 step 10) rather than letting a
+    // SUCCEEDED run imply the downstream hand-off happened.
+    if (!ENRICHMENT_SCHEDULED) {
+      this.deps.logger.warn('SRS 7.7 step 10 deferred: no enrichment/matching handler is registered', {
+        sourceId: run.sourceId,
+        runId: run.id,
+        enrichmentScheduled: ENRICHMENT_SCHEDULED,
       });
     }
 

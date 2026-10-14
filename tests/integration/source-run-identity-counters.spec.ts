@@ -28,6 +28,7 @@ const OUTCOME: SourceRunOutcome = {
   undeduplicable: 3,
   fallbackIdentities: 2,
   unexpectedZeroResults: false,
+  enrichmentScheduled: false,
   errorSummary: null,
 };
 

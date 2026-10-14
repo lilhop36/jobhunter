@@ -40,7 +40,7 @@ const SOURCE_RUN_COLUMNS = Prisma.raw(`
   "startedAt", "finishedAt", "durationMs", "jobsDiscovered", "jobsAccepted",
   "jobsDuplicate", "jobsRejected", "undeduplicable", "fallbackIdentities",
   "parseFailures", "httpFailures",
-  "unexpectedZeroResults", "errorSummary"
+  "unexpectedZeroResults", "enrichmentScheduled", "errorSummary"
 `);
 
 /** The partial unique index that enforces FR-003 source exclusivity. */
@@ -64,6 +64,7 @@ interface SourceRunRow {
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
+  enrichmentScheduled: boolean;
   errorSummary: string | null;
 }
 
@@ -89,6 +90,7 @@ function toRecord(row: SourceRunRow): SourceRunRecord {
     parseFailures: row.parseFailures,
     httpFailures: row.httpFailures,
     unexpectedZeroResults: row.unexpectedZeroResults,
+    enrichmentScheduled: row.enrichmentScheduled,
     errorSummary: row.errorSummary,
   };
 }
@@ -155,6 +157,7 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
           "parseFailures" = ${outcome.parseFailures},
           "httpFailures" = ${outcome.httpFailures},
           "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},
+          "enrichmentScheduled" = ${outcome.enrichmentScheduled},
           "errorSummary" = ${outcome.errorSummary ?? null},
           "updatedAt" = ${NOW_UTC}
       WHERE "id" = ${runId}::uuid

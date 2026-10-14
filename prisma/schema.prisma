@@ -211,6 +211,12 @@ model SourceRun {
   parseFailures         Int              @default(0)
   httpFailures          Int              @default(0)
   unexpectedZeroResults Boolean          @default(false)
+  /// SRS 7.7 step 10 ("schedule enrichment/matching work"). Engineering-owned
+  /// observability, like the counters: the enrichment/matching stage has no registered
+  /// handler yet, so the hand-off cannot be enqueued. Recording it per run makes the
+  /// deferral an explicit state instead of an implicit gap behind a SUCCEEDED status.
+  /// `false` means the run did not schedule downstream work.
+  enrichmentScheduled   Boolean          @default(false)
   errorSummary          String?
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt

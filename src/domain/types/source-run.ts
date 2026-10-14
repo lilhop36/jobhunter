@@ -32,6 +32,13 @@ export interface SourceRunRecord {
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
+  /**
+   * Whether this run scheduled downstream enrichment/matching work (SRS 7.7 step 10).
+   * Always `false` today: the stage has no registered handler, so enqueueing would
+   * produce guaranteed permanent failures. Recorded explicitly so a `SUCCEEDED` status
+   * never implies step 10 ran.
+   */
+  enrichmentScheduled: boolean;
   errorSummary: string | null;
 }
 

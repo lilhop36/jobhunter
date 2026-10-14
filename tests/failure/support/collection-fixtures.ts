@@ -32,6 +32,15 @@ export const COLLECTION_TASK_TYPE = 'failure.collection-task';
  */
 export const COLLECTION_STALE_RUN_SECONDS = 1;
 
+/**
+ * Acquisition bound handed to `RunSourceCollection`.
+ *
+ * The crash harness blocks in `normalize`, not `collect`, so the fast fake acquisition
+ * must never trip this bound: the run only ends when the process is killed, which is the
+ * durable state the test asserts. Generous on purpose.
+ */
+export const COLLECTION_ACQUISITION_TIMEOUT_MS = 60_000;
+
 /** Identity of the worker process that is killed mid-collection. */
 export const COLLECTION_KILLED_WORKER_ID = 'failure-test-collection-killed';
 
@@ -125,6 +134,7 @@ export function createCollectionHandler(
       adapter: makeCollectionAdapter(sourceId, blockOn),
       now: new Date(),
       staleRunSeconds: COLLECTION_STALE_RUN_SECONDS,
+      acquisitionTimeoutMs: COLLECTION_ACQUISITION_TIMEOUT_MS,
     });
   };
 }

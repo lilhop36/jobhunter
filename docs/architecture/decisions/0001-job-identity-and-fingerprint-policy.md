@@ -452,8 +452,9 @@ domain, and passes them to the repositories; no repository invents one.
 SRS 7.7 numbers "acquire source content" (1) and "apply source rate limits" (2) before
 "create SourceRun" (3). This implementation **opens the run first**, for three reasons:
 
-1. SRS 7.6 requires source-level exclusivity *for collection*. The run row is that lock,
-   so it must be taken before any network work or two workers can collect one source.
+1. SRS 7.5 requires source-level exclusivity *for collection* (`Source collection requires
+   source-level exclusivity`, §7.5). The run row is that lock, so it must be taken before
+   any network work or two workers can collect one source.
 2. `CollectionContext.sourceRunId` is required by the reviewed adapter port, so the
    adapter cannot be called without a run.
 3. An acquisition failure would otherwise leave no record at all, and the SRS 7.8 "HTTP
@@ -462,11 +463,42 @@ SRS 7.7 numbers "acquire source content" (1) and "apply source rate limits" (2) 
 The run is a plain row, never a long transaction: no transaction is held across the
 network call or across records. This is recorded as a deviation rather than hidden.
 
-### Step 10 is not performed
+### Step 10 is deferred, with an explicit recorded state
 
-"Schedul[ing] enrichment/matching work" is deferred: those stages do not exist yet, and
-enqueueing work for an unregistered handler produces guaranteed permanent failures. A
-documented gap is better than invented failures.
+"Schedul[ing] enrichment/matching work" is **not performed**: those stages have no
+registered handler yet, and enqueueing work for an unregistered handler produces
+guaranteed permanent failures, which would be worse than a documented gap. Rather than
+leave the gap implicit behind a `SUCCEEDED` status, the run records it:
+
+- `SourceRun.enrichmentScheduled` (engineering-owned, `BOOLEAN NOT NULL DEFAULT false`) is
+  `false` on every run today, so a `SUCCEEDED` collection status can never be read as "the
+  whole pipeline ran";
+- the use case logs the remaining dependency (`SRS 7.7 step 10 deferred: no
+  enrichment/matching handler is registered`) on every run.
+
+`tests/integration/collection-idempotency.spec.ts` asserts both, and that no work task is
+enqueued. The column becomes `true` when the enrichment/matching handler exists; it is in
+the same engineering-owned class as the funnel counters and is not a §5.2 attribute.
+
+### Bounded acquisition
+
+`collect` is bounded by a required `acquisitionTimeoutMs` input (SRS 9.5, ENG-031), with
+**no default**, matching `staleRunSeconds`. The SRS defines no source-timeout value
+(`AI_ANALYSIS_TIMEOUT_MS` covers AI only), so the bound is an explicit input rather than an
+invented constant.
+
+The bound is enforced at this boundary, not trusted to the adapter, because an adapter
+that ignores cancellation would otherwise hang the attempt: the use case races `collect`
+against the bound and, on expiry, aborts the signal the adapter was handed, finalizes the
+run `FAILED` (counted once as an `httpFailures` acquisition failure), and records that the
+operation was **abandoned with cooperative cancellation requested** - never that it
+stopped. An acquisition that settles after the timeout cannot rewrite the run or become an
+unhandled rejection; it is logged and discarded. A worker shutdown (the external signal)
+is never reported as a timeout.
+
+A bound that is not a positive number of milliseconds is rejected with a `RangeError`
+before any work, because `0` would merely race the acquisition and make the same input
+sometimes succeed and sometimes fail.
 
 ### Funnel mapping
 
@@ -494,6 +526,7 @@ funnel metrics". Collection must not discard it.
 | Condition | Status |
 |-----------|--------|
 | acquisition failed | `FAILED`, `httpFailures = 1`, concrete error in `errorSummary` |
+| acquisition exceeded `acquisitionTimeoutMs` | `FAILED`, `httpFailures = 1`, `timed out after <ms>` plus an abandoned-operation note |
 | aborted by worker shutdown (during acquisition or mid-loop) | `PARTIAL`, no HTTP failure claimed, so no false source fault |
 | zero collected and the source declared `RESULTS_EXPECTED` | `PARTIAL`, `unexpectedZeroResults = true` |
 | one or more records failed to normalize | `PARTIAL` |
@@ -506,7 +539,7 @@ instead, which avoids inventing a health rule.
 ### Crash safety
 
 An abandoned run is recovered by reaping runs still active beyond `staleRunSeconds`
-*before* opening the new one (ENG-025, SRS 7.6), which is why that input is required.
+*before* opening the new one (ENG-025, SRS 7.5), which is why that input is required.
 Recovery is also what makes a retried attempt idempotent: identical evidence conflicts on
 the partial indexes and only `lastSeenAt` advances, and a Job keyed by the same identity
 is refreshed rather than duplicated.
