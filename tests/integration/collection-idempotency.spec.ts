@@ -4,7 +4,7 @@ import {
   type RunSourceCollectionInput,
   type RunSourceCollectionResult,
 } from '@application/ingestion';
-import { SourceRunStatus } from '@domain/enums';
+import { DescriptionQuality, SourceRunStatus } from '@domain/enums';
 import {
   SOURCE_RUN_LEASE_EXPIRED_REASON,
   SourceResultExpectation,
@@ -716,6 +716,51 @@ describe('RunSourceCollection', () => {
       undeduplicable,
       parseFailures,
     });
+  });
+
+  it('retains and promotes an UNUSABLE-description record instead of rejecting it (FR-007)', async () => {
+    const sourceId = await createSource();
+    const sufficient = Array.from({ length: 30 }, (_, i) => `responsibility${i}`).join(' ');
+    const rows = [
+      makeRawJob({
+        sourceJobIdentifier: 'dq-1',
+        rawTitle: 'Backend Engineer',
+        rawDescription: '\u200B', // invisible only, not content
+      }),
+      makeRawJob({
+        sourceJobIdentifier: 'dq-2',
+        rawTitle: 'Data Analyst',
+        rawDescription: 'Apply Submit Cancel', // boilerplate only
+      }),
+      makeRawJob({
+        sourceJobIdentifier: 'dq-3',
+        rawTitle: 'Platform Engineer',
+        rawDescription: sufficient,
+      }),
+    ];
+
+    const result = await collectOnce(makeAdapter(sourceId, rows));
+
+    // The SRS excludes UNUSABLE jobs from matching/notification, not from collection:
+    // they are persisted for traceability and counted, and nothing is rejected here.
+    expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
+    expect(result.funnel).toMatchObject({ collected: 3, parsed: 3, valid: 3, unique: 3 });
+    expect(result.run).toMatchObject({ jobsRejected: 0 });
+
+    const persisted = await prisma.job.findMany({
+      where: { sourceId },
+      orderBy: { identityKey: 'asc' },
+    });
+    expect(persisted.map((job) => job.descriptionQuality)).toEqual([
+      DescriptionQuality.UNUSABLE,
+      DescriptionQuality.UNUSABLE,
+      DescriptionQuality.SUFFICIENT,
+    ]);
+
+    // Raw evidence survives classification, so an UNUSABLE record can be reprocessed later.
+    expect(await countEvidence(sourceId)).toBe(3);
+    const firstEvidence = await rawJobs.findById(persisted[0].rawJobId as string);
+    expect(firstEvidence?.rawDescription).toBe('\u200B');
   });
 
   it('records SRS 7.7 step 10 as deferred, never as performed', async () => {

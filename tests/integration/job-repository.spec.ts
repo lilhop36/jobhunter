@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { DescriptionQuality, SalaryPeriod, SalaryType } from '@domain/enums';
 import { asDecimalAmount, asProbability, type NormalizedJob } from '@domain/types';
 import { rawContentHash } from '@domain/normalizers/job-identity';
+import { DESCRIPTION_QUALITY_VERSION } from '@domain/normalizers/description-quality';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
@@ -262,5 +263,27 @@ describe('job upsert', () => {
 
     const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job });
     expect(stored.descriptionQuality).toBe(DescriptionQuality.UNUSABLE);
+  });
+
+  it('persists a sufficient description and its classifier policy version (FR-007)', async () => {
+    const sourceId = await createSource('job-description-sufficient');
+    const description = Array.from({ length: 30 }, (_, i) => `responsibility${i}`).join(' ');
+    const job = await normalize({ rawDescription: description });
+    expect(job.descriptionQuality).toBe(DescriptionQuality.SUFFICIENT);
+    expect(job.provenance.descriptionQuality?.conversionMethod).toBe(DESCRIPTION_QUALITY_VERSION);
+
+    const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job });
+    expect(stored.descriptionQuality).toBe(DescriptionQuality.SUFFICIENT);
+
+    const rows = await prisma.$queryRawUnsafe<{ provenance: Record<string, unknown> }[]>(
+      'SELECT "provenance" FROM "jobs" WHERE "id" = $1::uuid',
+      stored.id,
+    );
+    expect(rows[0].provenance).toMatchObject({
+      descriptionQuality: {
+        provenance: 'DETERMINISTIC',
+        conversionMethod: DESCRIPTION_QUALITY_VERSION,
+      },
+    });
   });
 });

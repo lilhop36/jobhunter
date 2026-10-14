@@ -1,7 +1,6 @@
 import {
   ApplicationMethod,
   CalendarType,
-  DescriptionQuality,
   EmploymentType,
   HealthStatus,
   ProvenanceSource,
@@ -12,6 +11,10 @@ import { parseDate } from '@domain/normalizers/calendar';
 import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
 import { contentFingerprintV1 } from '@domain/normalizers/job-identity';
+import {
+  DESCRIPTION_QUALITY_VERSION,
+  classifyDescriptionQuality,
+} from '@domain/normalizers/description-quality';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type {
   CollectionContext,
@@ -141,6 +144,13 @@ export class FakeSourceAdapter implements JobSourceAdapter {
         conversionMethod: null,
         evidence: null,
       };
+      // The classification is derived deterministically from the captured text, so it is
+      // recorded as DETERMINISTIC with the policy version that produced it (ENG-003, FR-007).
+      provenance.descriptionQuality = {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: DESCRIPTION_QUALITY_VERSION,
+        evidence: null,
+      };
     }
     if (raw.rawLocation) {
       provenance.locationText = {
@@ -188,16 +198,14 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       };
     }
 
-    const hasDescription = Boolean(raw.rawDescription && raw.rawDescription.trim());
-
     return {
       canonicalUrl,
       title: raw.rawTitle,
       company: raw.rawCompany,
       description: raw.rawDescription,
-      // Presence-only rule for the test double; the real quality classifier
-      // (Appendix E) lands with the extraction stage.
-      descriptionQuality: hasDescription ? DescriptionQuality.SUFFICIENT : DescriptionQuality.UNUSABLE,
+      // Delegated to the shared, versioned classifier (ENG-016, FR-007) so this double
+      // exercises the real rules instead of a presence-only stub.
+      descriptionQuality: classifyDescriptionQuality(raw.rawDescription),
       locationText: raw.rawLocation,
       locationCategory: location.category,
       remoteStatus: location.remoteStatus,
