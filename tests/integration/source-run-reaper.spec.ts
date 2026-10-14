@@ -238,3 +238,44 @@ describe('stale run recovery (ENG-025)', () => {
     expect(runs.filter((row) => row.status === 'RUNNING')).toHaveLength(0);
   });
 });
+
+describe('stale run recovery input guard (ENG-025)', () => {
+  // A non-positive maximum duration is a caller error, not a request to reclaim
+  // everything. `reapStaleRuns(0)` would otherwise compute `startedAt < now()` and
+  // fail every active run - including one that is perfectly healthy - so the guard
+  // must reject the bound *before* the recovery UPDATE executes. These cases seed a
+  // genuinely stale run and assert it survives untouched, which proves the throw
+  // happens first rather than after a partial reclaim.
+  it.each([0, -1])('rejects a max duration of %s before touching any run', async (maxDurationSeconds) => {
+    const run = await repo.start({ sourceId: await createSource(`guard-${maxDurationSeconds}`) });
+    await ageRun(run.id, 120);
+
+    await expect(repo.reapStaleRuns(maxDurationSeconds)).rejects.toBeInstanceOf(RangeError);
+
+    const stored = await repo.findById(run.id);
+    expect(stored?.status).toBe(SourceRunStatus.RUNNING);
+    expect(stored?.finishedAt).toBeNull();
+    expect(stored?.errorSummary).toBeNull();
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects a non-finite max duration (%s)',
+    async (maxDurationSeconds) => {
+      const run = await repo.start({ sourceId: await createSource('guard-nonfinite') });
+      await ageRun(run.id, 120);
+
+      await expect(repo.reapStaleRuns(maxDurationSeconds)).rejects.toBeInstanceOf(RangeError);
+
+      expect((await repo.findById(run.id))?.status).toBe(SourceRunStatus.RUNNING);
+    },
+  );
+
+  it('still reclaims a stale run when the bound is valid', async () => {
+    const run = await repo.start({ sourceId: await createSource('guard-valid') });
+    await ageRun(run.id, 120);
+
+    const reaped = await repo.reapStaleRuns(60);
+
+    expect(reaped.map((record) => record.id)).toEqual([run.id]);
+  });
+});
