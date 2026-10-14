@@ -15,6 +15,10 @@ import {
   DESCRIPTION_QUALITY_VERSION,
   classifyDescriptionQuality,
 } from '@domain/normalizers/description-quality';
+import {
+  EMPLOYMENT_TYPE_VERSION,
+  classifyEmploymentType,
+} from '@domain/normalizers/employment-type';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type {
   CollectionContext,
@@ -82,6 +86,10 @@ export class FakeSourceAdapter implements JobSourceAdapter {
     const canonicalUrl = canonicalizeUrl(raw.sourceUrl);
     const location = classifyLocation({ text: raw.rawLocation });
     const salary = parseSalary(raw.rawSalaryText);
+    const employment = classifyEmploymentType({
+      title: raw.rawTitle,
+      description: raw.rawDescription,
+    });
 
     // Delegated to the shared versioned fingerprint module (ENG-016, ADR-0001). The legacy
     // 32-bit `contentFingerprint` in url-normalizer.ts is unsafe even as a lookup key and
@@ -190,6 +198,13 @@ export class FakeSourceAdapter implements JobSourceAdapter {
         evidence: raw.rawSalaryText,
       };
     }
+    if (employment.type !== EmploymentType.UNKNOWN) {
+      provenance.employmentType = {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: EMPLOYMENT_TYPE_VERSION,
+        evidence: employment.evidence,
+      };
+    }
     if (fingerprint) {
       provenance.contentFingerprint = {
         provenance: ProvenanceSource.DETERMINISTIC,
@@ -211,7 +226,7 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       remoteStatus: location.remoteStatus,
       publishedDate,
       salary,
-      employmentType: EmploymentType.UNKNOWN,
+      employmentType: employment.type,
       application: {
         method: ApplicationMethod.UNKNOWN,
         applyUrl: null,

@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Prisma } from '@prisma/client';
-import { DescriptionQuality, SalaryPeriod, SalaryType } from '@domain/enums';
+import { DescriptionQuality, EmploymentType, SalaryPeriod, SalaryType } from '@domain/enums';
 import { asDecimalAmount, asProbability, type NormalizedJob } from '@domain/types';
 import { rawContentHash } from '@domain/normalizers/job-identity';
 import { DESCRIPTION_QUALITY_VERSION } from '@domain/normalizers/description-quality';
+import { EMPLOYMENT_TYPE_VERSION } from '@domain/normalizers/employment-type';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
@@ -285,5 +286,23 @@ describe('job upsert', () => {
         conversionMethod: DESCRIPTION_QUALITY_VERSION,
       },
     });
+  });
+
+  it('persists the extracted employment type and its policy version (FR-009)', async () => {
+    const sourceId = await createSource('job-employment-type');
+    const job = await normalize({ rawTitle: 'Backend Engineer (Contract)' });
+    expect(job.employmentType).toBe(EmploymentType.CONTRACT);
+    expect(job.provenance.employmentType?.conversionMethod).toBe(EMPLOYMENT_TYPE_VERSION);
+
+    const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job });
+
+    const rows = await prisma.$queryRawUnsafe<
+      { employmentType: string; provenance: Record<string, { conversionMethod?: string }> }[]
+    >(
+      'SELECT "employmentType"::text AS "employmentType", "provenance" FROM "jobs" WHERE "id" = $1::uuid',
+      stored.id,
+    );
+    expect(rows[0].employmentType).toBe('CONTRACT');
+    expect(rows[0].provenance.employmentType?.conversionMethod).toBe(EMPLOYMENT_TYPE_VERSION);
   });
 });
