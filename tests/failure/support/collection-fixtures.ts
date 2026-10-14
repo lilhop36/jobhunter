@@ -4,6 +4,7 @@ import { PermanentWorkTaskError, type WorkTaskHandler } from '@application/worke
 import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
+import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
 import type {
   CollectionContext,
@@ -125,6 +126,7 @@ export function createCollectionHandler(
     sourceRuns: new PrismaSourceRunRepository(prisma),
     rawJobs: new PrismaRawJobRepository(prisma),
     jobs: new PrismaJobRepository(prisma),
+    jobSources: new PrismaJobSourceRepository(prisma),
     logger: silentWorkerLogger,
   });
 

@@ -1,4 +1,5 @@
 import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { SOURCE_HEALTH_POLICY_VERSION, classifySourceHealth } from '@domain/health/source-health-policy';
 import { rawContentHash, resolveSourceRecordIdentity } from '@domain/normalizers';
 import {
   SourceResultExpectation,
@@ -8,6 +9,7 @@ import {
   type SourceRunRecord,
 } from '@domain/types';
 import type { JobRepository } from '@ports/job-repository';
+import type { JobSourceRepository } from '@ports/job-source-repository';
 import type { RawJobRepository } from '@ports/raw-job-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
@@ -59,6 +61,14 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * evidence is already persisted, so the evidence is never lost and the rest of the run
  * continues. Abandoned runs from a crashed worker are recovered by reaping stale runs
  * before the new run starts (ENG-025).
+ *
+ * ## Source health
+ *
+ * A run that finalizes also records what it said about its source (FR-020, SRS 4.9):
+ * status, and the last success or error time. This lives here rather than in the caller so
+ * no future caller of this use case can collect a source without recording its health. A
+ * run whose outcome was discarded records nothing - a reaped run is evidence about the
+ * worker lease, not about the source.
  */
 
 /** Terminal run statuses this use case can record. */
@@ -142,6 +152,8 @@ export interface RunSourceCollectionDeps {
   sourceRuns: SourceRunRepository;
   rawJobs: RawJobRepository;
   jobs: JobRepository;
+  /** Source store, used only to record the health the finished run implies (FR-020). */
+  jobSources: JobSourceRepository;
   logger: WorkerLogger;
 }
 
@@ -470,6 +482,10 @@ export class RunSourceCollection {
         runId: run.id,
         intendedStatus: outcome.status,
       });
+    } else {
+      // FR-020 (SRS 4.9): the source's health is whatever its most recent run said. Only a
+      // run that actually finalized is evidence - a discarded outcome says nothing.
+      await this.recordSourceHealth(finalized);
     }
 
     // Report the remaining dependency explicitly (SRS 7.7 step 10) rather than letting a
@@ -488,5 +504,31 @@ export class RunSourceCollection {
       status: outcome.status,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
     };
+  }
+
+  /**
+   * Record the health this run implies for its source (FR-020, SRS 4.9 / 7.3).
+   *
+   * Kept on the run's own outcome rather than counted over history, so the rule stays the
+   * domain's (`@domain/health`) and this method only applies it. A failure here propagates:
+   * the run is already finalized, so the task retries and records health on the retry, and
+   * a source whose health cannot be written stays visible instead of silently healthy.
+   */
+  private async recordSourceHealth(run: SourceRunRecord): Promise<void> {
+    const update = classifySourceHealth({
+      runStatus: run.status,
+      finishedAt: run.finishedAt,
+      unexpectedZeroResults: run.unexpectedZeroResults,
+    });
+    if (update === null) return;
+
+    await this.deps.jobSources.applyHealthUpdate(run.sourceId, update);
+    this.deps.logger.info('source health recorded from the completed run', {
+      sourceId: run.sourceId,
+      runId: run.id,
+      healthStatus: update.status,
+      policy: SOURCE_HEALTH_POLICY_VERSION,
+      reason: update.reason,
+    });
   }
 }

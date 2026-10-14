@@ -1,5 +1,8 @@
-import { PrismaClient } from '@prisma/client';
-import { JobSourceRepository, SchedulableSource } from '@ports/job-source-repository';
+import { Prisma, PrismaClient } from '@prisma/client';
+import { JobSourceRepository, SchedulableSource, SourceHealthUpdate } from '@ports/job-source-repository';
+
+/** See PrismaSourceRunRepository for why the timestamp columns use the UTC clock. */
+const NOW_UTC = Prisma.raw("date_trunc('milliseconds', now() AT TIME ZONE 'UTC')");
 
 interface SchedulableSourceRow {
   id: string;
@@ -38,5 +41,25 @@ export class PrismaJobSourceRepository implements JobSourceRepository {
       schedule: row.schedule,
       lastAttemptAt: row.lastAttemptAt === null ? null : toDate(row.lastAttemptAt),
     }));
+  }
+
+  /**
+   * Record what the most recent collection said about the source (FR-020).
+   *
+   * `COALESCE` is the "null means leave it" rule from the port: a failure must not erase
+   * `lastSuccessfulRunAt`, and a success must not erase `lastErrorAt`, so the two columns
+   * together still answer "when did it last work" and "when did it last break".
+   */
+  async applyHealthUpdate(sourceId: string, update: SourceHealthUpdate): Promise<void> {
+    // The row is guaranteed to exist: `source_runs.sourceId` is a foreign key to it and the
+    // caller records health for a run it just finalized.
+    await this.prisma.$executeRaw`
+      UPDATE "job_sources"
+      SET "healthStatus" = ${update.status}::"HealthStatus",
+          "lastSuccessfulRunAt" = COALESCE(${update.lastSuccessfulRunAt}, "lastSuccessfulRunAt"),
+          "lastErrorAt" = COALESCE(${update.lastErrorAt}, "lastErrorAt"),
+          "updatedAt" = ${NOW_UTC}
+      WHERE "id" = ${sourceId}::uuid
+    `;
   }
 }

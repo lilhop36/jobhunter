@@ -20,6 +20,7 @@ import type {
 } from '@ports/source-adapter';
 import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
+import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
@@ -46,6 +47,7 @@ const collection = new RunSourceCollection({
   sourceRuns,
   rawJobs,
   jobs,
+  jobSources: new PrismaJobSourceRepository(prisma),
   logger: silentWorkerLogger,
 });
 
@@ -557,6 +559,7 @@ describe('RunSourceCollection', () => {
       sourceRuns,
       rawJobs,
       jobs,
+      jobSources: new PrismaJobSourceRepository(prisma),
       logger: makeCapturingLogger(logs),
     });
     const adapter = new SlowCollectAdapter(
@@ -770,6 +773,7 @@ describe('RunSourceCollection', () => {
       sourceRuns,
       rawJobs,
       jobs,
+      jobSources: new PrismaJobSourceRepository(prisma),
       logger: makeCapturingLogger(logs),
     });
 
