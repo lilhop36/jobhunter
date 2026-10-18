@@ -140,6 +140,24 @@ enum ProvenanceSource {
   AI
 }
 
+/// SRS 5.2 lists `CandidateProfile.remotePreference` but defines no value set; these four
+/// are engineering-owned (ADR-0005). Only the two *exclusive* states penalize a
+/// contradicting posting; `NO_PREFERENCE` is the truthful "not stated" value.
+enum RemotePreference {
+  REMOTE_REQUIRED
+  REMOTE_PREFERRED
+  NO_PREFERENCE
+  ONSITE_ONLY
+}
+
+/// SRS 5.2 lists `CandidateProfile.relocationPreference` but defines no value set
+/// (ADR-0005). `UNDECIDED` is the truthful "not stated" value and never implies willingness.
+enum RelocationPreference {
+  WILLING
+  NOT_WILLING
+  UNDECIDED
+}
+
 // Engineering-owned state machines (not defined in the SRS).
 enum HealthStatus {
   HEALTHY
@@ -355,6 +373,120 @@ model WorkTask {
   @@index([status, runAfter, priority])
   @@index([leaseExpiresAt])
   @@map("work_tasks")
+}
+
+// ---------------------------------------------------------------------------
+// M2 tables: the candidate matching profile (SRS 4.5, 5.2; FR-012)
+//
+// Milestone 2 is "seeded candidate" + matcher. These tables hold what the
+// candidate *declared*; nothing here is derived from postings, and a value the
+// candidate never stated is NULL or an empty list rather than a guess (ENG-001).
+// ---------------------------------------------------------------------------
+
+model User {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email String @unique
+  /// SRS 5.2 lists `role` and `status` but Appendix A defines no value set for either, so
+  /// they are plain strings with the documented v1 defaults and become enums when
+  /// authentication lands. `passwordHash` is deliberately absent: the SRS makes it
+  /// conditional on password auth, and the v1 interface is Telegram deep-link linking
+  /// (SRS 3.2).
+  role   String @default("OWNER")
+  status String @default("ACTIVE")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profile CandidateProfile?
+
+  @@map("users")
+}
+
+model CandidateProfile {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @unique @db.Uuid
+
+  experienceYears Int?
+  remotePreference RemotePreference
+  relocationPreference RelocationPreference
+  /// SRS 5.2 lists `employmentPreferences` as a profile attribute (plural), so it is an
+  /// array rather than a join table. An empty array means "not stated".
+  employmentPreferences EmploymentType[]
+  /// SRS 5.2 names `salaryPreference` as one attribute; it is modelled as its four
+  /// columns (ENG-006: money as exact decimal, never float). "No salary preference" is
+  /// the all-absent combination, which `PrismaCandidateProfileRepository` maps back to
+  /// `null` — see the mapping table there.
+  salaryMin              Decimal?      @db.Decimal(14, 2)
+  salaryCurrency         String?
+  salaryPeriod           SalaryPeriod?
+  salaryRequireDisclosed Boolean       @default(false)
+  /// Content-derived revision of the profile (`profileVersionOf` in
+  /// @domain/matching/profile-version). A JobMatch records the revision it was scored
+  /// against, so a later profile edit cannot silently reinterpret a stored match
+  /// (ENG-012/ENG-013).
+  profileVersion String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  skills              CandidateSkill[]
+  targetRoles         TargetRole[]
+  locationPreferences LocationPreference[]
+
+  @@map("candidate_profiles")
+}
+
+model CandidateSkill {
+  id                 String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  candidateProfileId String @db.Uuid
+  canonicalSkill     String
+  /// SRS 5.2 `CandidateSkill.skillType`. The SRS names the attribute but no enum for it,
+  /// so the Appendix A skill-evidence ladder is reused (ADR-0005 §7).
+  skillType  SkillEvidence
+  /// How firmly the candidate holds the skill, in [0, 1]; weights its match credit.
+  confidence Decimal       @db.Decimal(4, 3)
+  createdAt  DateTime      @default(now())
+
+  /// SRS 5.6 "Recommended indexes": CandidateSkill(candidateProfileId, canonicalSkill)
+  /// UNIQUE. Case-insensitive duplicate detection is enforced by the seed's validation
+  /// rather than a functional index because the seed is the only write path; a
+  /// case-insensitive constraint belongs here once profile editing exists.
+  profile CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([candidateProfileId, canonicalSkill], map: "one_candidate_skill_per_profile")
+  @@map("candidate_skills")
+}
+
+model TargetRole {
+  id                 String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  candidateProfileId String @db.Uuid
+  title              String
+  /// Alternative spellings/titles meaning the same role. Empty means "none stated".
+  aliases   String[]
+  createdAt DateTime @default(now())
+
+  profile CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([candidateProfileId, title], map: "one_target_role_per_profile")
+  @@map("target_roles")
+}
+
+model LocationPreference {
+  id                 String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  candidateProfileId String @db.Uuid
+  category           LocationCategory
+  /// Free-text place for a category the gazetteer cannot name; null means "category only".
+  text      String?
+  createdAt DateTime @default(now())
+
+  profile CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  /// PostgreSQL treats NULLs as distinct, so this catches duplicate (category, text)
+  /// pairs but not two rows with the same category and no text. The seed's validation
+  /// rejects the whole set case-insensitively; a total constraint is deferred until
+  /// profile editing exists (same reasoning as CandidateSkill above).
+  @@unique([candidateProfileId, category, text], map: "one_location_preference_per_profile")
+  @@map("location_preferences")
 }
 
 model SystemLog {
