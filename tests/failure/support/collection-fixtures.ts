@@ -1,45 +1,31 @@
-import type { PrismaClient } from '@prisma/client';
-import { RunSourceCollection } from '@application/ingestion';
-import { PermanentWorkTaskError, type WorkTaskHandler } from '@application/worker';
-import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
-import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
-import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
-import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
-import type {
-  CollectionContext,
-  HealthCheckContext,
-  JobSourceAdapter,
-} from '@ports/source-adapter';
-import { silentWorkerLogger } from '@ports/worker-logger';
+import type { NormalizedJob, RawJobEvidence } from '@domain/types';
+import type { CollectionContext, HealthCheckContext, JobSourceAdapter } from '@ports/source-adapter';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../../support/fake-source-adapter';
 
 /**
- * Shared fixtures for the collection crash test.
- *
- * The child process and the parent test must agree on the task type, the record set,
- * and *where* the child blocks, so both import these values instead of duplicating
- * literals that could silently drift apart.
+ * Values shared between the collection crash test and the worker entry-point process it
+ * starts, so both read one definition instead of duplicating literals that could drift.
  */
 
-/** Task type whose handler runs one collection. */
-export const COLLECTION_TASK_TYPE = 'failure.collection-task';
-
 /**
- * Safety bound handed to `RunSourceCollection`. Short so the recovery wait in the
- * test is brief, while still being a real time-based bound evaluated on the database
- * clock - the abandoned run is recovered because its owner died, not because the test
- * rewrote its state.
+ * Safety bound handed to the worker as `SOURCE_STALE_RUN_SECONDS`. Short so the recovery
+ * wait in the test is brief, while still being a real time-based bound evaluated on the
+ * database clock - the abandoned run is recovered because its owner died, not because the
+ * test rewrote its state.
  */
 export const COLLECTION_STALE_RUN_SECONDS = 1;
 
 /**
- * Acquisition bound handed to `RunSourceCollection`.
+ * Acquisition bound handed to the worker as `SOURCE_ACQUISITION_TIMEOUT_MS`.
  *
- * The crash harness blocks in `normalize`, not `collect`, so the fast fake acquisition
- * must never trip this bound: the run only ends when the process is killed, which is the
- * durable state the test asserts. Generous on purpose.
+ * The harness blocks in `normalize`, not `collect`, so the fake acquisition resolves
+ * immediately and must never trip this bound - the run only ends when the process is
+ * killed, which is the durable state the test asserts. The value still has to obey the
+ * entry point's rule that an acquisition bound must be shorter than the stale-run bound:
+ * a run whose own acquisition bound outlived the stale bound could be reaped while it was
+ * still alive, so the configuration is rejected outright.
  */
-export const COLLECTION_ACQUISITION_TIMEOUT_MS = 60_000;
+export const COLLECTION_ACQUISITION_TIMEOUT_MS = 500;
 
 /** Identity of the worker process that is killed mid-collection. */
 export const COLLECTION_KILLED_WORKER_ID = 'failure-test-collection-killed';
@@ -82,59 +68,27 @@ export function collectionRecords(): RawJobEvidence[] {
 /**
  * Adapter over the shared record set, whose `normalize` never settles for `blockOn`.
  *
- * `blockOn: null` gives the same records without the block, so the recovery run
- * exercises the identical pipeline and simply completes.
+ * `blockOn: null` gives the same records without the block, so the recovery run exercises
+ * the identical pipeline and simply completes. Registered by the test entry point, which
+ * is what makes the kill land inside the real collection code path.
  */
-function makeCollectionAdapter(sourceId: string, blockOn: string | null): JobSourceAdapter {
+export function makeCollectionAdapter(sourceId: string, blockOn: string | null): JobSourceAdapter {
   const inner = new FakeSourceAdapter(makeFakeConfig({ sourceId }), collectionRecords());
+  if (blockOn === null) return inner;
+
   return {
-    get config() {
-      return inner.config;
-    },
+    config: inner.config,
     collect: (context: CollectionContext) => inner.collect(context),
+    // Never settles, so the worker is still inside the record loop when it is killed.
     normalize: (raw: RawJobEvidence): Promise<NormalizedJob> =>
-      blockOn !== null && raw.sourceJobIdentifier === blockOn
+      raw.sourceJobIdentifier === blockOn
         ? new Promise<NormalizedJob>(() => undefined)
         : inner.normalize(raw),
-    healthCheck: (context: HealthCheckContext): Promise<HealthResult> => inner.healthCheck(context),
+    healthCheck: (context: HealthCheckContext) => inner.healthCheck(context),
   };
 }
 
-/** Payload of a collection task. */
+/** Payload of a collection task, in the shape the registered handler parses. */
 export function collectionTaskPayload(sourceId: string): { sourceId: string } {
   return { sourceId };
-}
-
-function sourceIdFromTaskPayload(payload: unknown): string {
-  const sourceId = (payload as { sourceId?: unknown } | null)?.sourceId;
-  if (typeof sourceId !== 'string' || sourceId.length === 0) {
-    throw new PermanentWorkTaskError('collection task payload requires a sourceId');
-  }
-  return sourceId;
-}
-
-/**
- * Handler that collects one source, shared by the child process and the recovery
- * worker, so the recovered attempt runs the same code path as the crashed one.
- */
-export function createCollectionHandler(
-  prisma: PrismaClient,
-  blockOn: string | null,
-): WorkTaskHandler {
-  const collection = new RunSourceCollection({
-    sourceRuns: new PrismaSourceRunRepository(prisma),
-    rawJobs: new PrismaRawJobRepository(prisma),
-    jobs: new PrismaJobRepository(prisma),
-    logger: silentWorkerLogger,
-  });
-
-  return async ({ task }) => {
-    const sourceId = sourceIdFromTaskPayload(task.payload);
-    await collection.run({
-      adapter: makeCollectionAdapter(sourceId, blockOn),
-      now: new Date(),
-      staleRunSeconds: COLLECTION_STALE_RUN_SECONDS,
-      acquisitionTimeoutMs: COLLECTION_ACQUISITION_TIMEOUT_MS,
-    });
-  };
 }
