@@ -6,6 +6,7 @@ import {
   SourceRunRecord,
 } from '@domain/types';
 import {
+  SourceHealthConsequence,
   SourceRunActiveError,
   SourceRunOutcome,
   SourceRunRepository,
@@ -142,29 +143,73 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
     }
   }
 
-  async finalize(runId: string, outcome: SourceRunOutcome): Promise<SourceRunRecord | null> {
-    const rows = await this.prisma.$queryRaw<SourceRunRow[]>`
-      UPDATE "source_runs"
-      SET "status" = ${outcome.status}::"SourceRunStatus",
-          "finishedAt" = ${NOW_UTC},
-          "durationMs" = ${DURATION_MS},
-          "jobsDiscovered" = ${outcome.jobsDiscovered},
-          "jobsAccepted" = ${outcome.jobsAccepted},
-          "jobsDuplicate" = ${outcome.jobsDuplicate},
-          "jobsRejected" = ${outcome.jobsRejected},
-          "undeduplicable" = ${outcome.undeduplicable},
-          "fallbackIdentities" = ${outcome.fallbackIdentities},
-          "parseFailures" = ${outcome.parseFailures},
-          "httpFailures" = ${outcome.httpFailures},
-          "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},
-          "enrichmentScheduled" = ${outcome.enrichmentScheduled},
-          "errorSummary" = ${outcome.errorSummary ?? null},
-          "updatedAt" = ${NOW_UTC}
-      WHERE "id" = ${runId}::uuid
-        AND "status" IN (${ACTIVE_RUN_STATUS_LIST})
-      RETURNING ${SOURCE_RUN_COLUMNS}
-    `;
-    return rows.length === 1 ? toRecord(rows[0]) : null;
+  /**
+   * Record the terminal outcome, and in the same transaction the health it implies for the
+   * run's source (FR-020).
+   *
+   * The two rows move together because they are one observation. Written as two statements
+   * in autocommit, a crash between them would leave a terminal run whose source still looked
+   * healthy after a failed collection, with nothing left to correct it. `health` is already
+   * decided by `@domain/health` (ADR-0001); this only stores it.
+   *
+   * Both writes use `now()`, which PostgreSQL evaluates once per transaction, so the run's
+   * `finishedAt` and the health timestamp it dates are exactly the same instant.
+   */
+  async finalize(
+    runId: string,
+    outcome: SourceRunOutcome,
+    health: SourceHealthConsequence | null,
+  ): Promise<SourceRunRecord | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<SourceRunRow[]>`
+        UPDATE "source_runs"
+        SET "status" = ${outcome.status}::"SourceRunStatus",
+            "finishedAt" = ${NOW_UTC},
+            "durationMs" = ${DURATION_MS},
+            "jobsDiscovered" = ${outcome.jobsDiscovered},
+            "jobsAccepted" = ${outcome.jobsAccepted},
+            "jobsDuplicate" = ${outcome.jobsDuplicate},
+            "jobsRejected" = ${outcome.jobsRejected},
+            "undeduplicable" = ${outcome.undeduplicable},
+            "fallbackIdentities" = ${outcome.fallbackIdentities},
+            "parseFailures" = ${outcome.parseFailures},
+            "httpFailures" = ${outcome.httpFailures},
+            "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},
+            "enrichmentScheduled" = ${outcome.enrichmentScheduled},
+            "errorSummary" = ${outcome.errorSummary ?? null},
+            "updatedAt" = ${NOW_UTC}
+        WHERE "id" = ${runId}::uuid
+          AND "status" IN (${ACTIVE_RUN_STATUS_LIST})
+        RETURNING ${SOURCE_RUN_COLUMNS}
+      `;
+      // The fenced finalizer: the run was already terminal (a reaped zombie), so this
+      // attempt's outcome - and any health it claimed about the source - is discarded.
+      if (rows.length !== 1) return null;
+      const run = toRecord(rows[0]);
+
+      if (health !== null) {
+        const updated = await tx.$executeRaw`
+          UPDATE "job_sources"
+          SET "healthStatus" = ${health.status}::"HealthStatus",
+              "lastSuccessfulRunAt" = CASE WHEN ${health.countsAsSuccess}::boolean
+                                           THEN ${NOW_UTC} ELSE "lastSuccessfulRunAt" END,
+              "lastErrorAt" = CASE WHEN ${health.countsAsSuccess}::boolean
+                                   THEN "lastErrorAt" ELSE ${NOW_UTC} END,
+              "updatedAt" = ${NOW_UTC}
+          WHERE "id" = ${run.sourceId}::uuid
+        `;
+        // `source_runs.sourceId` is a foreign key, so the row must exist: a zero-row update
+        // means the run we just finalized points at no source, which is a bug worth failing
+        // (and rolling back) rather than silently dropping the health change.
+        if (updated !== 1) {
+          throw new Error(
+            `could not record source health: no job source ${run.sourceId} for run ${run.id}`,
+          );
+        }
+      }
+
+      return run;
+    });
   }
 
   async reapStaleRuns(maxDurationSeconds: number): Promise<SourceRunRecord[]> {

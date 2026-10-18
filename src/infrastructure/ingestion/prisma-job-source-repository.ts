@@ -1,33 +1,81 @@
-import { Prisma, PrismaClient } from '@prisma/client';
-import { JobSourceRepository, SchedulableSource, SourceHealthUpdate } from '@ports/job-source-repository';
+import { JobSource, PrismaClient, SourceRun } from '@prisma/client';
+import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import {
+  JobSourceRepository,
+  ListRunsOptions,
+  ListSourcesOptions,
+  PaginatedRuns,
+  PaginatedSources,
+  SchedulableSource,
+  SourceDetail,
+  SourceRunSummary,
+} from '@ports/job-source-repository';
 
-/** See PrismaSourceRunRepository for why the timestamp columns use the UTC clock. */
-const NOW_UTC = Prisma.raw("date_trunc('milliseconds', now() AT TIME ZONE 'UTC')");
+/** The one run a source row is joined to: its most recent, by the run-history order. */
+const LATEST_RUN_ORDER = [{ startedAt: 'desc' }, { id: 'desc' }] as const;
 
-interface SchedulableSourceRow {
-  id: string;
-  name: string;
-  schedule: string | null;
-  lastAttemptAt: Date | string | null;
-}
-
-function toDate(value: Date | string): Date {
-  return value instanceof Date ? value : new Date(value);
-}
+type JobSourceWithLatestRun = JobSource & { runs: SourceRun[] };
 
 /**
- * Source read model for the scheduler (FR-001/FR-002).
- *
- * The last attempt is the most recent run start, whatever its status — a failing source must
- * still be retried on its interval rather than on every tick. The correlated `max` rides the
- * `(sourceId, startedAt)` index on `source_runs`, so listing enabled sources stays a single
- * statement with no external I/O.
+ * Prisma models its enums as string-literal unions, the domain as TypeScript enums. The
+ * values are identical (they are the same database types), but the two are not structurally
+ * assignable, so each is converted at this boundary — the one place allowed to know both.
  */
+function toRunSummary(run: SourceRun): SourceRunSummary {
+  return {
+    id: run.id,
+    status: run.status as SourceRunStatus,
+    trigger: run.trigger as SourceRunTrigger,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    durationMs: run.durationMs,
+    jobsDiscovered: run.jobsDiscovered,
+    jobsAccepted: run.jobsAccepted,
+    jobsDuplicate: run.jobsDuplicate,
+    jobsRejected: run.jobsRejected,
+    undeduplicable: run.undeduplicable,
+    fallbackIdentities: run.fallbackIdentities,
+    parseFailures: run.parseFailures,
+    httpFailures: run.httpFailures,
+    unexpectedZeroResults: run.unexpectedZeroResults,
+    enrichmentScheduled: run.enrichmentScheduled,
+    errorSummary: run.errorSummary,
+  };
+}
+
+function toSourceDetail(row: JobSourceWithLatestRun): SourceDetail {
+  const latest = row.runs[0];
+  return {
+    id: row.id,
+    name: row.name,
+    adapterType: row.adapterType,
+    adapterVersion: row.adapterVersion,
+    enabled: row.enabled,
+    schedule: row.schedule,
+    healthStatus: row.healthStatus as HealthStatus,
+    lastSuccessfulRunAt: row.lastSuccessfulRunAt,
+    lastErrorAt: row.lastErrorAt,
+    latestRun: latest ? toRunSummary(latest) : null,
+  };
+}
+
 export class PrismaJobSourceRepository implements JobSourceRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
+  /**
+   * Every enabled source with its last collection attempt. Sources with no schedule are
+   * included so the scheduler can distinguish "not scheduled" from "scheduled but broken";
+   * filtering them out here would hide a misconfigured source from its own diagnostics.
+   */
   async listSchedulable(): Promise<SchedulableSource[]> {
-    const rows = await this.prisma.$queryRaw<SchedulableSourceRow[]>`
+    const rows = await this.prisma.$queryRaw<
+      {
+        id: string;
+        name: string;
+        schedule: string | null;
+        lastAttemptAt: Date | string | null;
+      }[]
+    >`
       SELECT s."id", s."name", s."schedule",
              (SELECT max(r."startedAt") FROM "source_runs" r WHERE r."sourceId" = s."id") AS "lastAttemptAt"
       FROM "job_sources" s
@@ -39,27 +87,69 @@ export class PrismaJobSourceRepository implements JobSourceRepository {
       id: row.id,
       name: row.name,
       schedule: row.schedule,
-      lastAttemptAt: row.lastAttemptAt === null ? null : toDate(row.lastAttemptAt),
+      lastAttemptAt: row.lastAttemptAt === null ? null : new Date(row.lastAttemptAt),
     }));
   }
 
-  /**
-   * Record what the most recent collection said about the source (FR-020).
-   *
-   * `COALESCE` is the "null means leave it" rule from the port: a failure must not erase
-   * `lastSuccessfulRunAt`, and a success must not erase `lastErrorAt`, so the two columns
-   * together still answer "when did it last work" and "when did it last break".
-   */
-  async applyHealthUpdate(sourceId: string, update: SourceHealthUpdate): Promise<void> {
-    // The row is guaranteed to exist: `source_runs.sourceId` is a foreign key to it and the
-    // caller records health for a run it just finalized.
-    await this.prisma.$executeRaw`
-      UPDATE "job_sources"
-      SET "healthStatus" = ${update.status}::"HealthStatus",
-          "lastSuccessfulRunAt" = COALESCE(${update.lastSuccessfulRunAt}, "lastSuccessfulRunAt"),
-          "lastErrorAt" = COALESCE(${update.lastErrorAt}, "lastErrorAt"),
-          "updatedAt" = ${NOW_UTC}
-      WHERE "id" = ${sourceId}::uuid
-    `;
+  async listSources(options: ListSourcesOptions): Promise<PaginatedSources> {
+    const { includeDisabled = false, healthStatus, cursor, limit } = options;
+
+    const rows = await this.prisma.jobSource.findMany({
+      where: {
+        ...(includeDisabled ? {} : { enabled: true }),
+        ...(healthStatus ? { healthStatus } : {}),
+        // Keyset, not offset: `name` is unique, so `name > cursor` is a total order and a
+        // concurrently inserted source cannot shift a later page.
+        ...(cursor ? { name: { gt: cursor.name } } : {}),
+      },
+      orderBy: { name: 'asc' },
+      take: limit + 1,
+      include: { runs: { orderBy: [...LATEST_RUN_ORDER], take: 1 } },
+    });
+
+    const page = rows.slice(0, limit);
+    return {
+      sources: page.map(toSourceDetail),
+      nextCursor: rows.length > limit ? { name: page[page.length - 1].name } : null,
+    };
+  }
+
+  async findById(id: string): Promise<SourceDetail | null> {
+    const row = await this.prisma.jobSource.findUnique({
+      where: { id },
+      include: { runs: { orderBy: [...LATEST_RUN_ORDER], take: 1 } },
+    });
+    return row === null ? null : toSourceDetail(row);
+  }
+
+  async listRuns(sourceId: string, options: ListRunsOptions): Promise<PaginatedRuns> {
+    const { cursor, limit, status, trigger } = options;
+
+    const rows = await this.prisma.sourceRun.findMany({
+      where: {
+        sourceId,
+        ...(status ? { status } : {}),
+        ...(trigger ? { trigger } : {}),
+        // Runs share a millisecond, so the cursor is the (startedAt, id) pair and the
+        // comparison is the lexicographic `(startedAt, id) < (cursor.startedAt, cursor.id)`.
+        ...(cursor
+          ? {
+              OR: [
+                { startedAt: { lt: cursor.startedAt } },
+                { startedAt: cursor.startedAt, id: { lt: cursor.id } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [...LATEST_RUN_ORDER],
+      take: limit + 1,
+    });
+
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      runs: page.map(toRunSummary),
+      nextCursor: rows.length > limit ? { startedAt: last.startedAt, id: last.id } : null,
+    };
   }
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Prisma } from '@prisma/client';
-import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { SourceRunStatus, SourceRunTrigger, HealthStatus } from '@domain/enums';
 import { SOURCE_RUN_LEASE_EXPIRED_REASON } from '@domain/types';
 import { SourceRunActiveError, SourceRunOutcome } from '@ports/source-run-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
@@ -96,7 +96,7 @@ describe('source run lifecycle', () => {
   it('records the funnel and duration on finalize', async () => {
     const run = await repo.start({ sourceId: await createSource('finalize') });
 
-    const finalized = await repo.finalize(run.id, HEALTHY_RUN);
+    const finalized = await repo.finalize(run.id, HEALTHY_RUN, null);
 
     expect(finalized).not.toBeNull();
     expect(finalized?.status).toBe(SourceRunStatus.SUCCEEDED);
@@ -122,7 +122,7 @@ describe('source run lifecycle', () => {
       parseFailures: 0,
       unexpectedZeroResults: true,
       errorSummary: 'collector returned zero records',
-    });
+    }, null);
 
     expect(finalized?.status).toBe(SourceRunStatus.PARTIAL);
     expect(finalized?.unexpectedZeroResults).toBe(true);
@@ -151,7 +151,7 @@ describe('source exclusivity', () => {
   it('allows a new run once the previous run is finalized', async () => {
     const sourceId = await createSource('sequential');
     const first = await repo.start({ sourceId });
-    await repo.finalize(first.id, HEALTHY_RUN);
+    await repo.finalize(first.id, HEALTHY_RUN, null);
 
     const second = await repo.start({ sourceId });
 
@@ -188,7 +188,7 @@ describe('stale run recovery (ENG-025)', () => {
 
   it('never touches a run that already reached a terminal state', async () => {
     const run = await repo.start({ sourceId: await createSource('terminal') });
-    await repo.finalize(run.id, HEALTHY_RUN);
+    await repo.finalize(run.id, HEALTHY_RUN, null);
     await ageRun(run.id, 600);
 
     const reaped = await repo.reapStaleRuns(60);
@@ -206,13 +206,74 @@ describe('stale run recovery (ENG-025)', () => {
 
     // The zombie wakes up and tries to finalize. Zero rows updated: it was reaped,
     // so its outcome must not replace the recorded one.
-    const lateFinalize = await repo.finalize(run.id, { ...HEALTHY_RUN, jobsDiscovered: 999 });
+    const lateFinalize = await repo.finalize(run.id, { ...HEALTHY_RUN, jobsDiscovered: 999 }, null);
 
     expect(lateFinalize).toBeNull();
     const stored = await repo.findById(run.id);
     expect(stored?.status).toBe(SourceRunStatus.FAILED);
     expect(stored?.errorSummary).toBe(SOURCE_RUN_LEASE_EXPIRED_REASON);
     expect(stored?.jobsDiscovered).toBe(0);
+  });
+
+  it('writes no health at all for a run that was already reaped', async () => {
+    const sourceId = await createSource('zombie-health');
+    const run = await repo.start({ sourceId });
+    await ageRun(run.id, 120);
+    await repo.reapStaleRuns(60);
+
+    // The zombie now claims the run succeeded. Because the run and its source are written
+    // together, the rejected finalize must leave the source's health untouched: a source
+    // cannot be stamped healthy by an outcome that was discarded, and there is no second
+    // write left behind to do it either.
+    const lateFinalize = await repo.finalize(run.id, HEALTHY_RUN, {
+      status: HealthStatus.HEALTHY,
+      countsAsSuccess: true,
+    });
+
+    expect(lateFinalize).toBeNull();
+    const source = await prisma.jobSource.findUniqueOrThrow({ where: { id: sourceId } });
+    expect(source.healthStatus).toBe(HealthStatus.UNKNOWN);
+    expect(source.lastSuccessfulRunAt).toBeNull();
+    expect(source.lastErrorAt).toBeNull();
+  });
+
+  it('dates the health it records with the finished run own finish time', async () => {
+    const sourceId = await createSource('finalize-health');
+    const run = await repo.start({ sourceId });
+
+    const finalized = await repo.finalize(run.id, HEALTHY_RUN, {
+      status: HealthStatus.HEALTHY,
+      countsAsSuccess: true,
+    });
+
+    const source = await prisma.jobSource.findUniqueOrThrow({ where: { id: sourceId } });
+    expect(source.healthStatus).toBe(HealthStatus.HEALTHY);
+    // One transaction, one `now()`: the two rows can never disagree about the instant.
+    expect(source.lastSuccessfulRunAt).toEqual(finalized?.finishedAt);
+  });
+
+  it('leaves the last success in place when a later run fails', async () => {
+    const sourceId = await createSource('health-not-cleared');
+    const first = await repo.start({ sourceId });
+    await repo.finalize(first.id, HEALTHY_RUN, {
+      status: HealthStatus.HEALTHY,
+      countsAsSuccess: true,
+    });
+    const success = await prisma.jobSource.findUniqueOrThrow({ where: { id: sourceId } });
+    expect(success.healthStatus).toBe(HealthStatus.HEALTHY);
+
+    const second = await repo.start({ sourceId });
+    await repo.finalize(
+      second.id,
+      { ...HEALTHY_RUN, status: SourceRunStatus.FAILED },
+      { status: HealthStatus.FAILING, countsAsSuccess: false },
+    );
+
+    // Both columns survive: "when did it last work" is not aged by a later failure.
+    const after = await prisma.jobSource.findUniqueOrThrow({ where: { id: sourceId } });
+    expect(after.healthStatus).toBe(HealthStatus.FAILING);
+    expect(after.lastSuccessfulRunAt).toEqual(success.lastSuccessfulRunAt);
+    expect(after.lastErrorAt).not.toBeNull();
   });
 
   it('releases the source after a crash so a rerun can start', async () => {
@@ -226,7 +287,7 @@ describe('stale run recovery (ENG-025)', () => {
 
     // Run 2: without recovery, the partial index would reject this forever.
     const rerun = await repo.start({ sourceId });
-    const finalized = await repo.finalize(rerun.id, HEALTHY_RUN);
+    const finalized = await repo.finalize(rerun.id, HEALTHY_RUN, null);
     expect(finalized?.status).toBe(SourceRunStatus.SUCCEEDED);
 
     const runs = await prisma.sourceRun.findMany({

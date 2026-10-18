@@ -1,10 +1,24 @@
-import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 import { SourceRunRecord } from '@domain/types';
 
 export interface StartSourceRunInput {
   sourceId: string;
   /** Defaults to SCHEDULE. */
   trigger?: SourceRunTrigger;
+}
+
+/**
+ * The health change one finished run implies for its source (FR-020). Decided by
+ * `@domain/health` and passed in already decided: this port stores the outcome and never
+ * infers health from a run status itself (the derivation is a domain rule, ADR-0001).
+ *
+ * `countsAsSuccess` says which timestamp the run's finish time lands in; the columns are
+ * "set to the run's finish time", never cleared, so a failed run cannot erase when the
+ * source last worked.
+ */
+export interface SourceHealthConsequence {
+  status: HealthStatus;
+  countsAsSuccess: boolean;
 }
 
 /**
@@ -61,10 +75,20 @@ export interface SourceRunRepository {
   start(input: StartSourceRunInput): Promise<SourceRunRecord>;
 
   /**
-   * Record the terminal outcome. Returns null when the run is no longer active
-   * (already finalized, or reaped as stale) - the fenced finalizer.
+   * Record the terminal outcome, and the health that outcome implies for the run's source
+   * (FR-020). Returns null when the run is no longer active (already finalized, or reaped as
+   * stale) - the fenced finalizer - and then writes nothing at all, including no health.
+   *
+   * The two rows belong to one observation and are written in one transaction: a run that
+   * became terminal while its health update was lost would leave a source looking healthy
+   * after a failed run, with nothing left to correct it. `health` arrives already decided
+   * (see `@domain/health`); `null` means this run's outcome says nothing about the source.
    */
-  finalize(runId: string, outcome: SourceRunOutcome): Promise<SourceRunRecord | null>;
+  finalize(
+    runId: string,
+    outcome: SourceRunOutcome,
+    health: SourceHealthConsequence | null,
+  ): Promise<SourceRunRecord | null>;
 
   /**
    * Fail every run still active after more than `maxDurationSeconds` on the

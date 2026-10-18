@@ -63,7 +63,7 @@ describe('source run identity counters', () => {
     const sourceId = await createSource('counters-persist');
     const run = await repo.start({ sourceId });
 
-    const finalized = await repo.finalize(run.id, OUTCOME);
+    const finalized = await repo.finalize(run.id, OUTCOME, null);
     expect(finalized?.undeduplicable).toBe(3);
     expect(finalized?.fallbackIdentities).toBe(2);
 

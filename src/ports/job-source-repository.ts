@@ -1,4 +1,4 @@
-import { HealthStatus } from '@domain/enums';
+import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 
 /**
  * A source as the scheduler sees it (FR-001/FR-002, SRS 7.6).
@@ -25,17 +25,84 @@ export interface SchedulableSource {
 }
 
 /**
- * A health change implied by one completed collection (FR-020). Produced by
- * `@domain/health` and passed in already decided: this port stores the outcome, it never
- * derives health from a run status itself (the derivation is a domain rule, ADR-0001).
+ * A source as the read API sees it (SRS 3.4 "Source health"; SRS 5.2 JobSource).
  *
- * The two timestamps are "set to this", not "set to this or clear": null means leave the
- * column as it was, so a failing run cannot erase when the source last worked.
+ * The SRS fixes the JobSource attributes but not the endpoint body, so this view is the
+ * smallest consistent shape: exactly the SRS attributes plus the latest run. `accessPolicy`
+ * is deliberately absent — it records the approved access mechanism, is not needed to
+ * report health, and an unauthenticated local API has no reason to republish it.
  */
-export interface SourceHealthUpdate {
-  status: HealthStatus;
+export interface SourceDetail {
+  id: string;
+  name: string;
+  adapterType: string;
+  adapterVersion: string;
+  enabled: boolean;
+  schedule: string | null;
+  healthStatus: HealthStatus;
   lastSuccessfulRunAt: Date | null;
   lastErrorAt: Date | null;
+  latestRun: SourceRunSummary | null;
+}
+
+/** One line of run history: identity, timing and the discovery funnel (SRS 7.4). */
+export interface SourceRunSummary {
+  id: string;
+  status: SourceRunStatus;
+  trigger: SourceRunTrigger;
+  startedAt: Date;
+  finishedAt: Date | null;
+  durationMs: number | null;
+  jobsDiscovered: number;
+  jobsAccepted: number;
+  jobsDuplicate: number;
+  jobsRejected: number;
+  undeduplicable: number;
+  fallbackIdentities: number;
+  parseFailures: number;
+  httpFailures: number;
+  unexpectedZeroResults: boolean;
+  enrichmentScheduled: boolean;
+  errorSummary: string | null;
+}
+
+/**
+ * Keyset cursor for the source list. Ordered by `name`, which is unique, so the name alone
+ * is a total order and no tiebreaker column is needed.
+ */
+export interface SourceCursor {
+  name: string;
+}
+
+/** Keyset cursor for run history. Ordered by `(startedAt DESC, id DESC)`; runs can share
+ *  a millisecond, so `id` breaks the tie. */
+export interface RunHistoryCursor {
+  startedAt: Date;
+  id: string;
+}
+
+export interface ListSourcesOptions {
+  includeDisabled?: boolean;
+  healthStatus?: HealthStatus;
+  cursor?: SourceCursor;
+  limit: number;
+}
+
+export interface PaginatedSources {
+  sources: SourceDetail[];
+  nextCursor: SourceCursor | null;
+}
+
+export interface ListRunsOptions {
+  cursor?: RunHistoryCursor;
+  limit: number;
+  status?: SourceRunStatus;
+  trigger?: SourceRunTrigger;
+}
+
+export interface PaginatedRuns {
+  runs: SourceRunSummary[];
+  nextCursor: RunHistoryCursor | null;
 }
 
 export interface JobSourceRepository {
@@ -47,9 +114,17 @@ export interface JobSourceRepository {
   listSchedulable(): Promise<SchedulableSource[]>;
 
   /**
-   * Record the health one finished collection implies (FR-020). Called only for a run
-   * that actually reached a terminal status: a run whose outcome was discarded (reaped as
-   * stale) is not evidence about the source and must not move its health.
+   * Sources with health and their latest run, ordered by `name` and paged by keyset so a
+   * page boundary cannot shift under concurrent inserts (offset paging would skip rows).
    */
-  applyHealthUpdate(sourceId: string, update: SourceHealthUpdate): Promise<void>;
+  listSources(options: ListSourcesOptions): Promise<PaginatedSources>;
+
+  /** A single source with health and its latest run, or null when the id is unknown. */
+  findById(id: string): Promise<SourceDetail | null>;
+
+  /**
+   * Run history for one source, newest first, with keyset pagination on
+   * `(startedAt DESC, id DESC)`.
+   */
+  listRuns(sourceId: string, options: ListRunsOptions): Promise<PaginatedRuns>;
 }

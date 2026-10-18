@@ -5,7 +5,6 @@ import { SourceResultExpectation, type RawJobEvidence } from '@domain/types';
 import type { CollectionContext } from '@ports/source-adapter';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
-import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
@@ -25,7 +24,6 @@ const collection = new RunSourceCollection({
   sourceRuns: new PrismaSourceRunRepository(prisma),
   rawJobs: new PrismaRawJobRepository(prisma),
   jobs: new PrismaJobRepository(prisma),
-  jobSources: new PrismaJobSourceRepository(prisma),
   logger: silentWorkerLogger,
 });
 
@@ -37,6 +35,16 @@ const ACQUISITION_TIMEOUT_MS = 30_000;
 class FailingAdapter extends FakeSourceAdapter {
   override async collect(_context: CollectionContext): Promise<RawJobEvidence[]> {
     throw new Error('connection reset by peer');
+  }
+}
+
+/**
+ * Accepts the request and then never answers, the way a wedged source does. Only the
+ * acquisition bound can end this run - the adapter itself never settles.
+ */
+class HangingAdapter extends FakeSourceAdapter {
+  override collect(_context: CollectionContext): Promise<RawJobEvidence[]> {
+    return new Promise<RawJobEvidence[]>(() => undefined);
   }
 }
 
@@ -65,13 +73,21 @@ async function healthOf(sourceId: string) {
   return prisma.jobSource.findUniqueOrThrow({ where: { id: sourceId } });
 }
 
-async function run(adapter: FakeSourceAdapter, expectation?: SourceResultExpectation) {
+async function run(
+  adapter: FakeSourceAdapter,
+  overrides: {
+    expectation?: SourceResultExpectation;
+    acquisitionTimeoutMs?: number;
+    signal?: AbortSignal;
+  } = {},
+) {
   return collection.run({
     adapter,
     now: NOW,
     staleRunSeconds: STALE_SECONDS,
-    acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
-    ...(expectation === undefined ? {} : { resultExpectation: expectation }),
+    acquisitionTimeoutMs: overrides.acquisitionTimeoutMs ?? ACQUISITION_TIMEOUT_MS,
+    ...(overrides.expectation === undefined ? {} : { resultExpectation: overrides.expectation }),
+    ...(overrides.signal === undefined ? {} : { signal: overrides.signal }),
   });
 }
 
@@ -127,12 +143,43 @@ describe('source health from a completed run', () => {
   it('degrades a source that returned no results where results were expected (AC-018)', async () => {
     const sourceId = await createSource();
 
-    await run(adapterFor(sourceId, []), SourceResultExpectation.RESULTS_EXPECTED);
+    await run(adapterFor(sourceId, []), {
+      expectation: SourceResultExpectation.RESULTS_EXPECTED,
+    });
 
     const source = await healthOf(sourceId);
     expect(source.healthStatus).toBe(HealthStatus.DEGRADED);
     expect(source.lastErrorAt).not.toBeNull();
     expect(source.lastSuccessfulRunAt).toBeNull();
+  });
+
+  it('fails a hung acquisition through its own bound, so a wedged source cannot stay HEALTHY (SRS 9.5)', async () => {
+    const sourceId = await createSource();
+
+    const result = await run(new HangingAdapter(makeFakeConfig({ sourceId })), {
+      acquisitionTimeoutMs: 100,
+    });
+
+    expect(result.status).toBe(SourceRunStatus.FAILED);
+    // The adapter never settles, so this can only have ended through the acquisition bound.
+    // Without a bound the run would stay RUNNING until it was reaped, and a reaped run is
+    // deliberately not evidence about the source - health would stay UNKNOWN forever while
+    // the source hung on every attempt.
+    const source = await healthOf(sourceId);
+    expect(source.healthStatus).toBe(HealthStatus.FAILING);
+    expect(source.lastErrorAt).not.toBeNull();
+    expect(source.lastSuccessfulRunAt).toBeNull();
+  });
+
+  it('dates health with the very finish time it recorded on the run', async () => {
+    const sourceId = await createSource();
+
+    const result = await run(adapterFor(sourceId, [makeRawJob({ sourceJobIdentifier: 'a-1' })]));
+
+    // Both writes share the database clock inside one transaction, so the column can never
+    // disagree with the run it came from.
+    const source = await healthOf(sourceId);
+    expect(source.lastSuccessfulRunAt).toEqual(result.run?.finishedAt);
   });
 });
 
@@ -170,5 +217,34 @@ describe('source health across a sequence of runs', () => {
     const source = await healthOf(sourceId);
     expect(source.healthStatus).toBe(HealthStatus.UNKNOWN);
     expect(source.lastErrorAt).toBeNull();
+  });
+
+  it('leaves health exactly as it was when the worker shut down mid-collection', async () => {
+    const sourceId = await createSource();
+    const row = makeRawJob({ sourceJobIdentifier: 'a-1', rawTitle: 'Engineer' });
+
+    await run(adapterFor(sourceId, [row]));
+    const healthy = await healthOf(sourceId);
+    expect(healthy.healthStatus).toBe(HealthStatus.HEALTHY);
+
+    // Shutdown during the record loop: the run is truthfully PARTIAL, but the worker's own
+    // restart must not be recorded as the source degrading.
+    const duringRecords = new AbortController();
+    duringRecords.abort();
+    const aborted = await run(adapterFor(sourceId, [row]), { signal: duringRecords.signal });
+    expect(aborted.status).toBe(SourceRunStatus.PARTIAL);
+
+    // Shutdown during acquisition: the same rule, reached through the other branch.
+    const duringAcquisition = new AbortController();
+    duringAcquisition.abort();
+    const abortedAcquisition = await run(new FailingAdapter(makeFakeConfig({ sourceId })), {
+      signal: duringAcquisition.signal,
+    });
+    expect(abortedAcquisition.status).toBe(SourceRunStatus.PARTIAL);
+
+    const after = await healthOf(sourceId);
+    expect(after.healthStatus).toEqual(healthy.healthStatus);
+    expect(after.lastSuccessfulRunAt).toEqual(healthy.lastSuccessfulRunAt);
+    expect(after.lastErrorAt).toBeNull();
   });
 });

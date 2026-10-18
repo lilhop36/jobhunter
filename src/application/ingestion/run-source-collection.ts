@@ -1,6 +1,10 @@
 import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 import { SOURCE_HEALTH_POLICY_VERSION, classifySourceHealth } from '@domain/health/source-health-policy';
-import { rawContentHash, resolveSourceRecordIdentity } from '@domain/normalizers';
+import {
+  applyDescriptionQuality,
+  rawContentHash,
+  resolveSourceRecordIdentity,
+} from '@domain/normalizers';
 import {
   SourceResultExpectation,
   isUnexpectedZeroResult,
@@ -9,7 +13,6 @@ import {
   type SourceRunRecord,
 } from '@domain/types';
 import type { JobRepository } from '@ports/job-repository';
-import type { JobSourceRepository } from '@ports/job-source-repository';
 import type { RawJobRepository } from '@ports/raw-job-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
@@ -66,9 +69,12 @@ import type { WorkerLogger } from '@ports/worker-logger';
  *
  * A run that finalizes also records what it said about its source (FR-020, SRS 4.9):
  * status, and the last success or error time. This lives here rather than in the caller so
- * no future caller of this use case can collect a source without recording its health. A
- * run whose outcome was discarded records nothing - a reaped run is evidence about the
- * worker lease, not about the source.
+ * no future caller of this use case can collect a source without recording its health, and
+ * it is handed to `finalize` so the run and the source move in one transaction.
+ *
+ * Two outcomes record nothing, because neither is evidence about the source: a run whose
+ * outcome was discarded (reaped as stale - evidence about the worker lease), and a run the
+ * worker's own shutdown cut short.
  */
 
 /** Terminal run statuses this use case can record. */
@@ -152,8 +158,6 @@ export interface RunSourceCollectionDeps {
   sourceRuns: SourceRunRepository;
   rawJobs: RawJobRepository;
   jobs: JobRepository;
-  /** Source store, used only to record the health the finished run implies (FR-020). */
-  jobSources: JobSourceRepository;
   logger: WorkerLogger;
 }
 
@@ -320,16 +324,19 @@ export class RunSourceCollection {
         return this.finish(run, funnel, {
           status: SourceRunStatus.FAILED,
           unexpectedZeroResults: false,
+          attributableToSource: true,
           errorSummary:
             `source acquisition timed out after ${input.acquisitionTimeoutMs}ms; ` +
             'operation abandoned (cooperative cancellation requested)',
         });
       }
       if (externalSignal?.aborted) {
-        // Shutdown, not a source fault: no HTTP failure is claimed.
+        // Shutdown, not a source fault: no HTTP failure is claimed, and nothing is claimed
+        // about the source either - the worker going away is not the source misbehaving.
         return this.finish(run, funnel, {
           status: SourceRunStatus.PARTIAL,
           unexpectedZeroResults: false,
+          attributableToSource: false,
           errorSummary: 'collection aborted during acquisition (worker shutdown)',
         });
       }
@@ -340,6 +347,7 @@ export class RunSourceCollection {
       return this.finish(run, funnel, {
         status: SourceRunStatus.FAILED,
         unexpectedZeroResults: false,
+        attributableToSource: true,
         errorSummary: `source acquisition failed: ${describeError(error)}`,
       });
     } finally {
@@ -392,6 +400,12 @@ export class RunSourceCollection {
         });
         continue;
       }
+      // SRS 7.7 step 7 (validate description) / FR-007: description quality is a shared
+      // deterministic policy, so the pipeline - not the adapter - is authoritative here.
+      // Re-deriving it from the description being persisted overwrites whatever the adapter
+      // supplied, so no adapter can mislabel a description.
+      job = applyDescriptionQuality(job);
+
       funnel.parsed += 1;
       // No collection-time rejection rule exists, so nothing is dropped here. An
       // UNUSABLE description is a matching concern, not a collection one (Appendix E).
@@ -447,6 +461,8 @@ export class RunSourceCollection {
     return this.finish(run, funnel, {
       status,
       unexpectedZeroResults,
+      // A run that only ended because the worker shut down is not the source's doing.
+      attributableToSource: abortedAt === null,
       errorSummary: notes.length === 0 ? null : bound(notes.join('; ')),
     });
   }
@@ -457,6 +473,8 @@ export class RunSourceCollection {
     outcome: {
       status: TerminalRunStatus;
       unexpectedZeroResults: boolean;
+      /** False when the run ended because of the worker (shutdown), not the source. */
+      attributableToSource: boolean;
       errorSummary: string | null;
     },
   ): Promise<RunSourceCollectionResult> {
@@ -475,17 +493,37 @@ export class RunSourceCollection {
       errorSummary: outcome.errorSummary,
     };
 
-    const finalized = await this.deps.sourceRuns.finalize(run.id, recorded);
+    // FR-020 (SRS 4.9): the domain decides what this run said about its source, and the run
+    // and the source are written together - a terminal run whose health never landed cannot
+    // exist. A verdict of null means the run said nothing about the source, and for a
+    // discarded outcome the repository writes nothing at all (the fenced finalizer).
+    const health = classifySourceHealth({
+      runStatus: outcome.status,
+      unexpectedZeroResults: outcome.unexpectedZeroResults,
+      attributableToSource: outcome.attributableToSource,
+    });
+
+    const finalized = await this.deps.sourceRuns.finalize(run.id, recorded, health);
     if (finalized === null) {
       this.deps.logger.warn('run was no longer active when it finished; outcome discarded', {
         sourceId: run.sourceId,
         runId: run.id,
         intendedStatus: outcome.status,
       });
+    } else if (health === null) {
+      this.deps.logger.warn('run ended for the worker, not the source; source health unchanged', {
+        sourceId: run.sourceId,
+        runId: run.id,
+        status: outcome.status,
+      });
     } else {
-      // FR-020 (SRS 4.9): the source's health is whatever its most recent run said. Only a
-      // run that actually finalized is evidence - a discarded outcome says nothing.
-      await this.recordSourceHealth(finalized);
+      this.deps.logger.info('recorded source health from the finished run', {
+        sourceId: run.sourceId,
+        runId: run.id,
+        policy: SOURCE_HEALTH_POLICY_VERSION,
+        status: health.status,
+        reason: health.reason,
+      });
     }
 
     // Report the remaining dependency explicitly (SRS 7.7 step 10) rather than letting a
@@ -504,31 +542,5 @@ export class RunSourceCollection {
       status: outcome.status,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
     };
-  }
-
-  /**
-   * Record the health this run implies for its source (FR-020, SRS 4.9 / 7.3).
-   *
-   * Kept on the run's own outcome rather than counted over history, so the rule stays the
-   * domain's (`@domain/health`) and this method only applies it. A failure here propagates:
-   * the run is already finalized, so the task retries and records health on the retry, and
-   * a source whose health cannot be written stays visible instead of silently healthy.
-   */
-  private async recordSourceHealth(run: SourceRunRecord): Promise<void> {
-    const update = classifySourceHealth({
-      runStatus: run.status,
-      finishedAt: run.finishedAt,
-      unexpectedZeroResults: run.unexpectedZeroResults,
-    });
-    if (update === null) return;
-
-    await this.deps.jobSources.applyHealthUpdate(run.sourceId, update);
-    this.deps.logger.info('source health recorded from the completed run', {
-      sourceId: run.sourceId,
-      runId: run.id,
-      healthStatus: update.status,
-      policy: SOURCE_HEALTH_POLICY_VERSION,
-      reason: update.reason,
-    });
   }
 }
