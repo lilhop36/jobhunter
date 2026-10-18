@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { SourceRunStatus, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
-import { silentWorkerLogger } from '@ports/worker-logger';
+import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { SourceScheduler } from '@application/scheduling';
 import {
   RunSourceCollection,
@@ -45,12 +45,25 @@ const NOW = new Date();
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
 
-function makeScheduler(): SourceScheduler {
+function makeScheduler(logger: WorkerLogger = silentWorkerLogger): SourceScheduler {
   return new SourceScheduler(
     { sources: sourceRepo, sourceRuns, tasks: taskRepo },
     { staleRunSeconds: STALE_SECONDS },
-    silentWorkerLogger,
+    logger,
   );
+}
+
+/** Collects log calls so a test can assert what an operator would actually see. */
+function recordingLogger(): { logger: WorkerLogger; entries: Array<{ level: string; message: string; meta: unknown }> } {
+  const entries: Array<{ level: string; message: string; meta: unknown }> = [];
+  return {
+    entries,
+    logger: {
+      info: (message, meta) => entries.push({ level: 'info', message, meta }),
+      warn: (message, meta) => entries.push({ level: 'warn', message, meta }),
+      error: (message, meta) => entries.push({ level: 'error', message, meta }),
+    },
+  };
 }
 
 async function createSource(
@@ -157,12 +170,19 @@ describe('SourceScheduler skip rules', () => {
 
   it('reports an unparseable schedule instead of silently collecting the source', async () => {
     const sourceId = await createSource('broken', { schedule: 'every 6 hours' });
+    const { logger, entries } = recordingLogger();
 
-    const result = await makeScheduler().runOnce(NOW);
+    const result = await makeScheduler(logger).runOnce(NOW);
 
     expect(result.enqueued).toEqual([]);
     expect(result.invalidSchedules).toEqual([sourceId]);
     expect(await activeTasks(sourceId)).toHaveLength(0);
+
+    // The return value is not the only place it surfaces: an operator sees it as an error,
+    // naming the source and the schedule that could not be parsed.
+    const reported = entries.find((entry) => entry.message.includes('unparseable schedule'));
+    expect(reported?.level).toBe('error');
+    expect(reported?.meta).toMatchObject({ sourceId, schedule: 'every 6 hours' });
   });
 });
 
