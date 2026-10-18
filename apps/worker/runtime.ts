@@ -1,0 +1,120 @@
+import { PrismaClient } from '@prisma/client';
+import {
+  RunSourceCollection,
+  SOURCE_COLLECTION_TASK_TYPE,
+  createSourceCollectionHandler,
+} from '@application/ingestion';
+import { SourceScheduler } from '@application/scheduling';
+import { WorkTaskHandlerRegistry, WorkTaskWorker } from '@application/worker';
+import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
+import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
+import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
+import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
+import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
+import type { JobSourceAdapter } from '@ports/source-adapter';
+import { consoleWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
+import { createAdapterRegistryResolver } from './adapters';
+import type { WorkerConfig } from './config';
+
+/**
+ * Composition root for the worker process (SRS 2.5, 7.2; ENG-017).
+ *
+ * Every piece of infrastructure is constructed here and nowhere else, so the entry point
+ * only has to decide configuration and logger, and a test can build the exact same runtime
+ * with a test adapter.
+ */
+export interface WorkerRuntimeDeps {
+  /**
+   * Builds the adapter for one source, or returns null when none is registered. Defaults to
+   * the production registry (`PRODUCTION_ADAPTERS` in `./adapters`, SRS 7.2 / Appendix E): a source is
+   * collected only when it has an APPROVED record, so a source without one is a clear
+   * permanent failure rather than a silent no-op. Tests inject the fake adapter here.
+   */
+  resolveAdapter?: (sourceId: string) => Promise<JobSourceAdapter | null>;
+  logger?: WorkerLogger;
+}
+
+export interface WorkerRuntime {
+  /** Recover abandoned work, then start claiming and scheduling. */
+  start(): Promise<void>;
+  /** Stop scheduling, stop claiming, release the in-flight attempt, close the pool. */
+  stop(): Promise<void>;
+}
+
+export function createWorkerRuntime(
+  config: WorkerConfig,
+  deps: WorkerRuntimeDeps,
+): WorkerRuntime {
+  const logger = deps.logger ?? consoleWorkerLogger;
+
+  const prisma = new PrismaClient({ datasources: { db: { url: config.databaseUrl } } });
+  const sourceRuns = new PrismaSourceRunRepository(prisma);
+  const tasks = new PrismaWorkTaskRepository(prisma);
+  const jobSources = new PrismaJobSourceRepository(prisma);
+
+  // The registry is the production adapter source (SRS 7.2 / Appendix E; ADR-0004); tests
+  // substitute the fake adapter here.
+  const resolveAdapter =
+    deps.resolveAdapter ?? createAdapterRegistryResolver({ sources: jobSources });
+
+  const collection = new RunSourceCollection({
+    sourceRuns,
+    rawJobs: new PrismaRawJobRepository(prisma),
+    jobs: new PrismaJobRepository(prisma),
+    logger,
+  });
+
+  const handlers = new WorkTaskHandlerRegistry().register(
+    SOURCE_COLLECTION_TASK_TYPE,
+    createSourceCollectionHandler({
+      resolveAdapter,
+      collection,
+      staleRunSeconds: config.staleRunSeconds,
+      acquisitionTimeoutMs: config.acquisitionTimeoutMs,
+    }),
+  );
+
+  const worker = new WorkTaskWorker(
+    tasks,
+    handlers,
+    {
+      workerId: config.workerId,
+      leaseSeconds: config.leaseSeconds,
+      pollIntervalMs: config.pollIntervalMs,
+      reaperIntervalMs: config.reaperIntervalMs,
+    },
+    logger,
+  );
+
+  const scheduler = new SourceScheduler(
+    { sources: jobSources, sourceRuns, tasks },
+    { intervalMs: config.schedulerIntervalMs, staleRunSeconds: config.staleRunSeconds },
+    logger,
+  );
+
+  let started = false;
+
+  return {
+    async start(): Promise<void> {
+      if (started) return;
+      started = true;
+
+      // Recovery before work (SRS 7.6, ENG-025): the scheduler's startup pass reaps runs
+      // abandoned by a dead worker *before* its catch-up enqueues anything, and the worker's
+      // own lease loop starts with a reap. Both happen before the first task is claimed, so
+      // a source wedged by a previous crash is released rather than waiting for a timer.
+      await scheduler.start();
+      await worker.start();
+    },
+
+    async stop(): Promise<void> {
+      if (!started) return;
+      started = false;
+      // Order matters: stop scheduling first so no new work is enqueued while the worker
+      // unwinds, then let the worker release its in-flight attempt, then close the pool.
+      await scheduler.stop();
+      await worker.stop();
+      await prisma.$disconnect();
+    },
+  };
+}
