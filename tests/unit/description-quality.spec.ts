@@ -1,10 +1,12 @@
-import { DescriptionQuality } from '@domain/enums';
+import { DescriptionQuality, ProvenanceSource } from '@domain/enums';
 import {
   DESCRIPTION_QUALITY_POLICY,
   DESCRIPTION_QUALITY_VERSION,
+  applyDescriptionQuality,
   classifyDescriptionQuality,
   defineDescriptionQualityPolicy,
 } from '@domain/normalizers/description-quality';
+import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 
 /** A description with `count` distinct, non-boilerplate words. */
 function words(count: number): string {
@@ -123,5 +125,85 @@ describe('defineDescriptionQualityPolicy', () => {
     });
     expect(classifyDescriptionQuality('BOILERPLATE', policy)).toBe(DescriptionQuality.UNUSABLE);
     expect(classifyDescriptionQuality('alpha beta', policy)).toBe(DescriptionQuality.SUFFICIENT);
+  });
+});
+
+describe('applyDescriptionQuality (shared policy is authoritative, FR-007)', () => {
+  /** A `NormalizedJob` as an adapter would produce it, before the pipeline re-derives. */
+  async function normalized(description: string | null) {
+    const adapter = new FakeSourceAdapter(makeFakeConfig());
+    return adapter.normalize(makeRawJob({ rawDescription: description }));
+  }
+
+  it('overwrites an adapter claim that promotes an UNUSABLE description', async () => {
+    const job = await normalized('\u200B'); // invisible only: actually UNUSABLE
+    const applied = applyDescriptionQuality({
+      ...job,
+      descriptionQuality: DescriptionQuality.SUFFICIENT,
+    });
+
+    expect(applied.descriptionQuality).toBe(DescriptionQuality.UNUSABLE);
+    expect(applied.descriptionQuality).toBe(classifyDescriptionQuality('\u200B'));
+  });
+
+  it('overwrites an adapter claim that downgrades real prose', async () => {
+    const job = await normalized(words(DESCRIPTION_QUALITY_POLICY.sufficientMinWords));
+    const applied = applyDescriptionQuality({
+      ...job,
+      descriptionQuality: DescriptionQuality.UNUSABLE,
+    });
+
+    expect(applied.descriptionQuality).toBe(DescriptionQuality.SUFFICIENT);
+  });
+
+  it('agrees with the shared classifier on both sides of the threshold', async () => {
+    const floor = DESCRIPTION_QUALITY_POLICY.sufficientMinWords;
+    expect(applyDescriptionQuality(await normalized(words(floor - 1))).descriptionQuality).toBe(
+      DescriptionQuality.PARTIAL,
+    );
+    expect(applyDescriptionQuality(await normalized(words(floor))).descriptionQuality).toBe(
+      DescriptionQuality.SUFFICIENT,
+    );
+  });
+
+  it('treats a missing description as UNUSABLE and still records provenance', async () => {
+    const applied = applyDescriptionQuality(await normalized(null));
+
+    expect(applied.descriptionQuality).toBe(DescriptionQuality.UNUSABLE);
+    expect(applied.provenance.descriptionQuality).toEqual({
+      provenance: ProvenanceSource.DETERMINISTIC,
+      conversionMethod: DESCRIPTION_QUALITY_VERSION,
+      evidence: null,
+    });
+  });
+
+  it('stamps the policy version over any adapter-supplied provenance', async () => {
+    const job = await normalized('Design and build the platform for our engineering team.');
+    const applied = applyDescriptionQuality({
+      ...job,
+      provenance: {
+        ...job.provenance,
+        descriptionQuality: {
+          provenance: ProvenanceSource.AI,
+          conversionMethod: 'ADAPTER_GUESS',
+          evidence: 'something else',
+        },
+      },
+    });
+
+    expect(applied.provenance.descriptionQuality).toEqual({
+      provenance: ProvenanceSource.DETERMINISTIC,
+      conversionMethod: DESCRIPTION_QUALITY_VERSION,
+      evidence: null,
+    });
+  });
+
+  it('does not mutate its input', async () => {
+    const job = await normalized('');
+    const before = job.descriptionQuality;
+
+    applyDescriptionQuality({ ...job, descriptionQuality: DescriptionQuality.SUFFICIENT });
+
+    expect(job.descriptionQuality).toBe(before);
   });
 });

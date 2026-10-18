@@ -1,4 +1,5 @@
-import { DescriptionQuality } from '../enums';
+import { DescriptionQuality, ProvenanceSource } from '../enums';
+import type { NormalizedJob } from '../types';
 
 /**
  * Deterministic description-quality classification (FR-007; SRS 3.5, 4.3, 7.7, Appendix E).
@@ -221,4 +222,34 @@ export function classifyDescriptionQuality(
 
   // R5: real, sufficient prose.
   return DescriptionQuality.SUFFICIENT;
+}
+
+/**
+ * Apply the shared policy to one normalized job (FR-007; SRS Appendix E).
+ *
+ * The ingestion pipeline calls this immediately before persistence, so a Job's
+ * `descriptionQuality` is always the shared classifier's verdict on the description that is
+ * actually persisted - never whatever the adapter supplied. An adapter may still set the
+ * field (the `NormalizedJob` contract requires it), but its value is overwritten here, so a
+ * source-specific implementation can neither promote garbage to SUFFICIENT nor downgrade
+ * real prose contrary to the policy.
+ *
+ * The provenance entry is stamped with {@link DESCRIPTION_QUALITY_VERSION} so the recorded
+ * basis of the classification stays recoverable after the policy changes. `evidence` is null
+ * because the description is already stored on the Job and its raw text on the RawJob
+ * (ENG-002); copying it here would be a second copy to keep in sync.
+ */
+export function applyDescriptionQuality(job: NormalizedJob): NormalizedJob {
+  return {
+    ...job,
+    descriptionQuality: classifyDescriptionQuality(job.description),
+    provenance: {
+      ...job.provenance,
+      descriptionQuality: {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: DESCRIPTION_QUALITY_VERSION,
+        evidence: null,
+      },
+    },
+  };
 }
