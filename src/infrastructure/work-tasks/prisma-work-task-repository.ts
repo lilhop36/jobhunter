@@ -8,6 +8,7 @@ import {
 } from '@domain/types';
 import {
   EnqueueWorkTaskInput,
+  EnqueueWorkTaskResult,
   WorkTaskRepository,
 } from '@ports/work-task-repository';
 
@@ -149,6 +150,10 @@ export class PrismaWorkTaskRepository implements WorkTaskRepository {
   }
 
   async enqueue(input: EnqueueWorkTaskInput): Promise<WorkTaskRecord> {
+    return (await this.enqueueOrConflict(input)).task;
+  }
+
+  async enqueueOrConflict(input: EnqueueWorkTaskInput): Promise<EnqueueWorkTaskResult> {
     const dedupeKey = input.dedupeKey ?? null;
     const priority = input.priority ?? 0;
     const maxAttempts = input.maxAttempts ?? 5;
@@ -170,8 +175,10 @@ export class PrismaWorkTaskRepository implements WorkTaskRepository {
         ON CONFLICT DO NOTHING
         RETURNING *
       `;
-      if (inserted.length === 1) return toRecord(inserted[0]);
+      if (inserted.length === 1) return { task: toRecord(inserted[0]), created: true };
 
+      // A null dedupeKey can never conflict with the partial index; a zero-row
+      // insert would mean something else went wrong, so retry rather than guess.
       if (dedupeKey === null) continue;
 
       const existing = await this.prisma.$queryRaw<WorkTaskRow[]>`
@@ -180,7 +187,7 @@ export class PrismaWorkTaskRepository implements WorkTaskRepository {
           AND "status" IN (${ACTIVE_STATUS_LIST})
         LIMIT 1
       `;
-      if (existing.length === 1) return toRecord(existing[0]);
+      if (existing.length === 1) return { task: toRecord(existing[0]), created: false };
     }
 
     throw new Error(`enqueue(${input.type}): could not persist or resolve an active task`);

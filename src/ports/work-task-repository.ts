@@ -15,6 +15,17 @@ export interface EnqueueWorkTaskInput {
   maxAttempts?: number;
 }
 
+/** The outcome of an exclusive enqueue: the task, and who created it. */
+export interface EnqueueWorkTaskResult {
+  task: WorkTaskRecord;
+  /**
+   * True when this call inserted the task. False means an active task already existed for
+   * the dedupe key and is being returned — for the manual-run endpoint that is exactly the
+   * "a collection is already in progress" signal behind 409 SOURCE_RUN_ACTIVE.
+   */
+  created: boolean;
+}
+
 /**
  * Persistence port for the PostgreSQL-backed work queue.
  *
@@ -27,6 +38,17 @@ export interface EnqueueWorkTaskInput {
 export interface WorkTaskRepository {
   /** Insert a task, honouring active-only `dedupeKey` uniqueness. */
   enqueue(input: EnqueueWorkTaskInput): Promise<WorkTaskRecord>;
+
+  /**
+   * Same as `enqueue`, but reports whether this call created the task. An active task
+   * already existing for the dedupe key returns it with `created: false`, which is the
+   * only thing that lets a caller tell "I started this" from "this was already running"
+   * without a racy read-then-write.
+   *
+   * The guarantee is the `one_active_task_per_dedupe_key` partial index: exactly one of
+   * two concurrent exclusive enqueues on the same key inserts.
+   */
+  enqueueOrConflict(input: EnqueueWorkTaskInput): Promise<EnqueueWorkTaskResult>;
 
   /**
    * Atomically claim the highest-priority due PENDING task, mark it RUNNING,
