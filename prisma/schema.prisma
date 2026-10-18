@@ -327,6 +327,7 @@ model Job {
 
   source JobSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
   rawJob RawJob?   @relation(fields: [rawJobId], references: [id], onDelete: SetNull)
+  matches JobMatch[]
 
   // SRS 5.6 database requirements.
   @@index([canonicalUrl])
@@ -397,6 +398,7 @@ model User {
   updatedAt DateTime @updatedAt
 
   profile CandidateProfile?
+  jobMatches JobMatch[]
 
   @@map("users")
 }
@@ -500,4 +502,66 @@ model SystemLog {
   @@index([level, createdAt])
   @@index([area, createdAt])
   @@map("system_logs")
+}
+
+// ---------------------------------------------------------------------------
+// M2 tables: deterministic match results (SRS 5.2 JobMatch, 5.6; FR-013..FR-015)
+//
+// This table is the *result* of matching, not an input: every column is derived
+// by `scoreMatch` (a pure domain function) from the candidate profile and the
+// normalized job, and nothing here is inferred from posting text (ENG-001).
+// ---------------------------------------------------------------------------
+
+model JobMatch {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @db.Uuid
+  jobId  String @db.Uuid
+
+  /// Relevance and confidence are different quantities (ENG-028, SRS 4.6 "Confidence");
+  /// both are `Percent` [0, 100] (SRS B.3). `confidence` is never derived from `score`.
+  score      Int
+  confidence Int
+  /// Per-factor scores (SRS 5.2 `roleScore` … `salaryScore`). NULL means the factor had no
+  /// usable evidence and was *excluded* from the score and the denominator (SRS 4.6
+  /// "UNKNOWN rule"), never that it scored zero (AC-010).
+  roleScore       Int?
+  skillScore      Int?
+  experienceScore Int?
+  locationScore   Int?
+  employmentScore Int?
+  freshnessScore  Int?
+  salaryScore     Int?
+  /// Versioned evidence document (`JobMatchEvidence`, SRS 5.2 `matchedEvidence` /
+  /// `missingEvidence` / `uncertainEvidence`; FR-015). Typed and validated on read; the
+  /// skill-named subset is carried structurally rather than re-parsed from the lines.
+  evidence Json
+  /// Deterministic, evidence-derived "why it matches" text, no AI and no free prose
+  /// (FR-015, ENG-008).
+  explanation String
+  /// SRS 4.6 "Versioning": every JobMatch stores the matcher revision it was scored with
+  /// (ENG-013). A scoring change requires a new value.
+  matcherVersion String
+  /// Engineering addition to SRS 5.2 (reported, not silently added): the profile revision
+  /// this result was scored against, so a later profile edit cannot silently reinterpret a
+  /// stored match (ENG-012/ENG-013).
+  profileVersion String
+  /// Engineering addition to SRS 5.2 (reported): sha256 over the canonical scoring inputs
+  /// (profile revision + the job fields that feed scoring + matcher version). The injected
+  /// clock is deliberately *excluded*, so a freshness-only change does not look like new
+  /// inputs. Unique with (user, job, matcherVersion): a profile edit or a changed job
+  /// produces a new row rather than overwriting history.
+  inputHash String
+  /// When this result was produced. Separate from `createdAt` because the clock is not an
+  /// input to `inputHash`: a freshness-only re-score updates the output in place.
+  scoredAt  DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job  Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  /// One row per distinct (user, job, matcherVersion, canonical input set) — see `inputHash`.
+  @@unique([userId, jobId, matcherVersion, inputHash], map: "one_match_per_user_job_input")
+  /// SRS 5.6 "Recommended indexes": JobMatch(userId, score).
+  @@index([userId, score], map: "job_matches_userId_score_idx")
+  @@map("job_matches")
 }
