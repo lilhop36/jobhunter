@@ -8,3 +8,6 @@ export * from './normalized-job';
 export * from './source-health';
 export * from './work-task';
 export * from './source-run';
+export * from './candidate-profile';
+export * from './matchable-job';
+export * from './job-match';

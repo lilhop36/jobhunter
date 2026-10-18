@@ -16,3 +16,5 @@ export * from './health-status.enum';
 export * from './work-task-status.enum';
 export * from './source-run-status.enum';
 export * from './source-run-trigger.enum';
+export * from './remote-preference.enum';
+export * from './relocation-preference.enum';
