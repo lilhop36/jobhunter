@@ -1,6 +1,13 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { CalendarType } from '@domain/enums';
+import { CalendarType, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
+import type { WorkTaskRecord } from '@domain/types';
+import {
+  SOURCE_COLLECTION_TASK_TYPE,
+  createSourceCollectionHandler,
+  type RunSourceCollection,
+} from '@application/ingestion';
+import { PermanentWorkTaskError } from '@application/worker';
 import {
   PRODUCTION_ADAPTERS,
   createAdapterRegistryResolver,
@@ -125,4 +132,54 @@ describe('adapter registry resolver (SRS 7.2, Appendix E; ADR-0004)', () => {
 
     await expect(resolver(REGISTERED_ROW.id)).resolves.toBeNull();
   });
+
+  /**
+   * The two halves composed, which is how the worker runs them: the registry resolver reports
+   * "no adapter", and the collection handler turns that into a PERMANENT failure. Retrying an
+   * unregistered source can never conjure an adapter, so it must not be retried until it
+   * dead-letters in front of an operator (SRS 7.2). The collection must not start either.
+   */
+  it('fails the task permanently, without collecting, when the source has no approved adapter', async () => {
+    const handler = createSourceCollectionHandler({
+      resolveAdapter: resolveWith([UNREGISTERED_ROW]),
+      collection: {
+        run: async () => {
+          throw new Error('a source without an adapter must not be collected');
+        },
+      } as unknown as RunSourceCollection,
+      staleRunSeconds: 60,
+      acquisitionTimeoutMs: 1_000,
+    });
+
+    await expect(
+      handler({ task: queuedCollection(UNREGISTERED_ROW.id), signal: new AbortController().signal }),
+    ).rejects.toThrow(new PermanentWorkTaskError(`no adapter is configured for source ${UNREGISTERED_ROW.id}`));
+  });
 });
+
+/** A task row shaped like one the queue would hand the worker; only `payload` is read. */
+function queuedCollection(sourceId: string): WorkTaskRecord {
+  const at = new Date(0);
+  return {
+    id: '11111111-1111-1111-1111-111111111111',
+    type: SOURCE_COLLECTION_TASK_TYPE,
+    payload: { sourceId, trigger: SourceRunTrigger.SCHEDULE },
+    dedupeKey: null,
+    status: WorkTaskStatus.PENDING,
+    priority: 0,
+    attempts: 1,
+    maxAttempts: 5,
+    runAfter: at,
+    lockedAt: null,
+    lockedBy: null,
+    leaseToken: null,
+    leaseExpiresAt: null,
+    sourceRunId: null,
+    lastError: null,
+    lastErrorAt: null,
+    createdAt: at,
+    updatedAt: at,
+    startedAt: null,
+    finishedAt: null,
+  };
+}
