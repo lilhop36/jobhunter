@@ -7,7 +7,11 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc --build",
+    "build": "tsc --build && tsc-alias",
+    "start:api": "node dist/apps/api/main.js",
+    "start:worker": "node dist/apps/worker/main.js",
+    "dev:api": "tsx watch apps/api/main.ts",
+    "dev:worker": "tsx watch apps/worker/main.ts",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "verify": "node scripts/check-disk-space.mjs && tsc --noEmit && vitest --run",
@@ -15,12 +19,16 @@
     "test:unit": "vitest --run tests/unit",
     "test:integration": "vitest --run tests/integration",
     "test:failure": "vitest --run tests/failure",
+    "seed:sources": "node scripts/seed-sources.mjs",
+    "seed:candidate": "tsx scripts/seed-candidate.ts",
     "test:ci": "vitest --run"
   },
   "devDependencies": {
     "@types/node": "20.17.0",
     "@vitest/coverage-v8": "2.1.9",
     "prisma": "5.22.0",
+    "tsc-alias": "1.9.7",
+    "tsx": "4.23.15",
     "typescript": "5.6.3",
     "vitest": "2.1.9"
   },
@@ -28,6 +36,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@prisma/client": "5.22.0"
+    "@prisma/client": "5.22.0",
+    "fastify": "^4.28.1"
   }
 }
