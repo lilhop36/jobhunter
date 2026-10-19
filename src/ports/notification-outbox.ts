@@ -8,6 +8,8 @@
  * breaking it — a crash between the two writes would leave an eligible job unnotified forever.
  */
 
+import type { NotificationMessageContent } from '@domain/notification';
+
 /**
  * A reservation to make in the same transaction as the match it announces.
  *
@@ -44,4 +46,54 @@ export interface NotificationFactsReader {
     notificationType: string;
     event: string;
   }): Promise<NotificationFacts>;
+}
+
+/** A row the dispatcher has claimed, with everything the message needs already read. */
+export interface ClaimedNotification {
+  id: string;
+  jobId: string;
+  /** Attempts made so far, *including* the claim that produced this row. */
+  attemptCount: number;
+  notificationType: string;
+  event: string;
+  content: NotificationMessageContent;
+}
+
+/**
+ * The outbox as the delivery dispatcher sees it (SRS 3.2 "Rate limits", FR-017, AC-015).
+ *
+ * The status transitions are the repository's, the *policy* is not: whether an attempt is the
+ * last one, and when the next one may run, are decided by the caller from the retry policy, and
+ * arrive here as `nextAttemptAt` (null = terminal). A repository that decided that itself would
+ * put delivery policy in SQL.
+ */
+export interface NotificationOutboxRepository {
+  /**
+   * Claim up to `limit` due rows, oldest first, moving them to `PROCESSING` and counting the
+   * attempt. `FOR UPDATE SKIP LOCKED` keeps two dispatchers from claiming the same row; a row
+   * already `PROCESSING` is invisible here, which is what stops a second send while one is in
+   * flight.
+   */
+  claimDue(input: { now: Date; limit: number }): Promise<ClaimedNotification[]>;
+
+  /** Record a delivery. `lastError` is cleared: the row carries only its current state. */
+  markSent(input: { id: string; sentAt: Date }): Promise<void>;
+
+  /** Record a failed attempt. `nextAttemptAt: null` makes the row terminal `FAILED`. */
+  markFailed(input: {
+    id: string;
+    lastError: string;
+    nextAttemptAt: Date | null;
+  }): Promise<void>;
+
+  /**
+   * Return rows stuck in `PROCESSING` to `PENDING`: a dispatcher that died mid-send left them
+   * there, and nothing else will ever look at them again.
+   *
+   * ponytail: this assumes one dispatcher, which is true while the only caller is the single
+   * worker process, and it is why it must run *before* any send starts. With two dispatchers a
+   * row being sent would be reset under the first one's feet, and the fix is a lease column
+   * like `work_tasks` has rather than a blanket reset.
+   */
+  recoverAbandoned(): Promise<number>;
 }
