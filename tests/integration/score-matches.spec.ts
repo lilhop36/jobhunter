@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Prisma } from '@prisma/client';
 import {
+  ApplicationMethod,
   CalendarType,
   DescriptionQuality,
   EmploymentType,
@@ -14,6 +15,7 @@ import {
   SkillEvidence,
 } from '@domain/enums';
 import { MATCHER_VERSION } from '@domain/matching';
+import { NOTIFICATION_ELIGIBILITY_VERSION } from '@domain/notification';
 import {
   asDecimalAmount,
   asProbability,
@@ -24,6 +26,7 @@ import { ScoreMatches } from '@application/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
+import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
 import type { MatchableJobReader } from '@ports/matchable-job-reader';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
 
@@ -40,7 +43,12 @@ const prisma = createTestPrismaClient();
 const profiles = new PrismaCandidateProfileRepository(prisma);
 const reader = new PrismaMatchableJobReader(prisma);
 const matchRepository = new PrismaJobMatchRepository(prisma);
-const scoring = new ScoreMatches({ profiles, jobs: reader, matches: matchRepository });
+const scoring = new ScoreMatches({
+  profiles,
+  jobs: reader,
+  matches: matchRepository,
+  facts: new PrismaNotificationFactsReader(prisma),
+});
 
 const FIRST_NOW = new Date('2026-10-05T00:00:00.000Z');
 
@@ -163,7 +171,16 @@ describe('ScoreMatches.run', () => {
 
     const result = await scoring.run({ now: FIRST_NOW, pageSize: 2 });
 
-    expect(result).toEqual({ profiles: 1, jobScores: 3, skipped: 0, inserted: 3, updated: 0, unchanged: 0 });
+    expect(result).toEqual({
+      profiles: 1,
+      jobScores: 3,
+      skipped: 0,
+      inserted: 3,
+      updated: 0,
+      unchanged: 0,
+      // No fixture job has an application path, so none is notifiable (SRS 3.5).
+      notificationsReserved: 0,
+    });
 
     const rows = await prisma.jobMatch.findMany({ where: { userId } });
     expect(rows).toHaveLength(3);
@@ -179,7 +196,15 @@ describe('ScoreMatches.run', () => {
   it('does nothing at all when no profile exists', async () => {
     const result = await scoring.run({ now: FIRST_NOW });
 
-    expect(result).toEqual({ profiles: 0, jobScores: 0, skipped: 0, inserted: 0, updated: 0, unchanged: 0 });
+    expect(result).toEqual({
+      profiles: 0,
+      jobScores: 0,
+      skipped: 0,
+      inserted: 0,
+      updated: 0,
+      unchanged: 0,
+      notificationsReserved: 0,
+    });
     expect(await prisma.jobMatch.count()).toBe(0);
   });
 
@@ -190,7 +215,15 @@ describe('ScoreMatches.run', () => {
 
     const second = await scoring.run({ now: FIRST_NOW, pageSize: 2 });
 
-    expect(second).toEqual({ profiles: 1, jobScores: 3, skipped: 0, inserted: 0, updated: 0, unchanged: 3 });
+    expect(second).toEqual({
+      profiles: 1,
+      jobScores: 3,
+      skipped: 0,
+      inserted: 0,
+      updated: 0,
+      unchanged: 3,
+      notificationsReserved: 0,
+    });
     const after = await prisma.jobMatch.findMany({ where: { userId }, orderBy: { jobId: 'asc' } });
     expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
     expect(after.map((row) => row.scoredAt.getTime())).toEqual(before.map((row) => row.scoredAt.getTime()));
@@ -214,7 +247,15 @@ describe('ScoreMatches.run', () => {
 
     const afterEdit = await scoring.run({ now: FIRST_NOW, pageSize: 5 });
 
-    expect(afterEdit).toEqual({ profiles: 1, jobScores: 3, skipped: 0, inserted: 3, updated: 0, unchanged: 0 });
+    expect(afterEdit).toEqual({
+      profiles: 1,
+      jobScores: 3,
+      skipped: 0,
+      inserted: 3,
+      updated: 0,
+      unchanged: 0,
+      notificationsReserved: 0,
+    });
     // Both revisions survive: a profile edit adds history rather than rewriting it.
     expect(await prisma.jobMatch.count({ where: { userId } })).toBe(6);
     expect(await prisma.jobMatch.count({ where: { userId, profileVersion: first.profileVersion } })).toBe(3);
@@ -229,7 +270,16 @@ describe('ScoreMatches.run', () => {
     // inputs have not changed, so this is the same row, not a new one.
     const later = await scoring.run({ now: new Date('2026-12-15T00:00:00.000Z'), pageSize: 5 });
 
-    expect(later).toEqual({ profiles: 1, jobScores: 3, skipped: 0, inserted: 0, updated: 3, unchanged: 0 });
+    expect(later).toEqual({
+      profiles: 1,
+      jobScores: 3,
+      skipped: 0,
+      inserted: 0,
+      updated: 3,
+      unchanged: 0,
+      // None of the fixture jobs has an application path, so none is notifiable (SRS 3.5).
+      notificationsReserved: 0,
+    });
     const after = await prisma.jobMatch.findMany({ where: { userId }, orderBy: { jobId: 'asc' } });
     expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
     expect(after.map((row) => row.freshnessScore)).toEqual([0, 0, 0]);
@@ -245,14 +295,123 @@ describe('ScoreMatches.run', () => {
     const staleReader: MatchableJobReader = {
       listMatchableJobs: async () =>
         calls++ === 0
-          ? [{ jobId: jobIds[0], sourceId, lifecycleStatus: LifecycleStatus.EXPIRED, job: matchableJob() }]
+          ? [
+              {
+                jobId: jobIds[0],
+                sourceId,
+                lifecycleStatus: LifecycleStatus.EXPIRED,
+                applicationTarget: {
+                  method: ApplicationMethod.ONLINE_URL,
+                  applyUrl: 'https://example.test/apply',
+                  applyEmail: null,
+                  evidence: null,
+                },
+                job: matchableJob(),
+              },
+            ]
           : [],
     };
-    const guarded = new ScoreMatches({ profiles, jobs: staleReader, matches: matchRepository });
+    const guarded = new ScoreMatches({
+      profiles,
+      jobs: staleReader,
+      matches: matchRepository,
+      facts: new PrismaNotificationFactsReader(prisma),
+    });
 
     const result = await guarded.run({ now: FIRST_NOW });
 
-    expect(result).toEqual({ profiles: 1, jobScores: 1, skipped: 1, inserted: 0, updated: 0, unchanged: 0 });
+    expect(result).toEqual({
+      profiles: 1,
+      jobScores: 1,
+      skipped: 1,
+      inserted: 0,
+      updated: 0,
+      unchanged: 0,
+      notificationsReserved: 0,
+    });
     expect(await prisma.jobMatch.count({ where: { userId } })).toBe(0);
+  });
+});
+
+/**
+ * SRS 3.2 eligibility, evaluated inside the scoring run (ENG-027): a scored job that is also
+ * eligible leaves with an outbox row in the same transaction. These cases pin that the gate runs
+ * at all, that it reads the *stored* job's application path, and that both table predicates
+ * (already notified, rejected) actually reach the policy.
+ */
+describe('notification eligibility inside the scoring run (SRS 3.2, ENG-027)', () => {
+  /** Give one fixture job a real application path; the others have none (SRS 3.5). */
+  async function giveApplicationPath(targetJobId: string): Promise<void> {
+    await prisma.job.update({
+      where: { id: targetJobId },
+      data: { applicationMethod: ApplicationMethod.EMAIL, applyEmail: 'jobs@example.test' },
+    });
+  }
+
+  it('reserves for the one eligible job and none for the jobs with no application path', async () => {
+    await profiles.saveForUser({ userId, profile: profile() });
+    await giveApplicationPath(jobIds[0]);
+
+    const result = await scoring.run({ now: FIRST_NOW });
+
+    expect(result.jobScores).toBe(3);
+    expect(result.notificationsReserved).toBe(1);
+
+    const match = await prisma.jobMatch.findFirstOrThrow({ where: { userId, jobId: jobIds[0] } });
+    const rows = await prisma.notificationOutbox.findMany();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      userId,
+      jobId: jobIds[0],
+      // ENG-027: the row points at the match it was written with.
+      jobMatchId: match.id,
+      notificationType: 'NEW_MATCH',
+      event: 'NEW_MATCH',
+      status: 'PENDING',
+    });
+    // The payload records the verdict, so a later delivery can say why it was sent.
+    const payload = rows[0].payload as Record<string, unknown>;
+    expect(payload.matcherVersion).toBe(MATCHER_VERSION);
+    expect(payload.eligibilityVersion).toBe(NOTIFICATION_ELIGIBILITY_VERSION);
+    expect(String(payload.eligibilityExplanation)).toContain('eligible');
+    expect(payload.score).toBe(match.score);
+    expect(rows[0].nextAttemptAt.toISOString()).toBe(FIRST_NOW.toISOString());
+  });
+
+  it('does not reserve a second time for an event that was already reserved', async () => {
+    await profiles.saveForUser({ userId, profile: profile() });
+    await giveApplicationPath(jobIds[0]);
+    await scoring.run({ now: FIRST_NOW });
+
+    const rerun = await scoring.run({ now: FIRST_NOW });
+
+    expect(rerun.notificationsReserved).toBe(0);
+    expect(await prisma.notificationOutbox.count()).toBe(1);
+  });
+
+  it('does not reserve for a job the user rejected', async () => {
+    await profiles.saveForUser({ userId, profile: profile() });
+    await giveApplicationPath(jobIds[0]);
+    // A rejection is only recorded against a notification that was sent. This one is for a
+    // different event, so the job is rejected but not "already notified" for this event: the two
+    // predicates have to be consulted separately.
+    const past = await prisma.notificationOutbox.create({
+      data: {
+        userId,
+        jobId: jobIds[0],
+        notificationType: 'NEW_MATCH',
+        event: 'SALARY_DISCLOSED',
+        payload: {},
+      },
+      select: { id: true },
+    });
+    await prisma.notificationFeedback.create({
+      data: { notificationId: past.id, value: 'NOT_RELEVANT' },
+    });
+
+    const result = await scoring.run({ now: FIRST_NOW });
+
+    expect(result.notificationsReserved).toBe(0);
+    expect(await prisma.notificationOutbox.count()).toBe(1);
   });
 });

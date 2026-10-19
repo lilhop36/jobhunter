@@ -1,5 +1,5 @@
 import type { LifecycleStatus } from '@domain/enums';
-import type { MatchableJob } from '@domain/types';
+import type { ApplicationTarget, MatchableJob } from '@domain/types';
 
 /**
  * One storable job, as the matcher sees it (SRS 5.2; FR-012, FR-013).
@@ -17,6 +17,12 @@ export interface MatchableJobBatch {
   sourceId: string;
   /** Returned so the caller can re-check the policy; not re-derived from `job`. */
   lifecycleStatus: LifecycleStatus;
+  /**
+   * The job's application path, returned for the same reason as `lifecycleStatus`: SRS 3.2's
+   * "usable application target" is a notification policy the caller re-applies, and the read
+   * that scores a job should be the only read it needs.
+   */
+  applicationTarget: ApplicationTarget;
   job: MatchableJob;
 }
 

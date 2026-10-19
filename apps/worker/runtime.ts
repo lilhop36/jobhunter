@@ -20,6 +20,7 @@ import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
 import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
+import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import { consoleWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
@@ -82,6 +83,7 @@ export function createWorkerRuntime(
     profiles: new PrismaCandidateProfileRepository(prisma),
     jobs: new PrismaMatchableJobReader(prisma),
     matches: matchRepository,
+    facts: new PrismaNotificationFactsReader(prisma),
   });
 
   /** Re-scores every enabled source's jobs (SRS 11.2; ADR-0005 §9). */

@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import {
+  ApplicationMethod,
   CalendarType,
   DescriptionQuality,
   EmploymentType,
@@ -42,6 +43,9 @@ const MATCHABLE_JOB_SELECT = {
   salaryPeriod: true,
   salaryEvidence: true,
   salaryConfidence: true,
+  applicationMethod: true,
+  applyUrl: true,
+  applyEmail: true,
   provenance: true,
 } satisfies Prisma.JobSelect;
 
@@ -127,6 +131,15 @@ function toBatch(row: StoredJob): MatchableJobBatch {
     jobId: row.id,
     sourceId: row.sourceId,
     lifecycleStatus: row.lifecycleStatus as LifecycleStatus,
+    applicationTarget: {
+      method: row.applicationMethod as ApplicationMethod,
+      applyUrl: row.applyUrl,
+      applyEmail: row.applyEmail,
+      // The Job table stores the path, not the text it was read from (the detection evidence
+      // lives in `provenance`). Eligibility asks whether a path exists, so NULL here is the
+      // honest "the stored job does not carry it", never "there was none".
+      evidence: null,
+    },
     job,
   };
 }

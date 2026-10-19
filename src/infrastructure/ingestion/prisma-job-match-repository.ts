@@ -166,7 +166,7 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
       `;
 
       if (existing.length === 0) {
-        await tx.$executeRaw`
+        const inserted = await tx.$queryRaw<Array<{ id: string }>>`
           INSERT INTO "job_matches" (
             "id", "userId", "jobId", "score", "confidence",
             "roleScore", "skillScore", "experienceScore", "locationScore", "employmentScore",
@@ -181,8 +181,14 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
             ${match.matcherVersion}, ${input.profileVersion}, ${input.inputHash},
             ${asTimestamp(input.scoredAt)}::timestamp(3), ${NOW_UTC}
           )
+          RETURNING "id"
         `;
-        return 'inserted';
+        return this.finish(
+          tx,
+          input,
+          inserted[0].id,
+          'inserted',
+        );
       }
 
       const stored = await tx.$queryRaw<MatchRow[]>`
@@ -196,7 +202,9 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
         evidence: jobMatchEvidenceOf(current),
         explanation: current.explanation,
       });
-      if (currentSignature === signature) return 'unchanged';
+      if (currentSignature === signature) {
+        return this.finish(tx, input, existing[0].id, 'unchanged');
+      }
 
       await tx.$executeRaw`
         UPDATE "job_matches" SET
@@ -214,8 +222,41 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
           "scoredAt" = ${asTimestamp(input.scoredAt)}::timestamp(3)
         WHERE "id" = ${existing[0].id}::uuid
       `;
-      return 'updated';
+      return this.finish(tx, input, existing[0].id, 'updated');
     });
+  }
+
+  /**
+   * The second half of the same transaction: the outbox row, if one was asked for (ENG-027).
+   *
+   * It runs for every outcome, not only `inserted`. An `unchanged` match can still be a first
+   * reservation — the match may have been stored before the outbox existed, or a previous
+   * attempt may have died between the two writes — and the unique event key makes the retry a
+   * no-op rather than a duplicate (AC-016).
+   */
+  private async finish(
+    tx: Prisma.TransactionClient,
+    input: SaveJobMatchInput,
+    jobMatchId: string,
+    status: SaveJobMatchOutcome['status'],
+  ): Promise<SaveJobMatchOutcome> {
+    const notification = input.notification ?? null;
+    if (notification === null) return { status, notificationReserved: false };
+
+    const inserted = await tx.$executeRaw`
+      INSERT INTO "notification_outbox" (
+        "id", "userId", "jobId", "jobMatchId", "notificationType", "event",
+        "payload", "status", "attemptCount", "nextAttemptAt", "createdAt"
+      ) VALUES (
+        gen_random_uuid(), ${input.userId}::uuid, ${input.jobId}::uuid, ${jobMatchId}::uuid,
+        ${notification.notificationType}, ${notification.event},
+        ${JSON.stringify(notification.payload)}::jsonb, 'PENDING'::"NotificationStatus", 0,
+        ${asTimestamp(notification.nextAttemptAt)}::timestamp(3), ${NOW_UTC}
+      )
+      ON CONFLICT ("userId", "jobId", "notificationType", "event") DO NOTHING
+    `;
+
+    return { status, notificationReserved: inserted === 1 };
   }
 
   async findById(id: string): Promise<JobMatchRecord | null> {

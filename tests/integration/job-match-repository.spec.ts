@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DescriptionQuality } from '@domain/enums';
 import { asPercent, type JobMatch } from '@domain/types';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
+import type { ReserveNotificationInput } from '@ports/notification-outbox';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
 
 /**
@@ -77,7 +78,12 @@ function scored(overrides: Partial<JobMatch> = {}): JobMatch {
 
 function save(
   match: JobMatch,
-  overrides: Partial<{ profileVersion: string; inputHash: string; scoredAt: Date }> = {},
+  overrides: Partial<{
+    profileVersion: string;
+    inputHash: string;
+    scoredAt: Date;
+    notification: ReserveNotificationInput | null;
+  }> = {},
 ) {
   return matches.saveIfChanged({
     userId,
@@ -86,14 +92,25 @@ function save(
     inputHash: overrides.inputHash ?? 'hash-a',
     scoredAt: overrides.scoredAt ?? new Date('2026-10-19T00:00:00.000Z'),
     match,
+    notification: overrides.notification ?? null,
   });
+}
+
+/** A reservation for the v1 event, as the scoring use case would build it. */
+function reserve(): ReserveNotificationInput {
+  return {
+    notificationType: 'NEW_MATCH',
+    event: 'NEW_MATCH',
+    payload: { score: 90, explanation: 'why it matches' },
+    nextAttemptAt: new Date('2026-10-19T00:00:00.000Z'),
+  };
 }
 
 describe('PrismaJobMatchRepository.saveIfChanged', () => {
   it('inserts a match and reads the evidence document back structurally', async () => {
-    expect(await save(scored({ matchedSkills: ['TypeScript'], missingSkills: ['PostgreSQL'] }))).toBe(
-      'inserted',
-    );
+    expect(
+      await save(scored({ matchedSkills: ['TypeScript'], missingSkills: ['PostgreSQL'] })),
+    ).toEqual({ status: 'inserted', notificationReserved: false });
 
     const row = await matches.findByInput({
       userId,
@@ -116,10 +133,10 @@ describe('PrismaJobMatchRepository.saveIfChanged', () => {
   });
 
   it('is idempotent: a rerun with identical inputs writes nothing', async () => {
-    expect(await save(scored())).toBe('inserted');
+    expect(await save(scored())).toEqual({ status: 'inserted', notificationReserved: false });
     const first = await prisma.jobMatch.findFirstOrThrow({ where: { userId, jobId } });
 
-    expect(await save(scored())).toBe('unchanged');
+    expect(await save(scored())).toEqual({ status: 'unchanged', notificationReserved: false });
 
     const rows = await prisma.jobMatch.findMany({ where: { userId, jobId } });
     expect(rows).toHaveLength(1);
@@ -156,7 +173,7 @@ describe('PrismaJobMatchRepository.saveIfChanged', () => {
       scoredAt: new Date('2026-11-19T00:00:00.000Z'),
     });
 
-    expect(updated).toBe('updated');
+    expect(updated.status).toBe('updated');
     const rows = await prisma.jobMatch.findMany({ where: { userId, jobId } });
     expect(rows).toHaveLength(1);
     expect(rows[0].score).toBe(88);
@@ -228,5 +245,70 @@ describe('PrismaJobMatchRepository.hasMatchesForOtherMatcherVersion', () => {
     });
 
     expect(await matches.hasMatchesForOtherMatcherVersion(MATCHER_VERSION)).toBe(true);
+  });
+});
+
+describe('the outbox row is written in the same transaction as its match (ENG-027)', () => {
+  it('reserves one PENDING notification pointing at the match it announces', async () => {
+    const outcome = await save(scored(), { notification: reserve() });
+
+    expect(outcome).toEqual({ status: 'inserted', notificationReserved: true });
+    const match = await prisma.jobMatch.findFirstOrThrow({ where: { userId, jobId } });
+    const rows = await prisma.notificationOutbox.findMany();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      userId,
+      jobId,
+      jobMatchId: match.id,
+      notificationType: 'NEW_MATCH',
+      event: 'NEW_MATCH',
+      status: 'PENDING',
+      attemptCount: 0,
+      lastError: null,
+      sentAt: null,
+    });
+    expect(rows[0].payload).toEqual({ score: 90, explanation: 'why it matches' });
+    // The injected clock, not `now()`: a reservation is due immediately in tests and in the
+    // dispatcher's scan, without the use case reading a clock of its own.
+    expect(rows[0].nextAttemptAt.toISOString()).toBe('2026-10-19T00:00:00.000Z');
+  });
+
+  it('never reserves the same event twice (AC-016)', async () => {
+    await save(scored(), { notification: reserve() });
+    const again = await save(scored(), { notification: reserve() });
+
+    expect(again).toEqual({ status: 'unchanged', notificationReserved: false });
+    expect(await prisma.notificationOutbox.count()).toBe(1);
+  });
+
+  it('reserves for an unchanged match, so a match stored before the outbox existed is not left unnotified', async () => {
+    // The M2-era case: the match is already there from a run that predates this table.
+    await save(scored(), { notification: null });
+    expect(await prisma.notificationOutbox.count()).toBe(0);
+
+    const healed = await save(scored(), { notification: reserve() });
+
+    expect(healed).toEqual({ status: 'unchanged', notificationReserved: true });
+    expect(await prisma.notificationOutbox.count()).toBe(1);
+  });
+
+  it('writes no outbox row when no reservation was asked for', async () => {
+    expect(await save(scored())).toEqual({ status: 'inserted', notificationReserved: false });
+    expect(await prisma.notificationOutbox.count()).toBe(0);
+  });
+
+  it('leaves no match behind when the reservation cannot be written', async () => {
+    // An unencodable payload throws inside the transaction, which is the cheapest way to make
+    // the second write fail after the first succeeded. If the two were separate writes the
+    // match would remain, and an eligible job would be unnotifiable forever.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+
+    await expect(
+      save(scored(), { notification: { ...reserve(), payload: circular } }),
+    ).rejects.toThrow(TypeError);
+
+    expect(await prisma.jobMatch.count({ where: { userId } })).toBe(0);
+    expect(await prisma.notificationOutbox.count()).toBe(0);
   });
 });

@@ -1,4 +1,5 @@
 import type { JobMatch } from '@domain/types';
+import type { ReserveNotificationInput } from '@ports/notification-outbox';
 
 /**
  * A persisted match: the deterministic result plus the identity and revision it was
@@ -24,6 +25,12 @@ export interface SaveJobMatchInput {
   inputHash: string;
   scoredAt: Date;
   match: JobMatch;
+  /**
+   * Make this reservation in the same transaction as the match (ENG-027). `null` means the job
+   * was evaluated and is not eligible, which is different from omitting it: the writer then
+   * deliberately writes no outbox row rather than leaving the question open.
+   */
+  notification?: ReserveNotificationInput | null;
 }
 
 /**
@@ -33,8 +40,16 @@ export interface SaveJobMatchInput {
  *   - `unchanged` — a row existed and the output is identical, so nothing was written.
  * There is at most one row per (user, job, matcherVersion, inputHash), so a rerun is
  * idempotent and a changed input set is preserved as history rather than overwritten.
+ *
+ * `notificationReserved` is about the outbox row in the same transaction, not about the match:
+ * `false` means either no reservation was asked for or an equivalent event was already reserved
+ * (AC-016). It is reported rather than folded into the status because the two are independent —
+ * a first reservation for an already-stored, unchanged match is a normal case, not a no-op.
  */
-export type SaveJobMatchOutcome = 'inserted' | 'updated' | 'unchanged';
+export interface SaveJobMatchOutcome {
+  status: 'inserted' | 'updated' | 'unchanged';
+  notificationReserved: boolean;
+}
 
 /**
  * Where a page ended. The list order is score descending, then id ascending, so the tuple

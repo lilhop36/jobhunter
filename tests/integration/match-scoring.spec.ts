@@ -26,6 +26,7 @@ import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/pris
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
+import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import type { MatchableJobReader } from '@ports/matchable-job-reader';
 import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
@@ -44,7 +45,12 @@ const reader = new PrismaMatchableJobReader(prisma);
 const matchRepository = new PrismaJobMatchRepository(prisma);
 const jobSources = new PrismaJobSourceRepository(prisma);
 const tasks = new PrismaWorkTaskRepository(prisma);
-const scoring = new ScoreMatches({ profiles, jobs: reader, matches: matchRepository });
+const scoring = new ScoreMatches({
+  profiles,
+  jobs: reader,
+  matches: matchRepository,
+  facts: new PrismaNotificationFactsReader(prisma),
+});
 
 const FIRST_NOW = new Date('2026-10-05T00:00:00.000Z');
 const SIGNAL = new AbortController().signal;
@@ -214,7 +220,12 @@ describe('match.scoring handler', () => {
         return reader.listMatchableJobs(options);
       },
     };
-    const crashing = new ScoreMatches({ profiles, jobs: crashingReader, matches: matchRepository });
+    const crashing = new ScoreMatches({
+      profiles,
+      jobs: crashingReader,
+      matches: matchRepository,
+      facts: new PrismaNotificationFactsReader(prisma),
+    });
 
     await expect(handlerFor(crashing, 2)({ task, signal: SIGNAL })).rejects.toThrow(
       'simulated crash mid-page',

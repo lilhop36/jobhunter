@@ -1,7 +1,16 @@
 import { isMatchable, matchInputHashOf, scoreMatch } from '@domain/matching';
+import {
+  NOTIFICATION_ELIGIBILITY_VERSION,
+  NOTIFICATION_EVENT_NEW_MATCH,
+  NOTIFICATION_TYPE_NEW_MATCH,
+  evaluateNotificationEligibility,
+  type NotificationEligibilityDecision,
+} from '@domain/notification';
+import type { JobMatch } from '@domain/types';
 import type { CandidateProfileRepository } from '@ports/candidate-profile-repository';
 import type { JobMatchRepository } from '@ports/job-match-repository';
 import type { MatchableJobReader } from '@ports/matchable-job-reader';
+import type { NotificationFactsReader } from '@ports/notification-outbox';
 
 /** Jobs read per page. Bounded so one run does not hold every matchable job in memory. */
 const DEFAULT_PAGE_SIZE = 100;
@@ -10,6 +19,8 @@ export interface ScoreMatchesDeps {
   profiles: CandidateProfileRepository;
   jobs: MatchableJobReader;
   matches: JobMatchRepository;
+  /** The SRS 3.2 predicates that live in the outbox and the feedback table. */
+  facts: NotificationFactsReader;
 }
 
 export interface ScoreMatchesInput {
@@ -42,6 +53,12 @@ export interface ScoreMatchesResult {
   inserted: number;
   updated: number;
   unchanged: number;
+  /**
+   * Outbox rows created in the same transaction as their match (ENG-027). Lower than
+   * `jobScores` for three ordinary reasons: the job was not eligible, its event was already
+   * reserved (AC-016), or the job was skipped.
+   */
+  notificationsReserved: number;
 }
 
 /**
@@ -74,6 +91,18 @@ export interface ScoreMatchesResult {
  * The re-check reads the status the reader returned, so it cannot catch a job that expires
  * *between* the page read and the write. Closing that window needs a conditional insert inside
  * the save transaction; not done until there is evidence it matters.
+ *
+ * ## Notification (ENG-027)
+ *
+ * A scored job is also evaluated for notification eligibility (SRS 3.2), and an eligible one
+ * carries a reservation into the same save, so the match row and its outbox row are written in
+ * one transaction. A crash before a reservation is therefore impossible to observe: either both
+ * rows exist or neither does, and the retry re-derives the same decision because the eligibility
+ * inputs are all stored facts.
+ *
+ * The reservation is a *row*, not a message: nothing is delivered here, and nothing reads these
+ * rows yet. `payload` carries the eligibility verdict beside the evidence so a delivered message
+ * can be rendered later without re-deriving why it was sent.
  */
 export class ScoreMatches {
   constructor(private readonly deps: ScoreMatchesDeps) {}
@@ -88,6 +117,7 @@ export class ScoreMatches {
       inserted: 0,
       updated: 0,
       unchanged: 0,
+      notificationsReserved: 0,
     };
 
     for (const stored of profiles) {
@@ -106,6 +136,15 @@ export class ScoreMatches {
         if (nextCursor === cursor) break;
         cursor = nextCursor;
 
+        // One round trip per predicate for the whole page: eligibility is evaluated per job, but
+        // the facts it needs are not per-job queries.
+        const facts = await this.deps.facts.factsForJobs({
+          userId: stored.userId,
+          jobIds: page.map((batch) => batch.jobId),
+          notificationType: NOTIFICATION_TYPE_NEW_MATCH,
+          event: NOTIFICATION_EVENT_NEW_MATCH,
+        });
+
         for (const batch of page) {
           // Worker shutdown: stop at a job boundary. Everything already written is complete and
           // will be re-found as 'unchanged' on the retry, so nothing is half-done.
@@ -122,6 +161,15 @@ export class ScoreMatches {
           }
 
           const match = scoreMatch({ profile: stored.profile, job: batch.job, now: input.now });
+          const decision = evaluateNotificationEligibility({
+            lifecycleStatus: batch.lifecycleStatus,
+            applicationTarget: batch.applicationTarget,
+            score: match.score,
+            confidence: match.confidence,
+            alreadyNotified: facts.alreadyNotified.has(batch.jobId),
+            rejectedByUser: facts.rejected.has(batch.jobId),
+          });
+
           const outcome = await this.deps.matches.saveIfChanged({
             userId: stored.userId,
             jobId: batch.jobId,
@@ -133,12 +181,44 @@ export class ScoreMatches {
             }),
             scoredAt: input.now,
             match,
+            notification: decision.eligible
+              ? {
+                  notificationType: NOTIFICATION_TYPE_NEW_MATCH,
+                  event: NOTIFICATION_EVENT_NEW_MATCH,
+                  payload: notificationPayloadOf(match, decision),
+                  nextAttemptAt: input.now,
+                }
+              : null,
           });
-          result[outcome] += 1;
+          result[outcome.status] += 1;
+          if (outcome.notificationReserved) result.notificationsReserved += 1;
         }
       }
     }
 
     return result;
   }
+}
+
+/**
+ * What the outbox row carries (SRS 5.2 `payload`).
+ *
+ * It records *why* the user is about to be told about this job — the eligibility verdict and the
+ * evidence it was made from — rather than a rendered message. Rendering SRS 3.2's content list
+ * needs the job's company and source name, which the scoring view does not carry, so the message
+ * itself belongs to the delivery increment; storing a half-rendered one now would freeze in the
+ * wrong shape.
+ */
+function notificationPayloadOf(match: JobMatch, decision: NotificationEligibilityDecision): unknown {
+  return {
+    eligibilityVersion: NOTIFICATION_ELIGIBILITY_VERSION,
+    eligibilityExplanation: decision.explanation,
+    matcherVersion: match.matcherVersion,
+    score: match.score,
+    confidence: match.confidence,
+    explanation: match.explanation,
+    matchedSkills: [...match.matchedSkills],
+    missingSkills: [...match.missingSkills],
+    uncertainSkills: [...match.uncertainSkills],
+  };
 }
