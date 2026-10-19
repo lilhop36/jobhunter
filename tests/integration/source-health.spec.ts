@@ -7,6 +7,7 @@ import { silentWorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
+import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
 
@@ -24,6 +25,7 @@ const collection = new RunSourceCollection({
   sourceRuns: new PrismaSourceRunRepository(prisma),
   rawJobs: new PrismaRawJobRepository(prisma),
   jobs: new PrismaJobRepository(prisma),
+  tasks: new PrismaWorkTaskRepository(prisma),
   logger: silentWorkerLogger,
 });
 

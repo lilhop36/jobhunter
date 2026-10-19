@@ -36,6 +36,7 @@ const collection = new RunSourceCollection({
   sourceRuns,
   rawJobs: new PrismaRawJobRepository(prisma),
   jobs: new PrismaJobRepository(prisma),
+  tasks: taskRepo,
   logger: silentWorkerLogger,
 });
 

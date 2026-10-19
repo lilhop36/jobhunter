@@ -69,6 +69,7 @@ export function createWorkerRuntime(
     sourceRuns,
     rawJobs: new PrismaRawJobRepository(prisma),
     jobs: new PrismaJobRepository(prisma),
+    tasks,
     logger,
   });
 

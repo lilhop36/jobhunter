@@ -12,12 +12,17 @@ import {
   type RawJobEvidence,
   type SourceRunRecord,
 } from '@domain/types';
+import {
+  MATCH_SCORING_TASK_TYPE,
+  matchScoringDedupeKey,
+  type MatchScoringTaskPayload,
+} from '@application/matching';
 import type { JobRepository } from '@ports/job-repository';
 import type { RawJobRepository } from '@ports/raw-job-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
+import type { WorkTaskRepository } from '@ports/work-task-repository';
 import type { WorkerLogger } from '@ports/worker-logger';
-
 /**
  * The collection use case: run one source once, end to end (SRS 7.7), recording the
  * SRS 7.8 funnel.
@@ -52,11 +57,11 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * operation's later settlement is logged and discarded. The run never claims the
  * operation was cancelled - only that it was abandoned.
  *
- * Step 10 of the sequence ("schedule enrichment/matching work") is **not performed**: the
- * enrichment and matching stages have no registered handler yet, and enqueueing work for
- * an unregistered handler produces guaranteed permanent failures. Instead of a silent
- * gap, every run records `enrichmentScheduled = false` and logs the remaining dependency,
- * so a `SUCCEEDED` status never implies step 10 ran.
+ * Step 10 of the sequence ("schedule enrichment/matching work") is performed: a terminal run
+ * enqueues one `match.score` task for the jobs it left behind, deduplicated on the run id, so
+ * the hand-off exists at most once per run. The run records whether that enqueue succeeded, in
+ * `enrichmentScheduled`, so a `SUCCEEDED` status is never read as "the whole pipeline ran" when
+ * the hand-off did not actually happen.
  *
  * ## Isolation and crash safety
  *
@@ -85,16 +90,6 @@ const MAX_ERROR_SUMMARY_LENGTH = 1000;
 
 /** How many distinct per-record failure notes are retained in `errorSummary`. */
 const MAX_RETAINED_FAILURE_NOTES = 5;
-
-/**
- * SRS 7.7 step 10 ("schedule enrichment/matching work") is **deferred**: the enrichment
- * and matching stages have no registered handler, and enqueueing work against an
- * unregistered handler produces guaranteed permanent failures (the worker classifies it
- * as non-retryable). Until that handler exists this is `false`, and it is recorded on
- * every run so a `SUCCEEDED` collection status can never be read as "the whole pipeline
- * ran".
- */
-const ENRICHMENT_SCHEDULED = false;
 
 /**
  * Raised when a source acquisition exceeds its bound (SRS 9.5). The bound is carried so
@@ -158,6 +153,8 @@ export interface RunSourceCollectionDeps {
   sourceRuns: SourceRunRepository;
   rawJobs: RawJobRepository;
   jobs: JobRepository;
+  /** Queue for the SRS 7.7 step 10 hand-off to matching. */
+  tasks: WorkTaskRepository;
   logger: WorkerLogger;
 }
 
@@ -478,6 +475,12 @@ export class RunSourceCollection {
       errorSummary: string | null;
     },
   ): Promise<RunSourceCollectionResult> {
+    // SRS 7.7 step 10: hand this run's jobs to matching. Enqueued *before* the run is finalized
+    // so the recorded flag is true only when a task really exists. The task is keyed by this run
+    // and is idempotent, so a finalize that turns out to be discarded (the run was reaped as
+    // stale) leaves a harmless extra scoring pass rather than a missing one.
+    const enrichmentScheduled = await this.enqueueMatching(run);
+
     const recorded: SourceRunOutcome = {
       status: outcome.status,
       jobsDiscovered: funnel.collected,
@@ -489,7 +492,7 @@ export class RunSourceCollection {
       parseFailures: funnel.parseFailures,
       httpFailures: funnel.httpFailures,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
-      enrichmentScheduled: ENRICHMENT_SCHEDULED,
+      enrichmentScheduled,
       errorSummary: outcome.errorSummary,
     };
 
@@ -526,21 +529,41 @@ export class RunSourceCollection {
       });
     }
 
-    // Report the remaining dependency explicitly (SRS 7.7 step 10) rather than letting a
-    // SUCCEEDED run imply the downstream hand-off happened.
-    if (!ENRICHMENT_SCHEDULED) {
-      this.deps.logger.warn('SRS 7.7 step 10 deferred: no enrichment/matching handler is registered', {
-        sourceId: run.sourceId,
-        runId: run.id,
-        enrichmentScheduled: ENRICHMENT_SCHEDULED,
-      });
-    }
-
     return {
       run: finalized,
       funnel,
       status: outcome.status,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
     };
+  }
+
+  /**
+   * Enqueue the SRS 7.7 step 10 hand-off: score the jobs this run left behind.
+   *
+   * A failure here does not fail the run. The jobs are already persisted, which is the run's own
+   * contract, and the source is collected again on its next schedule; the run records
+   * `enrichmentScheduled: false` so the missed hand-off is visible instead of implied.
+   */
+  private async enqueueMatching(run: SourceRunRecord): Promise<boolean> {
+    const payload: MatchScoringTaskPayload = {
+      sourceId: run.sourceId,
+      sourceRunId: run.id,
+      trigger: 'SOURCE_RUN',
+    };
+    try {
+      await this.deps.tasks.enqueue({
+        type: MATCH_SCORING_TASK_TYPE,
+        payload,
+        dedupeKey: matchScoringDedupeKey(payload),
+      });
+      return true;
+    } catch (error) {
+      this.deps.logger.error('could not enqueue matching work for the finished run', {
+        sourceId: run.sourceId,
+        runId: run.id,
+        error: describeError(error),
+      });
+      return false;
+    }
   }
 }

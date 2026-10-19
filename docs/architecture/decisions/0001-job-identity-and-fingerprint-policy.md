@@ -463,22 +463,26 @@ SRS 7.7 numbers "acquire source content" (1) and "apply source rate limits" (2) 
 The run is a plain row, never a long transaction: no transaction is held across the
 network call or across records. This is recorded as a deviation rather than hidden.
 
-### Step 10 is deferred, with an explicit recorded state
+### Step 10 is performed, and its outcome is recorded
 
-"Schedul[ing] enrichment/matching work" is **not performed**: those stages have no
-registered handler yet, and enqueueing work for an unregistered handler produces
-guaranteed permanent failures, which would be worse than a documented gap. Rather than
-leave the gap implicit behind a `SUCCEEDED` status, the run records it:
+"Schedul[ing] enrichment/matching work" is performed by the collection use case itself: a
+terminal run enqueues one `match.score` task, deduplicated on the run id, so the hand-off
+exists at most once per run and never once per job. The task is enqueued *before* the run is
+finalized, so the recorded flag can only be `true` when a task really exists. A finalize that
+is later discarded (the run was reaped as stale) leaves a redundant scoring pass, not a
+missing one: the task is idempotent.
 
 - `SourceRun.enrichmentScheduled` (engineering-owned, `BOOLEAN NOT NULL DEFAULT false`) is
-  `false` on every run today, so a `SUCCEEDED` collection status can never be read as "the
-  whole pipeline ran";
-- the use case logs the remaining dependency (`SRS 7.7 step 10 deferred: no
-  enrichment/matching handler is registered`) on every run.
+  `true` when the hand-off was enqueued and `false` when the enqueue failed, so a `SUCCEEDED`
+  collection status can never be read as "the whole pipeline ran" when the downstream stage
+  was not scheduled. A failed enqueue does not fail the run: the jobs are already persisted,
+  and the source is collected again on its next schedule.
+- the use case logs the failed hand-off (`could not enqueue matching work for the finished
+  run`) rather than leaving the gap implicit.
 
-`tests/integration/collection-idempotency.spec.ts` asserts both, and that no work task is
-enqueued. The column becomes `true` when the enrichment/matching handler exists; it is in
-the same engineering-owned class as the funnel counters and is not a §5.2 attribute.
+`tests/integration/collection-idempotency.spec.ts` asserts the enqueue, its dedupe key, and
+its payload, and that two runs produce two keys. The column is in the same engineering-owned
+class as the funnel counters and is not a §5.2 attribute.
 
 ### Bounded acquisition
 

@@ -2,10 +2,16 @@ import {
   DescriptionQuality,
   SourceRunStatus,
   SourceRunTrigger,
+  WorkTaskStatus,
 } from '@domain/enums';
 import { DESCRIPTION_QUALITY_VERSION } from '@domain/normalizers';
 import { RunSourceCollection } from '@application/ingestion/run-source-collection';
-import type { NormalizedJob, RawJobEvidence, SourceRunRecord } from '@domain/types';
+import type {
+  NormalizedJob,
+  RawJobEvidence,
+  SourceRunRecord,
+  WorkTaskRecord,
+} from '@domain/types';
 import type { JobRepository, UpsertJobInput, UpsertJobResult } from '@ports/job-repository';
 import type {
   ObserveRawJobInput,
@@ -18,6 +24,7 @@ import type {
   SourceRunOutcome,
   SourceRunRepository,
 } from '@ports/source-run-repository';
+import type { EnqueueWorkTaskInput, WorkTaskRepository } from '@ports/work-task-repository';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 
@@ -106,6 +113,68 @@ class StubRawJobs implements RawJobRepository {
   }
 }
 
+/**
+ * The queue, as far as this use case is concerned: the only thing it does with it is the
+ * SRS 7.7 step 10 hand-off, so that is the only method modelled.
+ */
+class StubTasks implements WorkTaskRepository {
+  readonly enqueued: EnqueueWorkTaskInput[] = [];
+
+  async enqueue(input: EnqueueWorkTaskInput): Promise<WorkTaskRecord> {
+    this.enqueued.push(input);
+    return {
+      id: `task-${this.enqueued.length}`,
+      type: input.type,
+      payload: input.payload ?? null,
+      dedupeKey: input.dedupeKey ?? null,
+      status: WorkTaskStatus.PENDING,
+      priority: input.priority ?? 0,
+      attempts: 0,
+      maxAttempts: input.maxAttempts ?? 5,
+      runAfter: NOW,
+      lockedAt: null,
+      lockedBy: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      sourceRunId: null,
+      lastError: null,
+      lastErrorAt: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      startedAt: null,
+      finishedAt: null,
+    };
+  }
+
+  async enqueueOrConflict(): Promise<never> {
+    return this.unused();
+  }
+
+  async claim(): Promise<never> {
+    return this.unused();
+  }
+
+  async heartbeat(): Promise<never> {
+    return this.unused();
+  }
+
+  async complete(): Promise<never> {
+    return this.unused();
+  }
+
+  async fail(): Promise<never> {
+    return this.unused();
+  }
+
+  async reapExpiredLeases(): Promise<never> {
+    return this.unused();
+  }
+
+  private unused(): never {
+    throw new Error('this test does not use the work queue beyond the step 10 hand-off');
+  }
+}
+
 class StubJobs implements JobRepository {
   readonly upserted: UpsertJobInput[] = [];
 
@@ -177,7 +246,13 @@ function harness() {
   const sourceRuns = new StubSourceRuns();
   const rawJobs = new StubRawJobs();
   const jobs = new StubJobs();
-  const collection = new RunSourceCollection({ sourceRuns, rawJobs, jobs, logger: silentWorkerLogger });
+  const collection = new RunSourceCollection({
+    sourceRuns,
+    rawJobs,
+    jobs,
+    tasks: new StubTasks(),
+    logger: silentWorkerLogger,
+  });
   return { sourceRuns, rawJobs, jobs, collection };
 }
 

@@ -4,6 +4,7 @@ import {
   type RunSourceCollectionInput,
   type RunSourceCollectionResult,
 } from '@application/ingestion';
+import { MATCH_SCORING_TASK_TYPE } from '@application/matching';
 import { DescriptionQuality, SourceRunStatus } from '@domain/enums';
 import {
   SOURCE_RUN_LEASE_EXPIRED_REASON,
@@ -22,6 +23,7 @@ import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
+import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-source-adapter';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
 
@@ -46,6 +48,7 @@ const collection = new RunSourceCollection({
   sourceRuns,
   rawJobs,
   jobs,
+  tasks: new PrismaWorkTaskRepository(prisma),
   logger: silentWorkerLogger,
 });
 
@@ -557,6 +560,7 @@ describe('RunSourceCollection', () => {
       sourceRuns,
       rawJobs,
       jobs,
+      tasks: new PrismaWorkTaskRepository(prisma),
       logger: makeCapturingLogger(logs),
     });
     const adapter = new SlowCollectAdapter(
@@ -763,13 +767,14 @@ describe('RunSourceCollection', () => {
     expect(firstEvidence?.rawDescription).toBe('\u200B');
   });
 
-  it('records SRS 7.7 step 10 as deferred, never as performed', async () => {
+  it('performs SRS 7.7 step 10: one deduped matching task per run', async () => {
     const sourceId = await createSource();
     const logs: LogEntry[] = [];
     const local = new RunSourceCollection({
       sourceRuns,
       rawJobs,
       jobs,
+      tasks: new PrismaWorkTaskRepository(prisma),
       logger: makeCapturingLogger(logs),
     });
 
@@ -782,13 +787,46 @@ describe('RunSourceCollection', () => {
       acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
     });
 
-    // Collection genuinely succeeded...
+    // Collection genuinely succeeded *and* the downstream hand-off happened, which the run
+    // states rather than leaving a SUCCEEDED status to be read as "the whole pipeline ran".
     expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
-    // ...but SUCCEEDED must not read as "the whole pipeline ran": the run states that the
-    // downstream hand-off was not scheduled, and the remaining dependency is reported.
-    expect(result.run?.enrichmentScheduled).toBe(false);
-    expect(logs.some((entry) => /step 10.*deferred/i.test(entry.message))).toBe(true);
-    // Nothing was enqueued against the (unregistered) enrichment/matching handler.
-    expect(await prisma.workTask.count()).toBe(0);
+    expect(result.run?.enrichmentScheduled).toBe(true);
+
+    const queued = await prisma.workTask.findMany();
+    expect(queued).toHaveLength(1);
+    expect(queued[0].type).toBe(MATCH_SCORING_TASK_TYPE);
+    // One task per run, never one per job: three records were collected above.
+    expect(queued[0].dedupeKey).toBe(`${MATCH_SCORING_TASK_TYPE}:${result.run?.id ?? ''}`);
+    expect(queued[0].payload).toMatchObject({
+      sourceId,
+      sourceRunId: result.run?.id,
+      trigger: 'SOURCE_RUN',
+    });
+  });
+
+  it('keys the hand-off by the run, so each run gets its own task', async () => {
+    const sourceId = await createSource();
+    const local = new RunSourceCollection({
+      sourceRuns,
+      rawJobs,
+      jobs,
+      tasks: new PrismaWorkTaskRepository(prisma),
+      logger: silentWorkerLogger,
+    });
+    const input = (): RunSourceCollectionInput => ({
+      adapter: makeAdapter(sourceId, [
+        makeRawJob({ sourceJobIdentifier: 'x-1', rawTitle: 'Backend Engineer' }),
+      ]),
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+    });
+
+    await local.run(input());
+    await local.run(input());
+
+    const keys = (await prisma.workTask.findMany()).map((row) => row.dedupeKey);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2);
   });
 });
