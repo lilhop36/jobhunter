@@ -32,18 +32,16 @@ export interface RequestMatchBackfillResult {
  * Two events invalidate every stored match, and neither belongs to a collection run:
  *
  *   1. **The candidate profile changed.** A profile edit changes `profileVersion`, so every
- *      stored row was scored against inputs that no longer exist. The caller is whoever
- *      performs the save — the profile write path and the `seed:candidate` path — and this use
- *      case is what it calls afterwards, with `PROFILE_CHANGED`.
+ *      stored row was scored against inputs that no longer exist. The caller is `PUT
+ *      /api/profile`, which asks for a `PROFILE_CHANGED` re-score after a save that changed the
+ *      revision. The `seed:candidate` script saves profiles too and does **not** call this use
+ *      case: it is an operator seed, and the jobs it affects are re-scored by the next
+ *      collection of each source.
  *   2. **The matcher version changed.** Stored rows carry the `matcherVersion` that produced
  *      them (ENG-013), so a deploy that changes `MATCHER_VERSION` makes them stale. The caller
  *      is a startup check that compares the running `MATCHER_VERSION` with what is stored and
  *      asks for a backfill with `MATCHER_VERSION_CHANGED`, so a new matcher re-scores itself
  *      instead of waiting for every source to be collected again.
- *
- * **Neither caller is wired yet.** This use case is the entry point they need; until something
- * calls it, a backfill only happens when an operator asks for one. That is stated rather than
- * implied — see the increment report.
  *
  * ## Shape
  *

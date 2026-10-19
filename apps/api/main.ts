@@ -2,12 +2,16 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
+import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaNotificationRepository } from '@infrastructure/matching/prisma-notification-repository';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
+import { RequestMatchBackfill } from '@application/matching';
+import type { WorkerLogger } from '@ports/worker-logger';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
 import { registerErrorHandler } from './errors';
 import { registerMatchRoutes } from './routes/matches';
 import { registerNotificationRoutes } from './routes/notifications';
+import { registerProfileRoutes } from './routes/profile';
 import { registerSourceRoutes } from './routes/sources';
 
 /**
@@ -52,6 +56,23 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
 
   await registerNotificationRoutes(app, {
     notifications: new PrismaNotificationRepository(prisma),
+  });
+
+  // The worker's logger interface, over Fastify's logger: one logging configuration per process,
+  // and silent under `NODE_ENV=test` like every other line the app writes.
+  const logger: WorkerLogger = {
+    info: (message, meta) => app.log.info({ meta }, message),
+    warn: (message, meta) => app.log.warn({ meta }, message),
+    error: (message, meta) => app.log.error({ meta }, message),
+  };
+
+  await registerProfileRoutes(app, {
+    profiles: new PrismaCandidateProfileRepository(prisma),
+    rescore: new RequestMatchBackfill({
+      sources: new PrismaJobSourceRepository(prisma),
+      tasks: new PrismaWorkTaskRepository(prisma),
+      logger,
+    }),
   });
 
   return { app, prisma };

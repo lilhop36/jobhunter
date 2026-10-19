@@ -57,6 +57,14 @@ export class PrismaCandidateProfileRepository implements CandidateProfileReposit
     return rows.map(toStoredProfile);
   }
 
+  async findForUser(userId: string): Promise<StoredCandidateProfile | null> {
+    const row = await this.prisma.candidateProfile.findUnique({
+      where: { userId },
+      include: PROFILE_INCLUDE,
+    });
+    return row === null ? null : toStoredProfile(row);
+  }
+
   async saveForUser(input: SaveCandidateProfileInput): Promise<StoredCandidateProfile> {
     const { profile } = input;
     const fields = {

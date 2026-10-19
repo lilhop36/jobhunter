@@ -47,6 +47,13 @@ export interface CandidateProfileRepository {
   listProfiles(): Promise<StoredCandidateProfile[]>;
 
   /**
+   * One candidate's profile, or `null` when they have never saved one. `null` is a state, not an
+   * error: SRS 3.4's `GET /api/profile` answers 404 for it rather than inventing an empty
+   * profile, because a profile nobody stated is not a profile with no fields (ENG-001).
+   */
+  findForUser(userId: string): Promise<StoredCandidateProfile | null>;
+
+  /**
    * Creates or replaces this user's profile. A save states the **whole**
    * profile: skills, target roles and location preferences that are no longer
    * claimed are removed rather than left behind, because a leftover row is a
