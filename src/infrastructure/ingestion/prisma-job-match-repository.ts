@@ -283,4 +283,24 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
     `;
     return rows.length === 1 ? toRecord(rows[0]) : null;
   }
+
+  /**
+   * `EXISTS` rather than a count: one row under another revision is already the whole answer, so
+   * nothing here depends on how many stale rows there are.
+   *
+   * ponytail: the predicate is "any row at another revision", and `job_matches` keeps a
+   * previous revision's rows on purpose (a profile edit or an input change adds history instead
+   * of overwriting it). So after a matcher upgrade this stays true, and each worker start asks
+   * for one backfill per enabled source. That is a bounded, idempotent scoring pass per start,
+   * not a loop — narrowing it to "a live job with no row at this revision" needs the matchable
+   * policy expressed in SQL, which is not worth duplicating until the extra pass is measurable.
+   */
+  async hasMatchesForOtherMatcherVersion(matcherVersion: string): Promise<boolean> {
+    const rows = await this.prisma.$queryRaw<Array<{ stale: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM "job_matches" WHERE "matcherVersion" <> ${matcherVersion}
+      ) AS "stale"
+    `;
+    return rows[0]?.stale === true;
+  }
 }

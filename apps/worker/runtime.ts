@@ -7,10 +7,12 @@ import {
 import { SourceScheduler } from '@application/scheduling';
 import {
   MATCH_SCORING_TASK_TYPE,
+  RequestMatchBackfill,
   ScoreMatches,
   createMatchScoringHandler,
 } from '@application/matching';
-import { WorkTaskHandlerRegistry, WorkTaskWorker } from '@application/worker';
+import { WorkTaskHandlerRegistry, WorkTaskWorker, describeError } from '@application/worker';
+import { MATCHER_VERSION } from '@domain/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
@@ -59,6 +61,7 @@ export function createWorkerRuntime(
   const sourceRuns = new PrismaSourceRunRepository(prisma);
   const tasks = new PrismaWorkTaskRepository(prisma);
   const jobSources = new PrismaJobSourceRepository(prisma);
+  const matchRepository = new PrismaJobMatchRepository(prisma);
 
   // The registry is the production adapter source (SRS 7.2 / Appendix E; ADR-0004); tests
   // substitute the fake adapter here.
@@ -78,8 +81,43 @@ export function createWorkerRuntime(
   const scoring = new ScoreMatches({
     profiles: new PrismaCandidateProfileRepository(prisma),
     jobs: new PrismaMatchableJobReader(prisma),
-    matches: new PrismaJobMatchRepository(prisma),
+    matches: matchRepository,
   });
+
+  /** Re-scores every enabled source's jobs (SRS 11.2; ADR-0005 §9). */
+  const backfillMatches = new RequestMatchBackfill({ sources: jobSources, tasks, logger });
+
+  /**
+   * The `MATCHER_VERSION_CHANGED` trigger: stored matches carry the revision that produced them
+   * (ENG-013), so a deploy that changes `MATCHER_VERSION` leaves scores computed by different
+   * rules. Asking for a backfill here is what makes that deploy re-score itself instead of
+   * leaving every stored match stale until its source happens to be collected again.
+   *
+   * This is the only caller of the backfill so far. The other trigger, `PROFILE_CHANGED`, has no
+   * caller because nothing writes a profile yet: there is no profile endpoint (SRS 3.4 lists
+   * `PUT /api/profile`, which v1 does not implement) and `saveForUser` is reached only from the
+   * seed script and tests.
+   */
+  const requestMatcherVersionBackfill = async (): Promise<void> => {
+    try {
+      if (!(await matchRepository.hasMatchesForOtherMatcherVersion(MATCHER_VERSION))) return;
+
+      const result = await backfillMatches.run({ reason: 'MATCHER_VERSION_CHANGED' });
+      logger.info('matcher version changed; every stored match is being recomputed', {
+        matcherVersion: MATCHER_VERSION,
+        enqueued: result.enqueued.length,
+        alreadyQueued: result.alreadyQueued.length,
+      });
+    } catch (error) {
+      // Correctness does not depend on this: a stale match is recomputed the next time its
+      // source is collected. A database that cannot answer the question is a problem the first
+      // collection reports far more clearly, so it must not stop the worker from starting.
+      logger.warn('could not request a matcher-version backfill', {
+        matcherVersion: MATCHER_VERSION,
+        error: describeError(error),
+      });
+    }
+  };
 
   const handlers = new WorkTaskHandlerRegistry()
     .register(
@@ -123,6 +161,11 @@ export function createWorkerRuntime(
       // own lease loop starts with a reap. Both happen before the first task is claimed, so
       // a source wedged by a previous crash is released rather than waiting for a timer.
       await scheduler.start();
+
+      // Then the deploy-level invalidation, still before the first task is claimed, so a
+      // changed matcher is already being re-scored by the time the worker accepts work.
+      await requestMatcherVersionBackfill();
+
       await worker.start();
     },
 

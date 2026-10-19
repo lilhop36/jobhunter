@@ -68,6 +68,15 @@ export interface JobMatchRepository {
   /** One page of matches, best score first (SRS 3.4 `GET /api/matches`). */
   listMatches(options: ListMatchesOptions): Promise<ListMatchesPage>;
 
+  /**
+   * True when any stored match was produced by a revision other than this one.
+   *
+   * Stored rows carry the `matcherVersion` that produced them (ENG-013), so this is the
+   * condition a deploy that changes `MATCHER_VERSION` needs: the stored scores were computed by
+   * different rules and must be recomputed rather than read.
+   */
+  hasMatchesForOtherMatcherVersion(matcherVersion: string): Promise<boolean>;
+
   findById(id: string): Promise<JobMatchRecord | null>;
 
   /** The stored row for one exact input set, or null. */

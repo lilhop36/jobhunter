@@ -2,7 +2,20 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { FastifyInstance } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { SOURCE_COLLECTION_TASK_TYPE, sourceCollectionDedupeKey } from '@application/ingestion';
-import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { MATCH_SCORING_TASK_TYPE } from '@application/matching';
+import {
+  EmploymentType,
+  LocationCategory,
+  RemotePreference,
+  RelocationPreference,
+  SalaryPeriod,
+  SkillEvidence,
+  SourceRunStatus,
+  SourceRunTrigger,
+} from '@domain/enums';
+import { MATCHER_VERSION, type UnversionedCandidateProfile } from '@domain/matching';
+import { asDecimalAmount, asProbability } from '@domain/types';
+import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { buildApi } from '../../apps/api/main';
 import { parseApiConfig } from '../../apps/api/config';
 import { createWorkerRuntime, type WorkerRuntime } from '../../apps/worker/runtime';
@@ -35,6 +48,41 @@ const prisma = createTestPrismaClient();
 let app: FastifyInstance;
 let appPrisma: PrismaClient;
 let runtime: WorkerRuntime | undefined;
+
+/**
+ * Long enough to classify SUFFICIENT (>= 25 lexical tokens) and free of the boilerplate
+ * lexicon, so the collected job reaches the matchable reader instead of being filtered out.
+ */
+const DESCRIPTION =
+  'We are hiring a backend engineer to own our payments platform. You will design services, ' +
+  'write TypeScript, review pull requests, improve database queries, and work closely with ' +
+  'product designers on customer facing features. Experience with PostgreSQL, message queues ' +
+  'and observability tooling helps considerably.';
+
+async function seedCandidate(userId: string): Promise<void> {
+  const profile: UnversionedCandidateProfile = {
+    experienceYears: 5,
+    remotePreference: RemotePreference.NO_PREFERENCE,
+    relocationPreference: RelocationPreference.UNDECIDED,
+    salaryPreference: {
+      min: asDecimalAmount('50000.00'),
+      currency: 'ETB',
+      period: SalaryPeriod.MONTH,
+      requireDisclosed: false,
+    },
+    employmentPreferences: [EmploymentType.FULL_TIME],
+    skills: [
+      {
+        canonicalSkill: 'TypeScript',
+        skillType: SkillEvidence.EXACT_MATCH,
+        confidence: asProbability(1),
+      },
+    ],
+    targetRoles: [{ title: 'Backend Engineer', aliases: [] }],
+    locationPreferences: [{ category: LocationCategory.ADDIS_ABABA, text: null }],
+  };
+  await new PrismaCandidateProfileRepository(prisma).saveForUser({ userId, profile });
+}
 
 beforeAll(() => {
   process.env.NODE_ENV = 'test';
@@ -108,8 +156,39 @@ async function waitForTask(taskId: string): Promise<string> {
   return status;
 }
 
-describe('manual run handoff', () => {
-  it('carries the API enqueue to the registered collection handler', async () => {
+/**
+ * The production path, assembled: a source with no schedule (so the scheduler adds nothing of
+ * its own), a manual run through the real endpoint, and the real worker runtime.
+ */
+async function startPipeline(): Promise<string> {
+  const source = await prisma.jobSource.create({
+    data: { name: `handoff-${Date.now()}`, adapterType: 'FAKE', adapterVersion: '1.0.0', schedule: null },
+    select: { id: true },
+  });
+  const rows = [
+    makeRawJob({
+      sourceJobIdentifier: 'm-1',
+      rawTitle: 'Backend Engineer',
+      rawCompany: 'Acme',
+      rawDescription: DESCRIPTION,
+      rawLocation: 'Addis Ababa',
+    }),
+  ];
+
+  const response = await app.inject({ method: 'POST', url: `/api/sources/${source.id}/run` });
+  expect(response.statusCode).toBe(202);
+
+  runtime = createWorkerRuntime(workerConfig(), {
+    resolveAdapter: async (requested) =>
+      requested === source.id
+        ? new FakeSourceAdapter(makeFakeConfig({ sourceId: source.id }), rows)
+        : null,
+  });
+  await runtime.start();
+  return source.id;
+}
+
+describe('manual run handoff', () => {  it('carries the API enqueue to the registered collection handler', async () => {
     const source = await prisma.jobSource.create({
       data: { name: 'handoff-source', adapterType: 'FAKE', adapterVersion: '1.0.0' },
     });
@@ -160,5 +239,75 @@ describe('manual run handoff', () => {
     // a terminal status with nothing behind it.
     expect(await prisma.rawJob.count({ where: { sourceId: source.id } })).toBe(2);
     expect(await prisma.job.count({ where: { sourceId: source.id } })).toBe(2);
+  }, 60_000);
+
+  it('carries the finished run all the way to a stored, explainable match', async () => {
+    const user = await prisma.user.create({
+      data: { email: `handoff-${Date.now()}@example.test` },
+      select: { id: true },
+    });
+    await seedCandidate(user.id);
+    const sourceId = await startPipeline();
+
+    // SRS 11.2 exit condition: a real collected job ends up with a deterministic match row. The
+    // only thing that connects the two stages is the queue row the run enqueued.
+    await waitForText(async () => {
+      const row = await prisma.jobMatch.findFirst({ where: { userId: user.id } });
+      return row === null ? '' : 'scored';
+    }, 'the collected job to be matched');
+
+    const run = await prisma.sourceRun.findFirstOrThrow({ where: { sourceId } });
+    expect(run.enrichmentScheduled).toBe(true);
+
+    const handoff = await prisma.workTask.findFirstOrThrow({
+      where: { dedupeKey: `${MATCH_SCORING_TASK_TYPE}:${run.id}` },
+    });
+    expect(handoff.type).toBe(MATCH_SCORING_TASK_TYPE);
+    expect(handoff.payload).toMatchObject({
+      sourceId,
+      sourceRunId: run.id,
+      trigger: 'SOURCE_RUN',
+    });
+
+    const stored = await prisma.jobMatch.findFirstOrThrow({ where: { userId: user.id } });
+    expect(stored.matcherVersion).toBe(MATCHER_VERSION);
+    expect(stored.confidence).toBeGreaterThan(0);
+    expect(stored.roleScore).not.toBeNull();
+    expect(stored.explanation.length).toBeGreaterThan(0);
+    // The Skills factor has no producer on the job side yet, so it is excluded (NULL), never
+    // recorded as zero (AC-010) — a stored match says so rather than implying "no skills match".
+    expect(stored.skillScore).toBeNull();
+  }, 60_000);
+
+  it('re-scores on startup when stored matches carry another matcher revision', async () => {
+    const user = await prisma.user.create({
+      data: { email: `version-${Date.now()}@example.test` },
+      select: { id: true },
+    });
+    await seedCandidate(user.id);
+    const sourceId = await startPipeline();
+    await waitForText(async () => {
+      const row = await prisma.jobMatch.findFirst({ where: { userId: user.id } });
+      return row === null ? '' : 'scored';
+    }, 'the collected job to be matched');
+
+    // A deploy that changes MATCHER_VERSION leaves exactly this behind: rows produced by rules
+    // the running matcher no longer implements (ENG-013).
+    await prisma.$executeRaw`UPDATE "job_matches" SET "matcherVersion" = '0.9.0'`;
+    await runtime?.stop();
+    runtime = undefined;
+
+    // The next worker start is the caller of the MATCHER_VERSION_CHANGED backfill.
+    runtime = createWorkerRuntime(workerConfig(), { resolveAdapter: async () => null });
+    await runtime.start();
+
+    const backfill = await prisma.workTask.findFirstOrThrow({
+      where: { dedupeKey: `${MATCH_SCORING_TASK_TYPE}:source:${sourceId}` },
+    });
+    expect(backfill.payload).toMatchObject({
+      sourceId,
+      sourceRunId: null,
+      trigger: 'MATCHER_VERSION_CHANGED',
+    });
   }, 60_000);
 });

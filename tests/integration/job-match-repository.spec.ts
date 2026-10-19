@@ -193,3 +193,40 @@ describe('PrismaJobMatchRepository.saveIfChanged', () => {
     await expect(matches.findById(row.id)).rejects.toThrow(/unrecognised evidence document/);
   });
 });
+
+describe('PrismaJobMatchRepository.hasMatchesForOtherMatcherVersion', () => {
+  it('is false when nothing is stored, so a fresh database asks for no backfill', async () => {
+    expect(await matches.hasMatchesForOtherMatcherVersion(MATCHER_VERSION)).toBe(false);
+  });
+
+  it('is false when every stored match was produced by the running revision', async () => {
+    await save(scored({ matcherVersion: MATCHER_VERSION }));
+
+    expect(await matches.hasMatchesForOtherMatcherVersion(MATCHER_VERSION)).toBe(false);
+  });
+
+  it('is true when one stored match was produced by another revision', async () => {
+    await save(scored({ matcherVersion: MATCHER_VERSION }));
+    await prisma.$executeRaw`UPDATE "job_matches" SET "matcherVersion" = '0.9.0' WHERE "jobId" = ${jobId}::uuid`;
+
+    expect(await matches.hasMatchesForOtherMatcherVersion(MATCHER_VERSION)).toBe(true);
+    // Asking about the revision that is actually stored is still false: the question is
+    // "does this session's matcher disagree with what is stored", not "is anything stored".
+    expect(await matches.hasMatchesForOtherMatcherVersion('0.9.0')).toBe(false);
+  });
+
+  it('is scoped to revisions, not to candidates or jobs', async () => {
+    const other = await prisma.user.create({ data: { email: `stale-${Date.now()}@example.test` } });
+    await save(scored({ matcherVersion: MATCHER_VERSION }));
+    await matches.saveIfChanged({
+      userId: other.id,
+      jobId,
+      profileVersion: 'v1:profile-a',
+      inputHash: 'hash-stale',
+      scoredAt: new Date('2026-10-19T00:00:00.000Z'),
+      match: scored({ matcherVersion: '0.9.0' }),
+    });
+
+    expect(await matches.hasMatchesForOtherMatcherVersion(MATCHER_VERSION)).toBe(true);
+  });
+});
