@@ -18,6 +18,12 @@ export interface ScoreMatchesInput {
   /** Jobs read per page; defaults to {@link DEFAULT_PAGE_SIZE}. */
   pageSize?: number;
   /**
+   * Cooperative cancellation (worker shutdown). Checked before each job, never mid-write, so an
+   * aborted attempt stops promptly and leaves only complete rows behind — each of which a rerun
+   * re-finds as unchanged.
+   */
+  signal?: AbortSignal;
+  /**
    * Injected evaluation time (ENG-012): this use case never reads the clock, and the clock is
    * not part of the input hash, so scoring later updates a row instead of duplicating it.
    */
@@ -101,6 +107,12 @@ export class ScoreMatches {
         cursor = nextCursor;
 
         for (const batch of page) {
+          // Worker shutdown: stop at a job boundary. Everything already written is complete and
+          // will be re-found as 'unchanged' on the retry, so nothing is half-done.
+          if (input.signal?.aborted === true) {
+            throw new Error('match scoring was aborted before completing');
+          }
+
           result.jobScores += 1;
 
           // Re-applied policy: the query filtered, but the rule belongs to the domain.

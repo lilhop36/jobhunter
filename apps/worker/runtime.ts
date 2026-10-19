@@ -5,11 +5,19 @@ import {
   createSourceCollectionHandler,
 } from '@application/ingestion';
 import { SourceScheduler } from '@application/scheduling';
+import {
+  MATCH_SCORING_TASK_TYPE,
+  ScoreMatches,
+  createMatchScoringHandler,
+} from '@application/matching';
 import { WorkTaskHandlerRegistry, WorkTaskWorker } from '@application/worker';
+import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
+import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
+import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import { consoleWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
@@ -64,15 +72,25 @@ export function createWorkerRuntime(
     logger,
   });
 
-  const handlers = new WorkTaskHandlerRegistry().register(
-    SOURCE_COLLECTION_TASK_TYPE,
-    createSourceCollectionHandler({
-      resolveAdapter,
-      collection,
-      staleRunSeconds: config.staleRunSeconds,
-      acquisitionTimeoutMs: config.acquisitionTimeoutMs,
-    }),
-  );
+  // Matching (SRS 11.2, FR-013/FR-014). The reader narrows to matchable jobs, the profile
+  // repository is the non-negotiable input, and the match repository owns the idempotent write.
+  const scoring = new ScoreMatches({
+    profiles: new PrismaCandidateProfileRepository(prisma),
+    jobs: new PrismaMatchableJobReader(prisma),
+    matches: new PrismaJobMatchRepository(prisma),
+  });
+
+  const handlers = new WorkTaskHandlerRegistry()
+    .register(
+      SOURCE_COLLECTION_TASK_TYPE,
+      createSourceCollectionHandler({
+        resolveAdapter,
+        collection,
+        staleRunSeconds: config.staleRunSeconds,
+        acquisitionTimeoutMs: config.acquisitionTimeoutMs,
+      }),
+    )
+    .register(MATCH_SCORING_TASK_TYPE, createMatchScoringHandler({ scoring, logger }));
 
   const worker = new WorkTaskWorker(
     tasks,
