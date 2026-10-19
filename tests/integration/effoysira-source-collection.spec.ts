@@ -166,5 +166,8 @@ describe('EffoySira approved-source collection (production registry, no network)
     expect(job?.salaryCurrency).toBe('ETB');
     expect(job?.applicationMethod).toBe('EMAIL');
     expect(job?.publishedCalendar).toBe('GREGORIAN');
-  });
+    // The real registration rate-limits at 800 ms per request and the finished run also hands
+    // its jobs to matching, so the default 5 s bound is a coin flip; waitForTask's own bound is
+    // 20 s.
+  }, 30_000);
 });
