@@ -252,6 +252,24 @@ describe('scoreMatch — UNKNOWN is excluded, not negative (AC-010, SRS 4.6)', (
     expect(partial.confidence).toBeLessThan(sufficient.confidence);
     expect(partial.confidence).toBe(81);
   });
+
+  it('lowers confidence, not the other factors, when the posting evidences no skills (D3, ADR-0005 §2)', () => {
+    // No stage extracts job-side skills yet, so every real job arrives with `skills: []` and the
+    // Skills factor is UNKNOWN. The safeguard is that this reads as thin evidence about the
+    // match, rather than as if the posting had been checked and lists no relevant skills.
+    const evidencing = scoreMatch({ profile: profile(), job: job(), now: NOW });
+    const withoutSkills = scoreMatch({ profile: profile(), job: job({ skills: [] }), now: NOW });
+
+    expect(withoutSkills.factors.skills).toBeNull();
+    expect(evidencing.factors.skills).toBe(67);
+
+    for (const factor of ['role', 'experience', 'location', 'employment', 'freshness', 'salary'] as const) {
+      expect(withoutSkills.factors[factor]).toBe(evidencing.factors[factor]);
+    }
+
+    expect(withoutSkills.confidence).toBeLessThan(evidencing.confidence);
+    expect(withoutSkills.explanation).toContain('skills: the posting evidences no skills');
+  });
 });
 
 describe('scoreMatch — role factor', () => {

@@ -74,6 +74,13 @@ interface FactorOutcome {
   matched: string[];
   missing: string[];
   uncertain: string[];
+  /**
+   * The skills this outcome is about, when the factor is skills. Carried structurally so
+   * `JobMatch.matchedSkills` / `uncertainSkills` are never recovered by parsing their own
+   * evidence lines back out — the lines embed the credit ladder for the explanation, and the
+   * names must not depend on that wording.
+   */
+  skills?: { matched: string[]; missing: string[]; uncertain: string[] };
 }
 
 function unknown(reason: string): FactorOutcome {
@@ -192,6 +199,8 @@ function scoreSkills(profile: CandidateProfile, job: MatchableJob): FactorOutcom
   const matched: string[] = [];
   const missing: string[] = [];
   const uncertain: string[] = [];
+  const matchedNames: string[] = [];
+  const uncertainNames: string[] = [];
 
   for (const candidate of candidateSkills) {
     // How firmly the candidate holds the skill weights how much its credit counts.
@@ -207,18 +216,32 @@ function scoreSkills(profile: CandidateProfile, job: MatchableJob): FactorOutcom
     creditTotal += weight * skillCredit(jobSkill.evidence, jobSkill.confidence);
     if (jobSkill.evidence === SkillEvidence.AI_SUGGESTED) {
       uncertain.push(`${candidate.canonicalSkill} (AI_SUGGESTED, confidence ${jobSkill.confidence})`);
+      uncertainNames.push(candidate.canonicalSkill);
     } else {
       matched.push(`${candidate.canonicalSkill} (${jobSkill.evidence})`);
+      matchedNames.push(candidate.canonicalSkill);
     }
   }
 
   if (weightTotal === 0) return unknown('skills: candidate skills carry no confidence weight');
 
-  return known(Math.round((100 * creditTotal) / weightTotal), TEXT_CERTAINTY[job.descriptionQuality], {
-    matched: matched.sort(),
-    missing: missing.sort(),
-    uncertain: uncertain.sort(),
-  });
+  const outcome = known(
+    Math.round((100 * creditTotal) / weightTotal),
+    TEXT_CERTAINTY[job.descriptionQuality],
+    {
+      matched: matched.sort(),
+      missing: missing.sort(),
+      uncertain: uncertain.sort(),
+    },
+  );
+  return {
+    ...outcome,
+    skills: {
+      matched: matchedNames.sort(),
+      missing: [...missing].sort(),
+      uncertain: uncertainNames.sort(),
+    },
+  };
 }
 
 function scoreExperience(profile: CandidateProfile, job: MatchableJob): FactorOutcome {
@@ -475,9 +498,9 @@ export function scoreMatch(input: MatchInput): JobMatch {
     score: asPercent(score),
     confidence: asPercent(confidence),
     factors,
-    matchedSkills: outcomes.skills.matched.map((line) => line.replace(/\s*\(.*$/, '')).sort(),
-    missingSkills: [...outcomes.skills.missing].sort(),
-    uncertainSkills: outcomes.skills.uncertain.map((line) => line.replace(/\s*\(.*$/, '')).sort(),
+    matchedSkills: outcomes.skills.skills?.matched ?? [],
+    missingSkills: outcomes.skills.skills?.missing ?? [],
+    uncertainSkills: outcomes.skills.skills?.uncertain ?? [],
     matchedEvidence,
     missingEvidence,
     uncertainEvidence,
