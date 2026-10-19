@@ -72,6 +72,19 @@ const GUARDED_PLAIN_UNIQUE_INDEXES: PlainUniqueIndexGuard[] = [
     protects:
       'one Job per source-scoped source-record identity, and no identity-less Job at all (ADR-0001)',
   },
+  {
+    name: 'one_notification_per_event',
+    table: 'notification_outbox',
+    definitionIncludes: [`USING btree ("userId", "jobId", "notificationType", event)`],
+    protects:
+      'at most one notification per equivalent event (ENG-027, AC-016): a partial index would let the same event back in once the first row reached SENT',
+  },
+  {
+    name: 'one_feedback_per_notification',
+    table: 'notification_feedback',
+    definitionIncludes: [`USING btree ("notificationId")`],
+    protects: 'one verdict per notification, replaced rather than accumulated (FR-018)',
+  },
 ];
 
 const prisma = createTestPrismaClient();

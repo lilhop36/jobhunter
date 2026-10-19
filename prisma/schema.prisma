@@ -101,6 +101,13 @@ enum NotificationStatus {
   CANCELLED
 }
 
+/// SRS 4.8 / FR-018 feedback values: "relevant/not relevant/unsure".
+enum NotificationFeedbackValue {
+  RELEVANT
+  NOT_RELEVANT
+  UNSURE
+}
+
 enum ApplicationMethod {
   ONLINE_URL
   EMAIL
@@ -328,6 +335,7 @@ model Job {
   source JobSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
   rawJob RawJob?   @relation(fields: [rawJobId], references: [id], onDelete: SetNull)
   matches JobMatch[]
+  notifications NotificationOutbox[]
 
   // SRS 5.6 database requirements.
   @@index([canonicalUrl])
@@ -399,6 +407,7 @@ model User {
 
   profile CandidateProfile?
   jobMatches JobMatch[]
+  notifications NotificationOutbox[]
 
   @@map("users")
 }
@@ -558,10 +567,78 @@ model JobMatch {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   job  Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  notifications NotificationOutbox[]
 
   /// One row per distinct (user, job, matcherVersion, canonical input set) — see `inputHash`.
   @@unique([userId, jobId, matcherVersion, inputHash], map: "one_match_per_user_job_input")
   /// SRS 5.6 "Recommended indexes": JobMatch(userId, score).
   @@index([userId, score], map: "job_matches_userId_score_idx")
   @@map("job_matches")
+}
+
+// ---------------------------------------------------------------------------
+// M3 tables: notification outbox and feedback (SRS 3.2, 4.8, 5.2; FR-016,
+// FR-017, FR-018; ENG-027, AC-015/016/017).
+//
+// Persistence only: nothing writes these rows yet. The gate is
+// `evaluateNotificationEligibility` (@domain/notification), and the writer is the
+// next increment — ENG-027 requires the match row and its outbox row in one
+// transaction, so the two inserts cannot be designed independently. Delivery,
+// Telegram credentials and the link token are later still.
+// ---------------------------------------------------------------------------
+
+model NotificationOutbox {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @db.Uuid
+  jobId  String @db.Uuid
+  /// The stored match this notification announces. Nullable because SRS 3.5 lets a
+  /// notification policy permit informational listings that have no match.
+  jobMatchId String? @db.Uuid
+
+  /// SRS 5.2 `notificationType` (v1: `NEW_MATCH`).
+  notificationType String
+  /// The event within that type (v1: `NEW_MATCH`). With user, job and type this is the
+  /// ENG-027 event key: an equivalent event is never inserted twice.
+  event String
+
+  /// SRS 5.2 `payload`: the rendered SRS 3.2 content, stored at reservation time so the
+  /// delivered message does not depend on what the job row says later.
+  payload Json
+
+  status        NotificationStatus @default(PENDING)
+  attemptCount  Int                @default(0)
+  nextAttemptAt DateTime           @default(now())
+  lastError     String?
+  createdAt     DateTime           @default(now())
+  sentAt        DateTime?
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job      Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobMatch JobMatch? @relation(fields: [jobMatchId], references: [id], onDelete: SetNull)
+  feedback NotificationFeedback[]
+
+  /// ENG-027 / AC-016: one row per equivalent event, enforced by the database rather
+  /// than by a read-then-write check. Guarded by tests/integration/partial-indexes.spec.ts
+  /// (plain unique: a partial index would let a second row in after the first was SENT).
+  @@unique([userId, jobId, notificationType, event], map: "one_notification_per_event")
+  /// SRS 5.6 "Recommended indexes": NotificationOutbox(status, nextAttemptAt) — the
+  /// dispatcher's due-scan.
+  @@index([status, nextAttemptAt], map: "notification_outbox_status_nextAttemptAt_idx")
+  @@map("notification_outbox")
+}
+
+model NotificationFeedback {
+  id             String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  notificationId String                    @db.Uuid
+  /// SRS 4.8 / FR-018: relevant | not relevant | unsure. `NOT_RELEVANT` is the
+  /// user's rejection and suppresses that job from further notification (SRS 3.2).
+  value          NotificationFeedbackValue
+  createdAt      DateTime                  @default(now())
+
+  notification NotificationOutbox @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  /// One verdict per notification: feedback replaces the previous verdict (upsert) so a
+  /// changed mind does not accumulate contradicting rows.
+  @@unique([notificationId], map: "one_feedback_per_notification")
+  @@map("notification_feedback")
 }
