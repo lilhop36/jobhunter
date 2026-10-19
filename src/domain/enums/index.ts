@@ -7,6 +7,7 @@ export * from './evidence-state.enum';
 export * from './skill-evidence.enum';
 export * from './ai-status.enum';
 export * from './notification-status.enum';
+export * from './notification-feedback-value.enum';
 export * from './application-method.enum';
 export * from './description-quality.enum';
 export * from './employment-type.enum';

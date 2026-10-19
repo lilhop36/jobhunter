@@ -2,10 +2,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
+import { PrismaNotificationRepository } from '@infrastructure/matching/prisma-notification-repository';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
 import { registerErrorHandler } from './errors';
 import { registerMatchRoutes } from './routes/matches';
+import { registerNotificationRoutes } from './routes/notifications';
 import { registerSourceRoutes } from './routes/sources';
 
 /**
@@ -46,6 +48,10 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
 
   await registerMatchRoutes(app, {
     matches: new PrismaJobMatchRepository(prisma),
+  });
+
+  await registerNotificationRoutes(app, {
+    notifications: new PrismaNotificationRepository(prisma),
   });
 
   return { app, prisma };

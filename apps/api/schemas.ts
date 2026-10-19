@@ -1,4 +1,10 @@
-import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import {
+  HealthStatus,
+  NotificationFeedbackValue,
+  NotificationStatus,
+  SourceRunStatus,
+  SourceRunTrigger,
+} from '@domain/enums';
 
 /**
  * Request schemas for the Phase 1 source endpoints.
@@ -65,5 +71,41 @@ export const listMatchesQuery = {
     matcherVersion: { type: 'string', minLength: 1 },
     userId: { type: 'string', pattern: UUID_PATTERN },
   },
+  additionalProperties: false,
+} as const;
+
+export const notificationIdParams = {
+  type: 'object',
+  required: ['id'],
+  properties: { id: { type: 'string', pattern: UUID_PATTERN } },
+  additionalProperties: false,
+} as const;
+
+/**
+ * `GET /api/notifications` filters. `userId` is optional for the same reason as on the matches
+ * route: SRS 3.4 fixes no authentication, so the caller says whose notifications it wants, and
+ * the running API binds to loopback until that is specified.
+ */
+export const listNotificationsQuery = {
+  type: 'object',
+  properties: {
+    ...paginationProperties,
+    userId: { type: 'string', pattern: UUID_PATTERN },
+    status: { type: 'string', enum: Object.values(NotificationStatus) },
+  },
+  additionalProperties: false,
+} as const;
+
+/**
+ * `POST /api/notifications/:id/feedback` (SRS 4.8 / FR-018).
+ *
+ * The three verdicts are the SRS's ("relevant / not relevant / unsure"), published as the enum
+ * names the database stores, like every other enum this API exposes. `additionalProperties:
+ * false` with `value` required means a client cannot send a fourth verdict or forget one.
+ */
+export const submitFeedbackBody = {
+  type: 'object',
+  required: ['value'],
+  properties: { value: { type: 'string', enum: Object.values(NotificationFeedbackValue) } },
   additionalProperties: false,
 } as const;
