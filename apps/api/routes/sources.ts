@@ -11,6 +11,7 @@ import type {
 import type { WorkTaskRepository } from '@ports/work-task-repository';
 import type { WorkTaskRecord } from '@domain/types';
 import { ApiError } from '../errors';
+import { decodeCursor, encodeCursor } from '../cursor';
 import { listRunsQuery, listSourcesQuery, sourceIdParams } from '../schemas';
 
 /**
@@ -199,14 +200,9 @@ function asIso(value: Date | null): string | null {
 }
 
 /**
- * A cursor is opaque: base64url of the keyset tuple. The tuple is encoded as JSON rather than
- * joined on a delimiter so that a value containing the delimiter (a source name, say) cannot
- * corrupt it. A malformed cursor is a 400 — the client sent it, so the client is told.
+ * A cursor is opaque: base64url of the keyset tuple (see {@link encodeCursor}). A malformed
+ * cursor is a 400 — the client sent it, so the client is told.
  */
-function encodeCursor(tuple: SourceCursor | RunHistoryCursor): string {
-  return Buffer.from(JSON.stringify(tuple), 'utf8').toString('base64url');
-}
-
 function decodeSourceCursor(raw: string): SourceCursor {
   const value = decodeCursor(raw);
   if (value === null || typeof value.name !== 'string' || value.name === '') {
@@ -223,17 +219,6 @@ function decodeRunCursor(raw: string): RunHistoryCursor {
   const startedAt = new Date(value.startedAt);
   if (Number.isNaN(startedAt.getTime())) throw invalidCursor();
   return { startedAt, id: value.id };
-}
-
-function decodeCursor(raw: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
-    return parsed !== null && typeof parsed === 'object'
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function invalidCursor(): ApiError {

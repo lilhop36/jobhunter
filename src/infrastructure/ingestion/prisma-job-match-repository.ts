@@ -9,6 +9,8 @@ import {
 import {
   JobMatchRecord,
   JobMatchRepository,
+  ListMatchesOptions,
+  ListMatchesPage,
   SaveJobMatchInput,
   SaveJobMatchOutcome,
 } from '@ports/job-match-repository';
@@ -221,6 +223,49 @@ export class PrismaJobMatchRepository implements JobMatchRepository {
       SELECT ${MATCH_COLUMNS} FROM "job_matches" WHERE "id" = ${id}::uuid
     `;
     return rows.length === 1 ? toRecord(rows[0]) : null;
+  }
+
+  /**
+   * One page of matches, best score first, keyset-paginated on (score DESC, id ASC).
+   *
+   * A row read here is validated like any other (`parseJobMatchEvidence`), so a page cannot
+   * publish a corrupt row as a mostly-empty match.
+   *
+   * ponytail: reads `job_matches` sequentially and sorts it. The table holds one row per
+   * (candidate, job, input set), so that is small for v1 — add a
+   * `("matcherVersion", "score" DESC, "id")` index (and to the guard test's list) when a page
+   * read stops being instant.
+   */
+  async listMatches(options: ListMatchesOptions): Promise<ListMatchesPage> {
+    const { matcherVersion, userId, cursor } = options;
+    // Fragments rather than a single over-conditional query: an omitted filter is absent from
+    // the SQL, so nothing has to be bound to a placeholder value it does not mean.
+    const userClause =
+      userId === undefined ? Prisma.empty : Prisma.sql`AND "userId" = ${userId}::uuid`;
+    const cursorClause =
+      cursor === undefined || cursor === null
+        ? Prisma.empty
+        : Prisma.sql`AND ("score" < ${cursor.score}::int OR ("score" = ${cursor.score}::int AND "id" > ${cursor.id}::uuid))`;
+
+    // `limit + 1` is how a keyset page knows there is a next one without a second count.
+    const rows = await this.prisma.$queryRaw<MatchRow[]>`
+      SELECT ${MATCH_COLUMNS} FROM "job_matches"
+      WHERE "matcherVersion" = ${matcherVersion}
+        ${userClause}
+        ${cursorClause}
+      ORDER BY "score" DESC, "id" ASC
+      LIMIT ${options.limit + 1}
+    `;
+
+    const page = rows.slice(0, options.limit).map(toRecord);
+    const last = page[page.length - 1];
+    return {
+      matches: page,
+      nextCursor:
+        rows.length > options.limit && last !== undefined
+          ? { score: last.score, id: last.id }
+          : null,
+    };
   }
 
   async findByInput(input: {

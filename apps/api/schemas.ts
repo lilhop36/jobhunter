@@ -45,3 +45,25 @@ export const listRunsQuery = {
   },
   additionalProperties: false,
 } as const;
+
+export const matchIdParams = {
+  type: 'object',
+  required: ['id'],
+  properties: { id: { type: 'string', pattern: UUID_PATTERN } },
+  additionalProperties: false,
+} as const;
+
+/**
+ * `GET /api/matches` filters. `matcherVersion` is optional here and defaults in the route to the
+ * running `MATCHER_VERSION`, so a client that does not care about revisions gets the current
+ * ones; asking for an older revision is how A/B evidence stays readable after a matcher change.
+ */
+export const listMatchesQuery = {
+  type: 'object',
+  properties: {
+    ...paginationProperties,
+    matcherVersion: { type: 'string', minLength: 1 },
+    userId: { type: 'string', pattern: UUID_PATTERN },
+  },
+  additionalProperties: false,
+} as const;

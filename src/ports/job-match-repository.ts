@@ -36,8 +36,37 @@ export interface SaveJobMatchInput {
  */
 export type SaveJobMatchOutcome = 'inserted' | 'updated' | 'unchanged';
 
+/**
+ * Where a page ended. The list order is score descending, then id ascending, so the tuple
+ * carries both keys and the page after it is the strictly smaller one.
+ */
+export interface MatchCursor {
+  score: number;
+  id: string;
+}
+
+export interface ListMatchesOptions {
+  /**
+   * Matcher revision to list. Required, and supplied by the caller: the route decides that the
+   * default is the running `MATCHER_VERSION`, so the repository never reads a config global.
+   */
+  matcherVersion: string;
+  /** Restrict to one candidate. Omitted lists every candidate's matches (FR-012 makes one the v1 reality). */
+  userId?: string;
+  limit: number;
+  cursor?: MatchCursor | null;
+}
+
+export interface ListMatchesPage {
+  matches: JobMatchRecord[];
+  nextCursor: MatchCursor | null;
+}
+
 export interface JobMatchRepository {
   saveIfChanged(input: SaveJobMatchInput): Promise<SaveJobMatchOutcome>;
+
+  /** One page of matches, best score first (SRS 3.4 `GET /api/matches`). */
+  listMatches(options: ListMatchesOptions): Promise<ListMatchesPage>;
 
   findById(id: string): Promise<JobMatchRecord | null>;
 

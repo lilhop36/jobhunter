@@ -1,9 +1,11 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { PrismaClient } from '@prisma/client';
+import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
 import { registerErrorHandler } from './errors';
+import { registerMatchRoutes } from './routes/matches';
 import { registerSourceRoutes } from './routes/sources';
 
 /**
@@ -40,6 +42,10 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
   await registerSourceRoutes(app, {
     sources: new PrismaJobSourceRepository(prisma),
     workTasks: new PrismaWorkTaskRepository(prisma),
+  });
+
+  await registerMatchRoutes(app, {
+    matches: new PrismaJobMatchRepository(prisma),
   });
 
   return { app, prisma };
