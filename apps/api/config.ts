@@ -13,6 +13,13 @@ export interface ApiConfig {
    */
   host: string;
   port: number;
+  /**
+   * The bot's public username (`TELEGRAM_BOT_USERNAME`), the one credential-dependent input
+   * of `POST /api/telegram/link`'s deep link. Optional: the link route reports its absence
+   * when it is hit instead of the process refusing to start (SRS 8.3 keeps the bot token
+   * itself away from the API process entirely — only the worker sends).
+   */
+  telegramBotUsername?: string;
 }
 
 /** Raised for configuration that would make the API unsafe or unstartable. */
@@ -50,5 +57,9 @@ export function parseApiConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig 
     databaseUrl: requiredString(env, 'DATABASE_URL'),
     host: optionalString(env, 'API_HOST', '127.0.0.1'),
     port: optionalPort(env, 'API_PORT', 3001),
+    telegramBotUsername: (() => {
+      const value = env['TELEGRAM_BOT_USERNAME']?.trim();
+      return value === undefined || value === '' ? undefined : value;
+    })(),
   };
 }

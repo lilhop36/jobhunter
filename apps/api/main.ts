@@ -5,6 +5,7 @@ import { PrismaJobReader } from '@infrastructure/ingestion/prisma-job-reader';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaNotificationRepository } from '@infrastructure/matching/prisma-notification-repository';
+import { PrismaTelegramLinkRepository } from '@infrastructure/matching/prisma-telegram-link-repository';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { RequestMatchBackfill } from '@application/matching';
 import type { WorkerLogger } from '@ports/worker-logger';
@@ -15,6 +16,7 @@ import { registerMatchRoutes } from './routes/matches';
 import { registerNotificationRoutes } from './routes/notifications';
 import { registerProfileRoutes } from './routes/profile';
 import { registerSourceRoutes } from './routes/sources';
+import { registerTelegramLinkRoutes } from './routes/telegram-link';
 import { registerWebRoutes } from './routes/web';
 
 /**
@@ -88,6 +90,11 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
       tasks: new PrismaWorkTaskRepository(prisma),
       logger,
     }),
+  });
+
+  await registerTelegramLinkRoutes(app, {
+    tokens: new PrismaTelegramLinkRepository(prisma),
+    botUsername: config.telegramBotUsername,
   });
 
   return { app, prisma };

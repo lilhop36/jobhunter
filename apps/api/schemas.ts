@@ -117,6 +117,18 @@ export const submitFeedbackBody = {
 } as const;
 
 /**
+ * `POST /api/telegram/link` names the candidate the deep-link token is for (SRS 3.4). There is
+ * no authentication and the userId is the seed's identity, so this is an operator Surface —
+ * same standing as the PUT profile body above.
+ */
+export const telegramLinkBody = {
+  type: 'object',
+  required: ['userId'],
+  properties: { userId: { type: 'string', pattern: UUID_PATTERN } },
+  additionalProperties: false,
+} as const;
+
+/**
  * `GET`/`PUT /api/profile` name the candidate in the query.
  *
  * Required here, unlike the list routes' optional `userId`: a profile belongs to exactly one
