@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { PrismaClient } from '@prisma/client';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
+import { PrismaJobReader } from '@infrastructure/ingestion/prisma-job-reader';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaNotificationRepository } from '@infrastructure/matching/prisma-notification-repository';
@@ -9,6 +10,7 @@ import { RequestMatchBackfill } from '@application/matching';
 import type { WorkerLogger } from '@ports/worker-logger';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
 import { registerErrorHandler } from './errors';
+import { registerJobRoutes } from './routes/jobs';
 import { registerMatchRoutes } from './routes/matches';
 import { registerNotificationRoutes } from './routes/notifications';
 import { registerProfileRoutes } from './routes/profile';
@@ -52,6 +54,10 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
 
   await registerMatchRoutes(app, {
     matches: new PrismaJobMatchRepository(prisma),
+  });
+
+  await registerJobRoutes(app, {
+    jobs: new PrismaJobReader(prisma),
   });
 
   await registerNotificationRoutes(app, {

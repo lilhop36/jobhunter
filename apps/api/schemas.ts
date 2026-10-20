@@ -1,6 +1,7 @@
 import {
   EmploymentType,
   HealthStatus,
+  LifecycleStatus,
   LocationCategory,
   NotificationFeedbackValue,
   NotificationStatus,
@@ -23,8 +24,7 @@ import {
  * Enums are derived from the domain enums, so a filter can never accept a status the system
  * does not have.
  */
-const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
-
+export const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
 export const sourceIdParams = {
   type: 'object',
   required: ['id'],
@@ -218,5 +218,27 @@ export const putProfileBody = {
       },
     },
   },
+  additionalProperties: false,
+} as const;
+
+/**
+ * `GET /api/jobs` (SRS 3.4). Both filters are optional and neither has a default: the read path
+ * does not decide which lifecycle states a client may see, it publishes the state it stored.
+ */
+export const listJobsQuery = {
+  type: 'object',
+  properties: {
+    ...paginationProperties,
+    sourceId: { type: 'string', pattern: UUID_PATTERN },
+    lifecycleStatus: { type: 'string', enum: Object.values(LifecycleStatus) },
+  },
+  additionalProperties: false,
+} as const;
+
+/** `GET /api/jobs/:id`. A non-UUID id is a bad request, not a miss. */
+export const jobIdParams = {
+  type: 'object',
+  required: ['id'],
+  properties: { id: { type: 'string', pattern: UUID_PATTERN } },
   additionalProperties: false,
 } as const;
