@@ -408,8 +408,47 @@ model User {
   profile CandidateProfile?
   jobMatches JobMatch[]
   notifications NotificationOutbox[]
+  telegramLinkTokens TelegramLinkToken[]
+  telegramDestination TelegramDestination?
 
   @@map("users")
+}
+
+/// SRS 3.2 "Linking": `POST /api/telegram/link` issues one of these, and the user it names
+/// frees the destination only after Telegram itself delivers the token back via the deep link
+/// (`t.me/<bot>?start=<token>`). The token is not private-profile data: the row stores only the
+/// user it was issued for, and never the plaintext, so a database leak cannot mint valid links
+/// (SRS 8.3). Short-lived: rows past `expiresAt` cannot resolve anything and are inert.
+model TelegramLinkToken {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @db.Uuid
+  /// SHA-256 hex of the one-time token. Unique because the hash, not the id, is the lookup key.
+  tokenHash String @unique
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  /// Consumed by the token's one permitted resolution; the deep link stops working here even
+  /// before expiry, which is what makes the token single-use.
+  usedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("telegram_link_tokens")
+}
+
+/// SRS 2.2/2.4: one seeded candidate owns one Telegram destination. The chat id arrives only
+/// after the token is resolved, so nothing here can be guessed or harvested (SRS 8.3).
+model TelegramDestination {
+  /// Primary key on the user: linking again records the same user's new destination rather
+  /// than accumulating contradicting rows.
+  userId String @id @db.Uuid
+  /// Telegram chat id as text: ids can exceed 32 bits (bigint) and be negative (channels and
+  /// groups), and text matches the decimal form that appears on the Telegram wire.
+  chatId String
+  linkedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("telegram_destinations")
 }
 
 model CandidateProfile {
