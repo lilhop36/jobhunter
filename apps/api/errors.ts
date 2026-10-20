@@ -99,6 +99,19 @@ export function registerErrorHandler(app: FastifyInstance): void {
         .send(envelope(ERROR_CODES.VALIDATION_ERROR, 'Request validation failed', details));
     }
 
+    // Fastify's own request-level errors (unsupported media type, empty JSON body, payload
+    // too large...) carry their target status. A caller mistake must not be reported as a
+    // server failure, so it keeps that status with the generic malformed-request code; the
+    // message is Fastify's and names no internals. Anything 4xx↑ that reaches here unrelated
+    // to the request stays a 500 below.
+    if (
+      typeof error.statusCode === 'number' &&
+      error.statusCode >= 400 &&
+      error.statusCode < 500
+    ) {
+      return reply.code(error.statusCode).send(envelope(ERROR_CODES.VALIDATION_ERROR, error.message));
+    }
+
     request.log.error({ err: error }, 'Unhandled API error');
     return reply
       .code(500)

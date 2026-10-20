@@ -460,6 +460,37 @@ describe('API /api/sources endpoints', () => {
       expect(body.task.dedupeKey).toBe(sourceCollectionDedupeKey(source.id));
     });
 
+    // Regression (found operating the stack live): these Fastify request-level errors used
+    // to fall through to the generic 500 INTERNAL_ERROR, turning a caller mistake into an
+    // apparent server failure.
+    it('answers an unsupported media type with 415, not 500', async () => {
+      const source = await createSourceWithRuns({ name: 'form-posted' });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/sources/${source.id}/run`,
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        payload: 'userId=x',
+      });
+
+      expect(response.statusCode).toBe(415);
+      expect(JSON.parse(response.body).error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('answers an empty JSON body with 400, not 500', async () => {
+      const source = await createSourceWithRuns({ name: 'empty-json' });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/sources/${source.id}/run`,
+        headers: { 'content-type': 'application/json' },
+        payload: '',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error.code).toBe('VALIDATION_ERROR');
+    });
+
     it('returns 409 SOURCE_DISABLED for a disabled source and enqueues nothing (ADR-0003)', async () => {
       const source = await createSourceWithRuns({ name: 'disabled-source', enabled: false });
 
