@@ -79,6 +79,15 @@ export class PrismaJobReader implements JobReader {
     const row = await this.prisma.job.findUnique({ where: { id }, include: JOB_READ_INCLUDE });
     return row === null ? null : toDetail(row);
   }
+
+  async findJobsByIds(ids: readonly string[]): Promise<Map<string, JobSummary>> {
+    if (ids.length === 0) return new Map();
+    const rows = await this.prisma.job.findMany({
+      where: { id: { in: [...ids] } },
+      include: JOB_READ_INCLUDE,
+    });
+    return new Map(rows.map((row) => [row.id, toSummary(row)]));
+  }
 }
 
 /**

@@ -15,6 +15,7 @@ import { registerMatchRoutes } from './routes/matches';
 import { registerNotificationRoutes } from './routes/notifications';
 import { registerProfileRoutes } from './routes/profile';
 import { registerSourceRoutes } from './routes/sources';
+import { registerWebRoutes } from './routes/web';
 
 /**
  * API process composition root (SRS 3.4; AC-014, AC-018).
@@ -58,6 +59,14 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
 
   await registerJobRoutes(app, {
     jobs: new PrismaJobReader(prisma),
+  });
+
+  await registerWebRoutes(app, {
+    profiles: new PrismaCandidateProfileRepository(prisma),
+    jobs: new PrismaJobReader(prisma),
+    matches: new PrismaJobMatchRepository(prisma),
+    notifications: new PrismaNotificationRepository(prisma),
+    sources: new PrismaJobSourceRepository(prisma),
   });
 
   await registerNotificationRoutes(app, {

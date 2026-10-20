@@ -114,15 +114,18 @@ const FACTOR_NAMES = [
   'salary',
 ] as const satisfies readonly (keyof MatchFactorScores)[];
 
-function unknownFactors(factors: MatchFactorScores): string[] {
+/** Exported for the web pages (`apps/api/routes/web.ts`), which render the same fixed factor order. */
+export function unknownFactors(factors: MatchFactorScores): string[] {
   return FACTOR_NAMES.filter((name) => factors[name] === null);
 }
 
 /**
  * A cursor is `{ score, id }`, the key the previous page ended at. `score` is validated as a
  * Percent so a cursor cannot ask for a page that no row could ever follow.
+ *
+ * Exported for the web pages, which page the same list and must reject the same bad cursors.
  */
-function decodeMatchCursor(raw: string): MatchCursor {
+export function decodeMatchCursor(raw: string): MatchCursor {
   const value = decodeCursor(raw);
   if (value === null || typeof value.id !== 'string' || !isPercent(value.score)) {
     throw ApiError.validation('The pagination cursor is not valid');

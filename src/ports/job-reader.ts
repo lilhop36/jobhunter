@@ -114,4 +114,11 @@ export interface JobReader {
 
   /** One stored job with its provenance, or null when the id is not stored. */
   findJob(id: string): Promise<JobDetail | null>;
+
+  /**
+   * The summaries for these ids, keyed by id — one query for a page of matches rather than one
+   * read per row. An id that is not stored is simply absent from the map; a list read a moment ago
+   * may name a job that has since been removed, and that is a normal state.
+   */
+  findJobsByIds(ids: readonly string[]): Promise<Map<string, JobSummary>>;
 }

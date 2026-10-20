@@ -110,7 +110,7 @@ function serializeJobDetail(job: JobDetail) {
  * A job cursor is `{ createdAt, id }`. Both parts are validated: the parser would otherwise hand
  * Prisma an unparseable date or a non-UUID id, and the client's mistake would surface as a 500.
  */
-function decodeJobCursor(raw: string): JobCursor {
+export function decodeJobCursor(raw: string): JobCursor {
   const value = decodeCursor(raw);
   const createdAt = typeof value?.createdAt === 'string' ? new Date(value.createdAt) : null;
   if (
