@@ -21,6 +21,7 @@
     "test:failure": "vitest --run tests/failure",
     "seed:sources": "node scripts/seed-sources.mjs",
     "seed:candidate": "tsx scripts/seed-candidate.ts",
+    "telegram:resolve": "tsx scripts/telegram-resolve.ts",
     "test:ci": "vitest --run"
   },
   "devDependencies": {
