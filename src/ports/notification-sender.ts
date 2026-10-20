@@ -8,6 +8,12 @@
  */
 export interface NotificationMessage {
   notificationId: string;
+  /**
+   * Who the message is for — the destination lookup key. The *content* stays
+   * destination-independent; the channel needs the user because its routing (chat id, user
+   * address…) is its own concern, not the dispatcher's (SRS 2.2/2.4, ADR-0008).
+   */
+  userId: string;
   /** Destination-independent text rendered from stored evidence (SRS 3.2 content list). */
   text: string;
   /** The job the message is about. */

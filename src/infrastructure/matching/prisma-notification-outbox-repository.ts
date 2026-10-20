@@ -22,6 +22,7 @@ function asAmount(value: Prisma.Decimal | null): string | null {
 
 const CLAIM_SELECT = {
   id: true,
+  userId: true,
   jobId: true,
   attemptCount: true,
   notificationType: true,
@@ -50,6 +51,7 @@ type ClaimRow = Prisma.NotificationOutboxGetPayload<{ select: typeof CLAIM_SELEC
 function toClaimed(row: ClaimRow): ClaimedNotification {
   return {
     id: row.id,
+    userId: row.userId,
     jobId: row.jobId,
     attemptCount: row.attemptCount,
     notificationType: row.notificationType,

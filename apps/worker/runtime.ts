@@ -11,7 +11,8 @@ import {
   ScoreMatches,
   createMatchScoringHandler,
 } from '@application/matching';
-import { WorkTaskHandlerRegistry, WorkTaskWorker, describeError } from '@application/worker';
+import { DispatchNotifications } from '@application/notification';
+import { WorkTaskHandlerRegistry, WorkTaskWorker, describeError, sleep as abortableSleep } from '@application/worker';
 import { MATCHER_VERSION } from '@domain/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
@@ -21,6 +22,9 @@ import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
 import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
 import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
+import { PrismaNotificationOutboxRepository } from '@infrastructure/matching/prisma-notification-outbox-repository';
+import { PrismaTelegramLinkRepository } from '@infrastructure/matching/prisma-telegram-link-repository';
+import { TelegramNotificationSender } from '@infrastructure/notification/telegram-notification-sender';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import { consoleWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
@@ -85,6 +89,33 @@ export function createWorkerRuntime(
     matches: matchRepository,
     facts: new PrismaNotificationFactsReader(prisma),
   });
+
+  /**
+   * Delivery (SRS 11.3, FR-017). Gated on the credential rather than attempted without one:
+   * without `TELEGRAM_BOT_TOKEN` there is a real channel missing, and the only honest
+   * behaviour is to not dispatch at all and say so — an invented "sent" would poison the
+   * outbox's already-notified guarantee (ENG-027), and a dispatcher with no destination store
+   * would fail every row it touched. Rows already reserved stay PENDING until a credential
+   * arrives, which is why they are outbox rows.
+   */
+  const outbox = new PrismaNotificationOutboxRepository(prisma);
+  const destinations = new PrismaTelegramLinkRepository(prisma);
+  const dispatcher =
+    config.telegramBotToken === undefined
+      ? null
+      : new DispatchNotifications({
+          outbox,
+          sender: new TelegramNotificationSender({ token: config.telegramBotToken, destinations }),
+        });
+
+  /** One bounded outbox sweep; the dispatcher decides per row what recurred. */
+  const runDispatchPass = async (): Promise<void> => {
+    if (dispatcher === null) return;
+    const result = await dispatcher.run({ now: new Date() });
+    if (result.attempted > 0) {
+      logger.info('notification dispatch pass', { ...result });
+    }
+  };
 
   /** Re-scores every enabled source's jobs (SRS 11.2; ADR-0005 §9). */
   const backfillMatches = new RequestMatchBackfill({ sources: jobSources, tasks, logger });
@@ -152,6 +183,8 @@ export function createWorkerRuntime(
   );
 
   let started = false;
+  let dispatchController: AbortController | undefined;
+  let dispatchLoopPromise: Promise<void> | undefined;
 
   return {
     async start(): Promise<void> {
@@ -168,6 +201,36 @@ export function createWorkerRuntime(
       // changed matcher is already being re-scored by the time the worker accepts work.
       await requestMatcherVersionBackfill();
 
+      // Delivery recovery last, still before claiming: rows a dead dispatcher left
+      // PROCESSING must return to PENDING before any new send starts (the outbox port's
+      // single-dispatcher note), and a blocked sweep must not block the other loops from the
+      // start — one failed sweep waits for the next tick like any other bounded pass.
+      if (dispatcher === null) {
+        logger.warn('TELEGRAM_BOT_TOKEN is not configured; notifications stay PENDING without delivery', {
+          action: 'set TELEGRAM_BOT_TOKEN to enable delivery',
+        });
+      } else {
+        try {
+          const abandoned = await dispatcher.recoverAbandoned();
+          if (abandoned > 0) logger.warn('recovered abandoned notification rows', { count: abandoned });
+        } catch (error) {
+          logger.error('notification recovery failed before dispatching', { error: describeError(error) });
+        }
+
+        dispatchController = new AbortController();
+        const intervalMs = config.notificationDispatchIntervalMs ?? 30_000;
+        dispatchLoopPromise = (async (signal: AbortSignal) => {
+          while (!signal.aborted) {
+            try {
+              await runDispatchPass();
+            } catch (error) {
+              logger.error('notification dispatch pass failed', { error: describeError(error) });
+            }
+            await abortableSleep(intervalMs, signal);
+          }
+        })(dispatchController.signal);
+      }
+
       await worker.start();
     },
 
@@ -175,7 +238,13 @@ export function createWorkerRuntime(
       if (!started) return;
       started = false;
       // Order matters: stop scheduling first so no new work is enqueued while the worker
-      // unwinds, then let the worker release its in-flight attempt, then close the pool.
+      // unwinds, then let the worker release its in-flight attempt, then close the pool. The
+      // dispatch loop joins after the worker: an in-flight send may already own a claimed
+      // outbox row, and a pass abandoned here would be re-recovered by the next start.
+      dispatchController?.abort();
+      await dispatchLoopPromise?.catch(() => undefined);
+      dispatchController = undefined;
+      dispatchLoopPromise = undefined;
       await scheduler.stop();
       await worker.stop();
       await prisma.$disconnect();

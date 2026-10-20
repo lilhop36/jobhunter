@@ -63,7 +63,11 @@ function resolveOptions(options: WorkTaskWorkerOptions): ResolvedOptions {
   };
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
+/**
+ * Abort-aware wait, shared with the worker runtime's own background loop: an aborted process
+ * stops waiting at once instead of leaving a live timer behind the shutdown barrier.
+ */
+export function sleep(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout;

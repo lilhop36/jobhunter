@@ -52,6 +52,8 @@ export interface NotificationFactsReader {
 export interface ClaimedNotification {
   id: string;
   jobId: string;
+  /** Destination lookup key for the channel (the row's user, SRS 2.2/2.4). */
+  userId: string;
   /** Attempts made so far, *including* the claim that produced this row. */
   attemptCount: number;
   notificationType: string;

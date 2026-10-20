@@ -27,6 +27,15 @@ export interface WorkerConfig {
   staleRunSeconds: number;
   /** Upper bound on one source acquisition, in milliseconds (ENG-031). */
   acquisitionTimeoutMs: number;
+  /**
+   * The Telegram bot credential (SRS 8.3: environment/secret-managed). When it is absent the
+   * dispatcher deliberately does not run: there is no "send anyway" path, because a phoney
+   * delivery status would be a lie in the outbox (ENG-008's spirit). Absence is announced at
+   * start, not mistaken for health.
+   */
+  telegramBotToken?: string;
+  /** How often the dispatcher sweeps the notification outbox, in milliseconds. */
+  notificationDispatchIntervalMs?: number;
 }
 
 /** Raised for configuration that would make the worker unsafe or unstartable. */
@@ -55,6 +64,12 @@ function positiveNumber(env: NodeJS.ProcessEnv, name: string): number {
 function optionalPositiveNumber(env: NodeJS.ProcessEnv, name: string): number | undefined {
   if (env[name] === undefined || env[name]?.trim() === '') return undefined;
   return positiveNumber(env, name);
+}
+
+/** A credential the worker can legitimately run without; trimmed, and undefined when unset. */
+function optionalString(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const value = env[name]?.trim();
+  return value === undefined || value === '' ? undefined : value;
 }
 
 /**
@@ -100,6 +115,8 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerC
     pollIntervalMs: optionalPositiveNumber(env, 'WORKER_POLL_INTERVAL_MS'),
     reaperIntervalMs: optionalPositiveNumber(env, 'WORKER_REAPER_INTERVAL_MS'),
     schedulerIntervalMs: optionalPositiveNumber(env, 'SOURCE_SCHEDULER_INTERVAL_MS'),
+    telegramBotToken: optionalString(env, 'TELEGRAM_BOT_TOKEN'),
+    notificationDispatchIntervalMs: optionalPositiveNumber(env, 'NOTIFICATION_DISPATCH_INTERVAL_MS'),
     staleRunSeconds,
     acquisitionTimeoutMs,
   };

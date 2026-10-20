@@ -77,8 +77,9 @@ export class DispatchNotifications {
       try {
         const outcome = await this.deps.sender.send({
           notificationId: notification.id,
-          jobId: notification.jobId,
+          userId: notification.userId,
           text,
+          jobId: notification.jobId,
         });
         if (outcome.delivered) {
           delivered = true;
