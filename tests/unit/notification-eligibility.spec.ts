@@ -105,12 +105,13 @@ describe('notification eligibility (SRS 3.2)', () => {
   });
 
   it('is not eligible below the confidence threshold, and names the numbers', () => {
-    const decision = evaluateNotificationEligibility(input({ confidence: asPercent(49) }));
+    const below = asPercent(NOTIFICATION_THRESHOLDS_V1.minConfidence - 1);
+    const decision = evaluateNotificationEligibility(input({ confidence: below }));
 
     expect(decision.eligible).toBe(false);
     expect(decision.reasons).toEqual(['CONFIDENCE_BELOW_THRESHOLD']);
-    expect(decision.explanation).toContain('49');
-    expect(decision.explanation).toContain('50');
+    expect(decision.explanation).toContain(String(below));
+    expect(decision.explanation).toContain(String(NOTIFICATION_THRESHOLDS_V1.minConfidence));
   });
 
   it('treats both thresholds as inclusive (SRS "score >= threshold")', () => {

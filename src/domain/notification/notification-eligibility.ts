@@ -51,10 +51,16 @@ export interface NotificationThresholds {
  * The v1 hypothesis. See ADR-0006 for the reasoning and the arithmetic behind each
  * number; a change here is a change to notification eligibility (ENG-014) and must
  * carry the same review as a matcher change.
+ *
+ * minConfidence 45 (owner-approved 2026-10-21 for the validation period): with job-side
+ * extraction absent (ADR-0005 §2) skills+experience are permanently UNKNOWN and
+ * completeness ceilings at 0.5 for title-only postings, so an exact role match caps
+ * confidence at ≈47 — 50 would silence the system entirely. Demonstrated live
+ * (95/100 relevance, 47% confidence, zero reservations across 48 postings).
  */
 export const NOTIFICATION_THRESHOLDS_V1: Readonly<NotificationThresholds> = {
   minScore: asPercent(60),
-  minConfidence: asPercent(50),
+  minConfidence: asPercent(45),
 };
 
 /** Why a job is not notifiable. One value per SRS 3.2 predicate, in that order. */

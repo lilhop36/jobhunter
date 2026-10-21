@@ -56,22 +56,25 @@ opt-in SRS 3.5 requires.
 ### 3. Thresholds
 
 ```ts
-NOTIFICATION_THRESHOLDS_V1 = { minScore: 60, minConfidence: 50 }   // Percent, inclusive
+NOTIFICATION_THRESHOLDS_V1 = { minScore: 60, minConfidence: 45 }   // Percent, inclusive
 ```
 
 - **Score 60.** Scores renormalize over the factors that had evidence, so a score is only
   comparable between jobs when their evidence is comparable — that is why confidence is a
   separate gate rather than being folded into this one.
-- **Confidence 50.** Confidence is `knownWeight / totalWeight × weighted extraction certainty`
-  over all seven factor weights (100). With Skills always unknown, `knownWeight` cannot exceed 70,
-  so confidence tops out around 70% before extraction certainty is applied. A stored match in the
-  M2 fixtures scores 90/56 with role, location, employment and freshness evidenced — above both
-  thresholds, so this is not a hypothetical. A job whose only evidence is a title match scores
-  high on relevance and low on confidence, and is **not** eligible.
+- **Confidence 45** (owner-approved 2026-10-21 for the validation period). Confidence is
+  `knownWeight / totalWeight × weighted extraction certainty` over all seven factor weights
+  (100). With Skills (30) and Experience (15) permanently UNKNOWN and Employment (5) unreached
+  in practice, `knownWeight` for title-only postings ceilings at 50/100, so completeness caps
+  at 0.5 and an exact role match still tops out around 47% confidence — demonstrated live on
+  48 collected EffoySira postings (best: 95/100 relevance, 47% confidence, zero reservations
+  at `minConfidence = 50`). Threshold 50 therefore silenced the system entirely; 45 admits
+  role-confirmed postings that also carry location and salary evidence, and stays far above
+  the zero-evidence guesses.
 - The consequence, stated plainly: **with Skills permanently UNKNOWN, an eligibility decision is
-  always made on at most 70% of the intended evidence.** Raising `minConfidence` above ~70 is a
-  no-op today. When job-side extraction lands, these numbers must be re-derived rather than kept,
-  and the change is a new `NOTIFICATION_ELIGIBILITY_VERSION`.
+  always made on at most 70% of the intended evidence — and in practice on ~50%.** When job-side
+  extraction lands, these numbers must be re-derived rather than kept, and the change is a new
+  `NOTIFICATION_ELIGIBILITY_VERSION`.
 
 ### 4. Event identity (ENG-027, AC-016)
 
@@ -122,9 +125,9 @@ exists.
 ### 7. Review items (owner sign-off needed)
 
 1. `minScore = 60` — is a relevance of 60/100 the bar for interrupting the user?
-2. `minConfidence = 50` — given the ~70 ceiling above, 50 means roughly three quarters of the
-   *available* evidence weight. Higher is stricter but converges towards silence until extraction
-   lands.
+2. `minConfidence = 45` (owner-approved 2026-10-21). With the ~50 practical ceiling for
+   title-only postings, 50 silenced the system entirely — sign-off moved it to 45 as the
+   validation-period value. When extraction lands, re-derive rather than keep.
 3. One `NEW_MATCH` notification per (user, job), forever, with no material-change events in v1
    (§4). Confirm that refusing to re-notify is the intended behaviour.
 4. Both thresholds are inclusive; a job exactly at the bar is eligible.

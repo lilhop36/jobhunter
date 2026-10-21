@@ -10,6 +10,7 @@ import {
   SkillEvidence,
 } from '@domain/enums';
 import { MATCHER_VERSION } from '@domain/matching';
+import { NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
 import type { UnversionedCandidateProfile } from '@domain/matching';
 import { asDecimalAmount, asPercent, asProbability } from '@domain/types';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
@@ -235,7 +236,7 @@ describe('GET /dashboard', () => {
     expect(response.body).toContain('Senior Backend Engineer');
     expect(response.body).toContain(`href="/matches/${matchId}"`);
     expect(response.body).toContain('High-confidence matches');
-    expect(response.body).toContain('Confidence at or above 50');
+    expect(response.body).toContain(`Confidence at or above ${NOTIFICATION_THRESHOLDS_V1.minConfidence}`);
     expect(response.body).toContain('Notification status');
     expect(response.body).toContain('PENDING');
     expect(response.body).toContain('Source health');
