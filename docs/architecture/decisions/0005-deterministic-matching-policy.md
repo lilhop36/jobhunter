@@ -1,6 +1,6 @@
 # ADR-0005: Deterministic matching policy
 
-- **Status:** Proposed — the scoring constants need owner review (see §7). The matcher itself is implemented and unit-tested.
+- **Status:** Accepted — 2026-10-22. The scoring constants were reviewed and accepted as the v1 hypothesis.
 - **Date:** 2026-10-18
 - **Relates to:** SRS v1.1 §4.5, §4.6, §5.2 (`CandidateProfile`, `JobMatch`), §6.7, §10.4, Appendix A, Appendix B.3; FR-012–FR-015; AC-009, AC-010; ENG-001, ENG-004, ENG-005, ENG-007, ENG-012, ENG-013, ENG-028
 - **Depends on:** the persisted candidate profile (built, `tests/integration/candidate-profile-repository.spec.ts`) and job-side skill extraction + a canonical skill dictionary (not yet built), which supply §2's inputs

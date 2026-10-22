@@ -1,8 +1,6 @@
 # ADR-0006: Notification eligibility policy
 
-- **Status:** Proposed — the threshold constants need owner review (see §7). The policy, the
-  schema and the migration are implemented and tested; nothing writes or delivers a notification
-  yet.
+- **Status:** Accepted — 2026-10-22. The threshold constants were reviewed and accepted; `minConfidence = 45` was owner-approved 2026-10-21 for the validation period.
 - **Date:** 2026-10-19
 - **Relates to:** SRS v1.1 §3.2, §3.5, §4.8, §5.2, §5.6, §11.3; FR-016, FR-017, FR-018; AC-004,
   AC-015, AC-016, AC-017; ENG-007, ENG-008, ENG-014, ENG-027, ENG-030

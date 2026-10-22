@@ -1,6 +1,6 @@
 # ADR-0008: Telegram linking and delivery
 
-- **Status:** Proposed (Milestone 3 implemented against this policy; owner sign-off pending, like ADR-0005/0006/0007)
+- **Status:** Accepted — 2026-10-22. All §5 items accepted: token TTL 10 min, claim-then-link order, no-destination ⇒ permanent failure, 30s dispatch cadence, resolver as operator command. Milestone 3 implemented against this policy.
 - **Date:** 2026-10-20
 - **Context:** SRS 3.2 (linking, content, rate limits, duplicate suppression), SRS 3.4 route table, SRS 2.2/2.4 (one candidate, one destination), FR-016/FR-017, ENG-027, M3. ADR-0006 fixed *eligibility* and left linking/delivery/retry open; this ADR closes that gap. The owner supplied the bot credential for `@jobhunterethiobot` (rooted live with `getMe`), which unlocked this work.
 

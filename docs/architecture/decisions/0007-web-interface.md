@@ -1,8 +1,6 @@
 # ADR-0007 — Web interface: server-rendered HTML in the API process
 
-- **Status:** Proposed — the approach needs owner review. The read-only pages described here
-  are implemented and tested; the forms (`/profile`, `/settings`) are not, and are the part this
-  ADR most needs a decision on (§5).
+- **Status:** Accepted — 2026-10-22. Server-rendered HTML in the API process accepted; read-only pages implemented. Mutating pages (`/profile`, `/settings`, `/settings/telegram`) remain blocked on authentication/CSRF decision (not in this ADR).
 - **Date:** 2026-10-20
 - **Requirement:** SRS 3.1 (required routes, dashboard, match detail, provenance, low bandwidth,
   accessibility), SRS 3.3; FR-011, FR-015, FR-018.
