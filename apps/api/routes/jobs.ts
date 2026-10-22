@@ -84,6 +84,8 @@ function serializeJob(job: JobSummary) {
     salaryCurrency: job.salaryCurrency,
     salaryPeriod: job.salaryPeriod,
     publishedAt: job.publishedAt === null ? null : job.publishedAt.toISOString(),
+    applicationDeadline:
+      job.applicationDeadline === null ? null : job.applicationDeadline.toISOString(),
     lifecycleStatus: job.lifecycleStatus,
     createdAt: job.createdAt.toISOString(),
     updatedAt: job.updatedAt.toISOString(),

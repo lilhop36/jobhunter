@@ -17,6 +17,7 @@ export const JOB_PROVENANCE_FIELDS = [
   'publishedCalendar',
   'originalPublishedDateText',
   'publishedAt',
+  'applicationDeadline',
   'salaryType',
   'salaryMin',
   'salaryMax',

@@ -312,6 +312,10 @@ model Job {
   originalPublishedDateText String?
   publishedAt               DateTime?
   dateConfidence            Decimal?            @db.Decimal(4, 3)
+  /// The application deadline the source stated, at UTC midnight (the shared date parser is
+  /// date-only). NULL means UNKNOWN: absence of evidence, never "no deadline" and never
+  /// inferred from the posting's age. FR-019 reads this to detect an expired job.
+  applicationDeadline       DateTime?           @db.Timestamp(3)
   salaryType                SalaryType          @default(UNKNOWN)
   salaryMin                 Decimal?            @db.Decimal(14, 2)
   salaryMax                 Decimal?            @db.Decimal(14, 2)
@@ -342,6 +346,7 @@ model Job {
   @@index([contentFingerprint])
   @@index([sourceId, lifecycleStatus])
   @@index([publishedAt])
+  @@index([applicationDeadline])
   // One Job per source-scoped identity. Plain (never partial): a partial index over a
   // nullable column would accept repeated NULLs and stop preventing promotion of
   // identity-less Jobs. The name is fixed to match the hand-written migration index.

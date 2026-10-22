@@ -12,6 +12,7 @@ import {
   createMatchScoringHandler,
 } from '@application/matching';
 import { DispatchNotifications } from '@application/notification';
+import { ExpireDeadlines } from '@application/lifecycle';
 import { WorkTaskHandlerRegistry, WorkTaskWorker, describeError, sleep as abortableSleep } from '@application/worker';
 import { MATCHER_VERSION } from '@domain/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
@@ -67,6 +68,7 @@ export function createWorkerRuntime(
   const tasks = new PrismaWorkTaskRepository(prisma);
   const jobSources = new PrismaJobSourceRepository(prisma);
   const matchRepository = new PrismaJobMatchRepository(prisma);
+  const jobRepository = new PrismaJobRepository(prisma);
 
   // The registry is the production adapter source (SRS 7.2 / Appendix E; ADR-0004); tests
   // substitute the fake adapter here.
@@ -76,10 +78,17 @@ export function createWorkerRuntime(
   const collection = new RunSourceCollection({
     sourceRuns,
     rawJobs: new PrismaRawJobRepository(prisma),
-    jobs: new PrismaJobRepository(prisma),
+    jobs: jobRepository,
     tasks,
     logger,
   });
+
+  /**
+   * FR-019 deadline reconciliation. It runs at the head of every scoring task rather than on a
+   * timer, so the state is current exactly when it matters and no extra interval has to be
+   * configured, bounded, or tested.
+   */
+  const expireDeadlines = new ExpireDeadlines({ jobs: jobRepository, logger });
 
   // Matching (SRS 11.2, FR-013/FR-014). The reader narrows to matchable jobs, the profile
   // repository is the non-negotiable input, and the match repository owns the idempotent write.
@@ -162,7 +171,7 @@ export function createWorkerRuntime(
         acquisitionTimeoutMs: config.acquisitionTimeoutMs,
       }),
     )
-    .register(MATCH_SCORING_TASK_TYPE, createMatchScoringHandler({ scoring, logger }));
+    .register(MATCH_SCORING_TASK_TYPE, createMatchScoringHandler({ scoring, expire: expireDeadlines, logger }));
 
   const worker = new WorkTaskWorker(
     tasks,

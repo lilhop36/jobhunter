@@ -61,6 +61,18 @@ export interface LifecycleStatusUpdate {
 }
 
 /**
+ * Everything the deadline policy needs about one Job (FR-019). Read separately from
+ * {@link LifecycleCandidate} because the two policies own different states and must not
+ * accidentally receive each other's evidence.
+ */
+export interface DeadlineCandidate {
+  jobId: string;
+  currentStatus: LifecycleStatus;
+  /** The stored deadline, or null when the source stated none this system could read. */
+  applicationDeadline: Date | null;
+}
+
+/**
  * Store for the canonical, evidence-derived Job (SRS 5.2).
  *
  * Uniqueness is `(sourceId, identityKey)` only. There is no cross-source identity and
@@ -79,6 +91,16 @@ export interface JobRepository {
    * `RECONCILED_LIFECYCLE_STATUSES`), with the observation evidence to reconcile them.
    */
   listLifecycleCandidates(sourceId: string): Promise<LifecycleCandidate[]>;
+
+  /**
+   * Jobs the deadline policy owns (see `DEADLINE_RECONCILED_STATUSES`), with the stored
+   * deadline. Table-wide rather than per-source: a stated deadline is a fact about the posting,
+   * so expiry does not depend on which source is being collected or when it last ran.
+   *
+   * ACTIVE jobs with no deadline are not returned — the policy can say nothing about them, and
+   * they are the overwhelming majority.
+   */
+  listDeadlineCandidates(): Promise<DeadlineCandidate[]>;
 
   /**
    * Apply decided lifecycle statuses. Returns how many Jobs were actually written; callers

@@ -230,6 +230,7 @@ ${nextPageLink('/jobs', {}, result.nextCursor && encodeCursor({
 <dt>Employment</dt><dd>${job.employmentType}</dd>
 <dt>Salary</dt><dd>${salaryText(job)}</dd>
 <dt>Published</dt><dd>${publishedText(job)}</dd>
+<dt>Deadline</dt><dd>${deadlineText(job)}</dd>
 <dt>Description quality</dt><dd>${job.descriptionQuality}</dd>
 <dt>Lifecycle</dt><dd>${job.lifecycleStatus}</dd>
 <dt>Application</dt><dd>${applicationHtml(job)}</dd>
@@ -616,8 +617,14 @@ function publishedText(job: JobDetail): Html {
   return parts.length === 0 ? unknownMark() : html`${parts.map((part, index) => (index === 0 ? part : html` · ${part}`))}`;
 }
 
-function applicationHtml(job: JobDetail): Html {
-  const { method, applyUrl, applyEmail } = job.application;
+/** A stated deadline, or the word unknown: an empty cell would read as "no deadline". */
+function deadlineText(job: JobDetail): Html {
+  return job.applicationDeadline === null
+    ? unknownMark()
+    : html`${job.applicationDeadline.toISOString().slice(0, 10)}`;
+}
+
+function applicationHtml(job: JobDetail): Html {  const { method, applyUrl, applyEmail } = job.application;
   const parts: Html[] = [];
   if (applyUrl !== null) parts.push(linkOrText(applyUrl));
   if (applyEmail !== null) parts.push(html`<code>${applyEmail}</code>`);

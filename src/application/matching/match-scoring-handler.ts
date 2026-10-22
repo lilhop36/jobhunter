@@ -4,6 +4,7 @@ import {
   type WorkTaskHandler,
 } from '@application/worker';
 import { consoleWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
+import type { ExpireDeadlines } from '@application/lifecycle';
 import type { ScoreMatches } from './score-matches';
 
 /**
@@ -92,6 +93,14 @@ export function parseMatchScoringTaskPayload(payload: unknown): MatchScoringTask
 
 export interface MatchScoringHandlerOptions {
   scoring: ScoreMatches;
+  /**
+   * Deadline reconciliation, run before scoring (FR-019). Scoring is where "ACTIVE" starts to
+   * matter, so expiry happens here rather than on a timer of its own: a job whose stated
+   * deadline has passed is EXPIRED by the time the policy reads it, and is therefore neither
+   * scored nor notified. It needs no collection of its own, so a source that is failing to
+   * collect cannot keep its expired postings alive.
+   */
+  expire: ExpireDeadlines;
   logger?: WorkerLogger;
   /** Injected clock (ENG-012). Defaults to the wall clock. */
   now?: () => Date;
@@ -115,11 +124,18 @@ export function createMatchScoringHandler(options: MatchScoringHandlerOptions): 
   return async ({ task, signal }) => {
     const payload = parseMatchScoringTaskPayload(task.payload);
     const startedAt = Date.now();
+    // One clock read for both steps, so expiry and scoring cannot disagree about "now".
+    const evaluationTime = now();
 
     try {
+      // Expire first, so this scoring pass cannot see a job whose deadline has already passed.
+      // A failure here fails the attempt: scoring a stale catalogue would reserve notifications
+      // for postings nobody can apply to any more.
+      await options.expire.run({ now: evaluationTime });
+
       const result = await options.scoring.run({
         sourceId: payload.sourceId,
-        now: now(),
+        now: evaluationTime,
         signal,
         ...(options.pageSize === undefined ? {} : { pageSize: options.pageSize }),
       });

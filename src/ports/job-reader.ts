@@ -46,6 +46,8 @@ export interface JobSummary {
   salaryCurrency: string | null;
   salaryPeriod: SalaryPeriod;
   publishedAt: Date | null;
+  /** The application deadline the source stated, date-only, or null when UNKNOWN. */
+  applicationDeadline: Date | null;
   lifecycleStatus: LifecycleStatus;
   createdAt: Date;
   updatedAt: Date;

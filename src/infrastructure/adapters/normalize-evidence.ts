@@ -18,6 +18,7 @@ import {
   EMPLOYMENT_TYPE_VERSION,
   classifyEmploymentType,
 } from '@domain/normalizers/employment-type';
+import { DEADLINE_EXTRACTION_VERSION, parseDeadline } from '@domain/normalizers/deadline';
 import {
   APPLICATION_TARGET_VERSION,
   resolveApplicationTarget,
@@ -48,6 +49,13 @@ export async function normalizeRawEvidence(
   const application = resolveApplicationTarget({
     title: raw.rawTitle,
     description: raw.rawDescription,
+  });
+  // Read from the description's own labelled text; a source that states no deadline leaves
+  // this UNKNOWN, which is not the same claim as "the posting never closes".
+  const applicationDeadline = parseDeadline({
+    description: raw.rawDescription,
+    sourceCalendarHint: declared.declaredCalendar,
+    declaredDateFormat: declared.declaredDateFormat,
   });
 
   // Delegated to the shared versioned fingerprint module (ENG-016, ADR-0001). Unlike
@@ -138,6 +146,13 @@ export async function normalizeRawEvidence(
       };
     }
   }
+  if (applicationDeadline.deadlineAt !== null) {
+    provenance.applicationDeadline = {
+      provenance: ProvenanceSource.DETERMINISTIC,
+      conversionMethod: applicationDeadline.conversionMethod ?? DEADLINE_EXTRACTION_VERSION,
+      evidence: applicationDeadline.evidence,
+    };
+  }
   if (salary.type !== SalaryType.UNKNOWN) {
     provenance.salaryType = {
       provenance: ProvenanceSource.DETERMINISTIC,
@@ -191,6 +206,7 @@ export async function normalizeRawEvidence(
     locationCategory: location.category,
     remoteStatus: location.remoteStatus,
     publishedDate,
+    applicationDeadline,
     salary,
     employmentType: employment.type,
     application,

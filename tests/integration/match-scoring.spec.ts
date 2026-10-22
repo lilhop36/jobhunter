@@ -24,7 +24,9 @@ import {
 } from '@application/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
+import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaJobSourceRepository } from '@infrastructure/ingestion/prisma-job-source-repository';
+import { ExpireDeadlines } from '@application/lifecycle';
 import { PrismaMatchableJobReader } from '@infrastructure/matching/prisma-matchable-job-reader';
 import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
@@ -171,6 +173,7 @@ function handlerFor(
 ) {
   return createMatchScoringHandler({
     scoring: useCase,
+    expire: new ExpireDeadlines({ jobs: new PrismaJobRepository(prisma), logger: silentWorkerLogger }),
     now: () => FIRST_NOW,
     logger,
     ...(pageSize === undefined ? {} : { pageSize }),

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Prisma } from '@prisma/client';
-import { DescriptionQuality, EmploymentType, SalaryPeriod, SalaryType, ApplicationMethod } from '@domain/enums';
+import { DescriptionQuality, EmploymentType, LifecycleStatus, SalaryPeriod, SalaryType, ApplicationMethod } from '@domain/enums';
 import { asDecimalAmount, asProbability, type NormalizedJob } from '@domain/types';
 import { rawContentHash } from '@domain/normalizers/job-identity';
 import { DESCRIPTION_QUALITY_VERSION } from '@domain/normalizers/description-quality';
@@ -258,6 +258,65 @@ describe('job upsert', () => {
     expect(rows[0].provenance).toMatchObject({
       title: { provenance: 'SOURCE' },
       canonicalUrl: { provenance: 'DETERMINISTIC' },
+    });
+  });
+
+  it('persists a stated deadline and its provenance, and follows the newest evidence on refresh (FR-019)', async () => {
+    const sourceId = await createSource('job-deadline');
+    const stated = await normalize({
+      rawDescription: 'Build things. Deadline: 30 Nov 2026. Apply by email.',
+    });
+    expect(stated.applicationDeadline.deadlineAt).toEqual(new Date('2026-11-30T00:00:00.000Z'));
+
+    const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job: stated });
+
+    const read = await prisma.job.findUniqueOrThrow({
+      where: { id: stored.id },
+      select: { applicationDeadline: true, provenance: true },
+    });
+    expect(read.applicationDeadline?.toISOString()).toBe('2026-11-30T00:00:00.000Z');
+    const provenance = read.provenance as Record<
+      string,
+      { conversionMethod: string | null; evidence: string | null }
+    >;
+    expect(provenance.applicationDeadline?.conversionMethod).toBe('GREGORIAN_NAMED_MONTH_V1');
+    expect(provenance.applicationDeadline?.evidence).toContain('Deadline');
+
+    // A recapture that no longer states a deadline clears the column: it follows the newest
+    // evidence, and an old value must not survive a source that stopped stating one.
+    const cleared = await normalize({ rawDescription: 'Build things. Apply by email.' });
+    await repo.upsert({ sourceId, identityKey: 'sid:job-1', job: cleared });
+    const refreshed = await prisma.job.findUniqueOrThrow({
+      where: { id: stored.id },
+      select: { applicationDeadline: true },
+    });
+    expect(refreshed.applicationDeadline).toBeNull();
+  });
+
+  it('reads deadline candidates only for the statuses the deadline policy owns', async () => {
+    const sourceId = await createSource('job-deadline-candidates');
+    const owned = await repo.upsert({
+      sourceId,
+      identityKey: 'sid:job-1',
+      job: await normalize({ rawDescription: 'Deadline: 30 Nov 2026' }),
+    });
+    await repo.upsert({
+      sourceId,
+      identityKey: 'sid:job-2',
+      job: await normalize({ sourceJobIdentifier: 'job-2', rawDescription: 'Nothing stated.' }),
+    });
+    const otherStatus = await repo.upsert({ sourceId, identityKey: 'sid:job-3', job: await normalize({ sourceJobIdentifier: 'job-3', rawDescription: 'Deadline: 1 Dec 2026' }) });
+    await prisma.job.update({
+      where: { id: otherStatus.job.id },
+      data: { lifecycleStatus: LifecycleStatus.NOT_FOUND },
+    });
+
+    const candidates = await repo.listDeadlineCandidates();
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toEqual({
+      jobId: owned.job.id,
+      currentStatus: LifecycleStatus.ACTIVE,
+      applicationDeadline: new Date('2026-11-30T00:00:00.000Z'),
     });
   });
 

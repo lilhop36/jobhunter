@@ -121,6 +121,7 @@ function toSummary(row: JobReadRow): JobSummary {
     salaryCurrency: row.salaryCurrency,
     salaryPeriod: row.salaryPeriod as SalaryPeriod,
     publishedAt: row.publishedAt,
+    applicationDeadline: row.applicationDeadline,
     lifecycleStatus: row.lifecycleStatus as LifecycleStatus,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

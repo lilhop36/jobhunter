@@ -98,4 +98,18 @@ export interface NotificationOutboxRepository {
    * like `work_tasks` has rather than a blanket reset.
    */
   recoverAbandoned(): Promise<number>;
+
+  /**
+   * Cancel `PENDING` rows whose Job can no longer be notified (FR-016, SRS 3.2: "ACTIVE"), and
+   * report how many were cancelled.
+   *
+   * A reservation is made at scoring time and may sit in the outbox through a retry ladder, so
+   * the job's state at send time is the one that decides. Two things can change it: the job left
+   * `ACTIVE`, or its stated deadline passed after the reservation.
+   *
+   * The deadline comparison is the same rule as `@domain/lifecycle`'s `isPastDeadline`, repeated
+   * in SQL because this is a single-statement guard over a batch. `tests/integration/
+   * deadline-expiry.spec.ts` pins the two to the same answer.
+   */
+  cancelIneligible(input: { now: Date }): Promise<number>;
 }

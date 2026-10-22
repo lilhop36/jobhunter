@@ -213,6 +213,10 @@ class StubJobs implements JobRepository {
     return [];
   }
 
+  async listDeadlineCandidates(): Promise<[]> {
+    return [];
+  }
+
   async applyLifecycleStatuses(): Promise<number> {
     return 0;
   }

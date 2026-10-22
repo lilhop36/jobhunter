@@ -8,6 +8,7 @@ import {
 } from '@domain/enums';
 import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
 import { parseDate } from '@domain/normalizers/calendar';
+import { parseDeadline } from '@domain/normalizers/deadline';
 import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
 import { contentFingerprintV1 } from '@domain/normalizers/job-identity';
@@ -97,6 +98,12 @@ export class FakeSourceAdapter implements JobSourceAdapter {
     const application = resolveApplicationTarget({
       title: raw.rawTitle,
       description: raw.rawDescription,
+    });
+    // The same shared deadline extraction production uses (ENG-016).
+    const applicationDeadline = parseDeadline({
+      description: raw.rawDescription,
+      sourceCalendarHint: this.config.declaredCalendar,
+      declaredDateFormat: this.config.declaredDateFormat,
     });
 
     // Delegated to the shared versioned fingerprint module (ENG-016, ADR-0001). The legacy
@@ -199,6 +206,13 @@ export class FakeSourceAdapter implements JobSourceAdapter {
         };
       }
     }
+    if (applicationDeadline.deadlineAt !== null) {
+      provenance.applicationDeadline = {
+        provenance: ProvenanceSource.DETERMINISTIC,
+        conversionMethod: applicationDeadline.conversionMethod,
+        evidence: applicationDeadline.evidence,
+      };
+    }
     if (salary.type !== SalaryType.UNKNOWN) {
       provenance.salaryType = {
         provenance: ProvenanceSource.DETERMINISTIC,
@@ -254,6 +268,7 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       locationCategory: location.category,
       remoteStatus: location.remoteStatus,
       publishedDate,
+      applicationDeadline,
       salary,
       employmentType: employment.type,
       // Delegated to the shared, versioned resolver (ENG-016, FR-006) so this double

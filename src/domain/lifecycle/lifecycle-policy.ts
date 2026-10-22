@@ -18,10 +18,11 @@ import { LifecycleStatus } from '@domain/enums';
  *
  * The rule is threshold-free: it compares the Job's last observation against the source's
  * most recent informative run rather than counting missed runs or days, so there is no
- * tunable constant to misconfigure. `EXPIRED` (a deadline) and `NOT_FOUND` (a dead
- * application target) come from evidence this system does not hold yet, so they are
- * deliberately left alone: this policy can never re-derive them, and overwriting them from
- * listing presence would destroy a determination it cannot restore.
+ * tunable constant to misconfigure. `EXPIRED` (a stated deadline) is owned by
+ * `@domain/lifecycle/deadline-policy` and `NOT_FOUND` (a dead application target) comes from
+ * evidence this system does not hold yet, so both are deliberately left alone here: this
+ * policy can never re-derive them, and overwriting them from listing presence would destroy a
+ * determination it cannot restore.
  *
  * `ponytail:` a single missed run is enough to retire a Job. A source that intermittently
  * truncates its listing will flap. Add a consecutive-miss requirement (and a policy version

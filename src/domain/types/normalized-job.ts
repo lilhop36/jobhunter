@@ -6,6 +6,7 @@ import {
   RemoteStatus,
 } from '../enums';
 import { DateParsed } from './date-parsed';
+import { DeadlineParsed } from './deadline-parsed';
 import { JobProvenance } from './field-provenance';
 import { SalaryParsed } from './salary-parsed';
 
@@ -41,6 +42,11 @@ export interface NormalizedJob {
   locationCategory: LocationCategory;
   remoteStatus: RemoteStatus;
   publishedDate: DateParsed;
+  /**
+   * The application deadline the source stated, or UNKNOWN. Read from the description's own
+   * labelled text (`DEADLINE_EXTRACTION_V1`), never inferred from the posting's age.
+   */
+  applicationDeadline: DeadlineParsed;
   salary: SalaryParsed;
   employmentType: EmploymentType;
   application: ApplicationTarget;

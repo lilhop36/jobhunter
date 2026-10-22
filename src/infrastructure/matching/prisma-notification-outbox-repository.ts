@@ -164,4 +164,23 @@ export class PrismaNotificationOutboxRepository implements NotificationOutboxRep
       WHERE "status" = 'PROCESSING'::"NotificationStatus"
     `;
   }
+
+  async cancelIneligible(input: { now: Date }): Promise<number> {
+    // One statement, no read-then-write window: a row is cancelled only while it is still
+    // PENDING, so this can never steal a row another dispatcher is sending.
+    return this.prisma.$executeRaw`
+      UPDATE "notification_outbox" o
+      SET "status" = 'CANCELLED'::"NotificationStatus",
+          "lastError" = 'the job is no longer notifiable'
+      WHERE o."status" = 'PENDING'::"NotificationStatus"
+        AND EXISTS (
+          SELECT 1 FROM "jobs" j
+          WHERE j."id" = o."jobId"
+            AND (j."lifecycleStatus" <> 'ACTIVE'::"LifecycleStatus"
+                 OR (j."applicationDeadline" IS NOT NULL
+                     AND j."applicationDeadline" + INTERVAL '1 day'
+                         <= ${asTimestamp(input.now)}::timestamp(3)))
+        )
+    `;
+  }
 }

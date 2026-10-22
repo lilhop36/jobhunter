@@ -1,7 +1,9 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import { DescriptionQuality, LifecycleStatus, SourceRunStatus } from '@domain/enums';
 import { RECONCILED_LIFECYCLE_STATUSES } from '@domain/lifecycle/lifecycle-policy';
+import { DEADLINE_RECONCILED_STATUSES } from '@domain/lifecycle/deadline-policy';
 import {
+  DeadlineCandidate,
   JobRecord,
   JobRepository,
   LifecycleCandidate,
@@ -34,6 +36,7 @@ const JOB_REFRESH_COLUMNS = Prisma.raw(`
   "originalPublishedDateText" = EXCLUDED."originalPublishedDateText",
   "publishedAt" = EXCLUDED."publishedAt",
   "dateConfidence" = EXCLUDED."dateConfidence",
+  "applicationDeadline" = EXCLUDED."applicationDeadline",
   "salaryType" = EXCLUDED."salaryType",
   "salaryMin" = EXCLUDED."salaryMin",
   "salaryMax" = EXCLUDED."salaryMax",
@@ -105,6 +108,12 @@ interface LifecycleCandidateRow {
   latestQualifyingRunStartedAt: Date | string | null;
 }
 
+interface DeadlineCandidateRow {
+  jobId: string;
+  lifecycleStatus: string;
+  applicationDeadline: Date | string | null;
+}
+
 /**
  * Canonical Job store (SRS 5.2, ADR-0001).
  *
@@ -133,6 +142,7 @@ export class PrismaJobRepository implements JobRepository {
 
     const rawJobId = input.rawJobId ?? null;
     const publishedAt = asTimestamp(job.publishedDate.publishedAt);
+    const applicationDeadline = asTimestamp(job.applicationDeadline.deadlineAt);
     const salaryMin = job.salary.min;
     const salaryMax = job.salary.max;
     const provenance = JSON.stringify(job.provenance ?? {});
@@ -155,6 +165,7 @@ export class PrismaJobRepository implements JobRepository {
           "remoteStatus", "publishedCalendar", "originalPublishedDateText", "publishedAt",
           "dateConfidence", "salaryType", "salaryMin", "salaryMax", "salaryCurrency",
           "salaryPeriod", "salaryEvidence", "salaryConfidence", "employmentType",
+          "applicationDeadline",
           "applicationMethod", "applyUrl", "applyEmail", "contentFingerprint", "provenance",
           "createdAt", "updatedAt"
         ) VALUES (
@@ -169,6 +180,7 @@ export class PrismaJobRepository implements JobRepository {
           ${job.salary.period}::"SalaryPeriod", ${job.salary.evidence},
           ${job.salary.confidence}::numeric(4,3),
           ${job.employmentType}::"EmploymentType",
+          ${applicationDeadline}::timestamp(3),
           ${application.method}::"ApplicationMethod", ${application.applyUrl},
           ${application.applyEmail}, ${job.contentFingerprint}, ${provenance}::jsonb,
           ${NOW_UTC}, ${NOW_UTC}
@@ -230,6 +242,30 @@ export class PrismaJobRepository implements JobRepository {
       currentStatus: row.lifecycleStatus as LifecycleStatus,
       lastObservedAt: toNullableDate(row.lastObservedAt),
       latestQualifyingRunStartedAt: toNullableDate(row.latestQualifyingRunStartedAt),
+    }));
+  }
+
+  /**
+   * Read model for the deadline policy (FR-019). The filter is the policy's own ownership
+   * rule, expressed in SQL so a Job whose state came from another signal is never loaded.
+   */
+  async listDeadlineCandidates(): Promise<DeadlineCandidate[]> {
+    const ownedStatuses = Prisma.join(DEADLINE_RECONCILED_STATUSES);
+    const rows = await this.prisma.$queryRaw<DeadlineCandidateRow[]>`
+      SELECT j."id" AS "jobId",
+             j."lifecycleStatus"::text AS "lifecycleStatus",
+             j."applicationDeadline" AS "applicationDeadline"
+        FROM "jobs" j
+       WHERE j."lifecycleStatus"::text IN (${ownedStatuses})
+         AND (j."applicationDeadline" IS NOT NULL
+              OR j."lifecycleStatus"::text = ${LifecycleStatus.EXPIRED})
+       ORDER BY j."id" ASC
+    `;
+
+    return rows.map((row) => ({
+      jobId: row.jobId,
+      currentStatus: row.lifecycleStatus as LifecycleStatus,
+      applicationDeadline: toNullableDate(row.applicationDeadline),
     }));
   }
 

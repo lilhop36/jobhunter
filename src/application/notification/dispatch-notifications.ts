@@ -55,6 +55,11 @@ export class DispatchNotifications {
   }
 
   async run(input: DispatchNotificationsInput): Promise<DispatchNotificationsResult> {
+    // Eligibility can decay between reservation and delivery (FR-016): cancel what the job's own
+    // state no longer supports before claiming, so this pass never sends a posting the candidate
+    // cannot act on. Cancelled rows keep their recorded verdict instead of becoming FAILED.
+    await this.deps.outbox.cancelIneligible({ now: input.now });
+
     const claimed = await this.deps.outbox.claimDue({
       now: input.now,
       limit: input.limit ?? DEFAULT_BATCH_SIZE,
