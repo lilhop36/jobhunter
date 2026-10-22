@@ -2,6 +2,7 @@ import { CalendarType } from '@domain/enums';
 import type { JobSourceAdapter, SourceAdapterConfig } from '@ports/source-adapter';
 import { createEffoySiraAdapter } from '@infrastructure/adapters/effoysira';
 import { createEthiojobsAdapter } from '@infrastructure/adapters/ethiojobs';
+import { createJobWebEthiopiaAdapter } from '@infrastructure/adapters/jobwebethiopia';
 
 /**
  * One production source adapter, admitted only by an APPROVED record in `docs/sources`
@@ -27,7 +28,8 @@ export interface ProductionAdapterRegistration {
 
 /**
  * Every adapter the worker may resolve in production. One entry per APPROVED record in
- * `docs/sources`; today EffoySira (effoysira.com) and Ethiojobs (ethiojobs.net).
+ * `docs/sources`; today EffoySira (effoysira.com), Ethiojobs (ethiojobs.net) and
+ * JobWebEthiopia (jobwebethiopia.com).
  *
  * An entry here is a claim that `docs/sources/<approvalRecord>` exists and reads
  * `Status: APPROVED`; `tests/unit/source-approval-records.spec.ts` enforces that, so an
@@ -67,6 +69,24 @@ export const PRODUCTION_ADAPTERS: readonly ProductionAdapterRegistration[] = [
       options: { delayMs: 800, maxListingPages: 2 },
     },
     create: (config) => createEthiojobsAdapter(config),
+  },
+  {
+    sourceName: 'JobWebEthiopia',
+    approvalRecord: 'jobwebethiopia.md',
+    config: {
+      adapterType: 'JOBWEBETHIOPIA_STATIC_HTML',
+      adapterVersion: '1.0.0',
+      accessMechanism: 'STATIC_HTML',
+      declaredCalendar: CalendarType.GREGORIAN,
+      declaredDateFormat: null,
+      declaredCurrency: null,
+      canonicalUrlIdentityTrusted: true,
+      // robots.txt `Crawl-delay: 30` is the politeness floor: one request per 30 s, and a
+      // run budget of one listing page plus six posting pages (~190 s of waiting) under
+      // the 300 s acquisition bound. Freshness comes from the source's shorter schedule.
+      options: { delayMs: 30_000, maxListingPages: 1, maxPosts: 6 },
+    },
+    create: (config) => createJobWebEthiopiaAdapter(config),
   },
 ];
 

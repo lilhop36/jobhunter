@@ -47,4 +47,21 @@ await prisma.jobSource.upsert({
 });
 
 console.log('seeded JobSource: Ethiojobs (ETHIOJOBS_STATIC_HTML 1.0.0, enabled, schedule 6h)');
+
+await prisma.jobSource.upsert({
+  where: { name: 'JobWebEthiopia' },
+  update: {},
+  create: {
+    name: 'JobWebEthiopia',
+    adapterType: 'JOBWEBETHIOPIA_STATIC_HTML',
+    adapterVersion: '1.0.0',
+    enabled: true,
+    accessPolicy: { approvalRecord: 'docs/sources/jobwebethiopia.md' },
+    // The publisher asks for one request per 30 s, so a run reads only the newest few
+    // postings; a shorter schedule - not a bigger page budget - keeps coverage current.
+    schedule: '3h',
+  },
+});
+
+console.log('seeded JobSource: JobWebEthiopia (JOBWEBETHIOPIA_STATIC_HTML 1.0.0, enabled, schedule 3h)');
 await prisma.$disconnect();
