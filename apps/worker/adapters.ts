@@ -1,6 +1,7 @@
 import { CalendarType } from '@domain/enums';
 import type { JobSourceAdapter, SourceAdapterConfig } from '@ports/source-adapter';
 import { createEffoySiraAdapter } from '@infrastructure/adapters/effoysira';
+import { createEthiojobsAdapter } from '@infrastructure/adapters/ethiojobs';
 
 /**
  * One production source adapter, admitted only by an APPROVED record in `docs/sources`
@@ -26,7 +27,7 @@ export interface ProductionAdapterRegistration {
 
 /**
  * Every adapter the worker may resolve in production. One entry per APPROVED record in
- * `docs/sources`; today only EffoySira (effoysira.com) is approved.
+ * `docs/sources`; today EffoySira (effoysira.com) and Ethiojobs (ethiojobs.net).
  *
  * An entry here is a claim that `docs/sources/<approvalRecord>` exists and reads
  * `Status: APPROVED`; `tests/unit/source-approval-records.spec.ts` enforces that, so an
@@ -51,6 +52,21 @@ export const PRODUCTION_ADAPTERS: readonly ProductionAdapterRegistration[] = [
       options: { delayMs: 800, maxListingPages: 2 },
     },
     create: (config) => createEffoySiraAdapter(config),
+  },
+  {
+    sourceName: 'Ethiojobs',
+    approvalRecord: 'ethiojobs.md',
+    config: {
+      adapterType: 'ETHIOJOBS_STATIC_HTML',
+      adapterVersion: '1.0.0',
+      accessMechanism: 'STATIC_HTML',
+      declaredCalendar: CalendarType.GREGORIAN,
+      declaredDateFormat: null,
+      declaredCurrency: null,
+      canonicalUrlIdentityTrusted: true,
+      options: { delayMs: 800, maxListingPages: 2 },
+    },
+    create: (config) => createEthiojobsAdapter(config),
   },
 ];
 

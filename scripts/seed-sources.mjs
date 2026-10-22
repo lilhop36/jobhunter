@@ -32,4 +32,19 @@ await prisma.jobSource.upsert({
 });
 
 console.log('seeded JobSource: EffoySira (EFFOYSIRA_STATIC_HTML 1.0.0, enabled, schedule 6h)');
+
+await prisma.jobSource.upsert({
+  where: { name: 'Ethiojobs' },
+  update: {},
+  create: {
+    name: 'Ethiojobs',
+    adapterType: 'ETHIOJOBS_STATIC_HTML',
+    adapterVersion: '1.0.0',
+    enabled: true,
+    accessPolicy: { approvalRecord: 'docs/sources/ethiojobs.md' },
+    schedule: '6h',
+  },
+});
+
+console.log('seeded JobSource: Ethiojobs (ETHIOJOBS_STATIC_HTML 1.0.0, enabled, schedule 6h)');
 await prisma.$disconnect();
