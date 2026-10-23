@@ -1,7 +1,20 @@
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { MATCHER_VERSION } from '@domain/matching';
 import { NOTIFICATION_ELIGIBILITY_VERSION, NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
 import type { MatchFactorScores } from '@domain/types';
+import { CreateTelegramLinkToken } from '@application/telegram';
+import {
+  clearSetCookie,
+  createSession,
+  csrfSetCookie,
+  deleteSession,
+  getSession,
+  parseCookies,
+  sessionSetCookie,
+  verifyCsrf,
+  CSRF_COOKIE,
+  SESSION_COOKIE,
+} from '@application/web/session';
 import type {
   CandidateProfileRepository,
   StoredCandidateProfile,
@@ -10,24 +23,29 @@ import type { JobCursor, JobDetail, JobReader, JobSummary } from '@ports/job-rea
 import type { JobMatchRecord, JobMatchRepository, MatchCursor } from '@ports/job-match-repository';
 import type { JobSourceRepository, SourceDetail } from '@ports/job-source-repository';
 import type { NotificationRecord, NotificationRepository } from '@ports/notification-repository';
+import type { TelegramLinkTokenStore } from '@ports/telegram-linking';
 import { encodeCursor } from '../cursor';
 import { UUID_PATTERN } from '../schemas';
 import { errorPage, html, page, sendPage, type Html, type NavKey } from '../web/html';
+import { formValuesFromInput, parseProfileForm, profileForm, toFormValues } from '../web/profile-form';
 import { decodeJobCursor } from './jobs';
 import { decodeMatchCursor, unknownFactors } from './matches';
+import { saveProfile, toProfile, type ProfileRoutesDeps } from './profile';
 
 /**
- * The read-only web pages (SRS 3.1, ADR-0007): `/dashboard`, `/jobs`, `/jobs/:id`, `/matches` and
- * `/matches/:id`, server-rendered, no client JavaScript, no assets.
+ * The web pages (SRS 3.1; ADR-0007 read-only, ADR-0009 mutations): `/dashboard`, `/jobs`,
+ * `/jobs/:id`, `/matches`, `/matches/:id`, `/profile`, `/settings`, `/settings/telegram`,
+ * `/login`, `/logout`.
  *
- * Every page reads through the same ports the JSON routes use, so a page cannot show a fact the
- * API would not publish, and every stored value is escaped by the template. Job text is untrusted
- * (SRS: external content is hostile input): escaping plus the CSP in `sendPage` is why an
- * interpolation is never trusted, and why a URL is only rendered as a link when it is http(s).
+ * The read pages never show a fact the JSON API would not publish, every stored value is escaped by
+ * the template, and a URL only becomes a link when it is http(s) — job text is untrusted input.
  *
- * The candidate is resolved from the stored profiles rather than assumed: v1 seeds one (FR-012),
- * but a page that hard-coded "the candidate" would have to be rewritten the day a second profile
- * exists. One profile is used directly; several produce a chooser.
+ * The mutating pages (`/profile`, `/settings/telegram`) sit behind a session and a double-submit
+ * CSRF token (ADR-0009): `jh_session` is HttpOnly, `jh_csrf` is readable and echoed into each form,
+ * and a POST is accepted only when the two agree. There is no password — v1 is a personal,
+ * loopback tool, and choosing a candidate *is* the login.
+ *
+ * The candidate is never hard-coded: the session names one, a second candidate is data.
  */
 export interface WebRoutesDeps {
   profiles: CandidateProfileRepository;
@@ -35,6 +53,12 @@ export interface WebRoutesDeps {
   matches: JobMatchRepository;
   notifications: NotificationRepository;
   sources: JobSourceRepository;
+  /** The `PROFILE_CHANGED` entry point, shared with `PUT /api/profile` (ADR-0009). */
+  rescore: ProfileRoutesDeps['rescore'];
+  /** ADR-0008: minting a one-use linking token. */
+  telegramTokens: TelegramLinkTokenStore;
+  /** The bot's public username, from configuration; absent means linking is not configured. */
+  botUsername?: string;
 }
 
 const PAGE_LIMIT = 25;
@@ -42,12 +66,14 @@ const DASHBOARD_MATCHES = 20;
 const DASHBOARD_TOP = 5;
 
 export async function registerWebRoutes(app: FastifyInstance, deps: WebRoutesDeps): Promise<void> {
+  // The pages are read-only GETs except for two form POSTs, which are registered together at the
+  // end in their own encapsulated scope so the form media type stays out of the JSON API.
+
   // SRS 3.1 requires `/dashboard`; `/` simply sends the browser there.
   app.get('/', async (_request, reply) => reply.redirect('/dashboard'));
 
   app.get('/dashboard', async (request, reply) => {
-    const { userId } = request.query as { userId?: string };
-    const candidate = await resolveCandidate(deps.profiles, userId);
+    const candidate = await resolveCandidateForPage(request, deps.profiles);
     const early = earlyResponse(reply, candidate, 'dashboard');
     if (early !== null) return early;
 
@@ -104,11 +130,11 @@ ${sources.sources.length === 0
   });
 
   app.get('/matches', async (request, reply) => {
-    const { userId, cursor } = request.query as { userId?: string; cursor?: string };
-    const candidate = await resolveCandidate(deps.profiles, userId);
+    const candidate = await resolveCandidateForPage(request, deps.profiles);
     const early = earlyResponse(reply, candidate, 'matches');
     if (early !== null) return early;
 
+    const { cursor } = request.query as { cursor?: string };
     const { profile } = candidate as { profile: StoredCandidateProfile };
     let decoded: MatchCursor | undefined;
     try {
@@ -258,10 +284,242 @@ ${provenanceHtml(job.provenance)}`;
       }),
     );
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // Sessions (ADR-0009)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Choosing a candidate is the only "login": no password, because v1 is a personal, loopback tool
+   * (ADR-0009 §2.3). The link carries the user id, so this is a state-changing GET — it mints
+   * nothing secret (the token is random either way) and a form would ask the user to type a value
+   * they cannot see.
+   */
+  app.get('/login', async (request, reply) => {
+    const { userId } = request.query as { userId?: string };
+    if (userId !== undefined && isUuid(userId)) {
+      const profile = await deps.profiles.findForUser(userId);
+      if (profile !== null) {
+        const { sessionToken, csrfToken } = createSession(profile.userId);
+        return reply
+          .header('set-cookie', [sessionSetCookie(sessionToken), csrfSetCookie(csrfToken)])
+          .redirect('/dashboard');
+      }
+    }
+
+    const stored = await deps.profiles.listProfiles();
+    const body =
+      stored.length === 0
+        ? html`<p class="muted">No candidate profile exists yet. Seed one with
+<code>npm run seed:candidate</code>.</p>`
+        : html`<p>Choose the candidate these pages should act for:</p>
+<ul class="plain">${stored.map(
+            (profile) =>
+              html`<li><a href="/login?userId=${profile.userId}">Profile ${profile.profileVersion}</a></li>`,
+          )}</ul>`;
+    return sendPage(
+      reply,
+      200,
+      page({ title: 'Sign in', heading: 'Sign in', body, current: 'dashboard' }),
+    );
+  });
+
+  /**
+   * Logout clears both cookies. A GET is safe here: it destroys a session rather than performing an
+   * action, so the worst a forged request does is end the operator's own session.
+   */
+  app.get('/logout', async (request, reply) => {
+    deleteSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+    return reply
+      .header('set-cookie', [clearSetCookie(SESSION_COOKIE), clearSetCookie(CSRF_COOKIE)])
+      .redirect('/login');
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // /profile — the whole-profile editor (SRS 3.1, 3.4; ADR-0009)
+  // ---------------------------------------------------------------------------------------------
+
+  app.get('/profile', async (request, reply) => {
+    const candidate = await resolveCandidateForPage(request, deps.profiles);
+    const early = earlyResponse(reply, candidate, 'profile');
+    if (early !== null) return early;
+    const { profile } = candidate as { profile: StoredCandidateProfile };
+
+    const session = activeSession(request, profile.userId);
+    if (session.setCookies !== null) reply.header('set-cookie', session.setCookies);
+
+    return sendPage(
+      reply,
+      200,
+      page({
+        title: 'Edit profile',
+        heading: 'Edit profile',
+        current: 'profile',
+        body: profileForm(toFormValues(profile.profile), [], session.csrfToken),
+      }),
+    );
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // /settings (SRS 3.1)
+  // ---------------------------------------------------------------------------------------------
+
+  app.get('/settings', async (request, reply) => {
+    const candidate = await resolveCandidateForPage(request, deps.profiles);
+    const early = earlyResponse(reply, candidate, 'settings');
+    if (early !== null) return early;
+
+    const body = html`<p>Settings for this deployment.</p>
+<ul class="plain">
+<li><a href="/settings/telegram">Telegram notifications</a></li>
+</ul>`;
+    return sendPage(
+      reply,
+      200,
+      page({ title: 'Settings', heading: 'Settings', body, current: 'settings' }),
+    );
+  });
+
+  app.get('/settings/telegram', async (request, reply) => {
+    const candidate = await resolveCandidateForPage(request, deps.profiles);
+    const early = earlyResponse(reply, candidate, 'settings');
+    if (early !== null) return early;
+    const { profile } = candidate as { profile: StoredCandidateProfile };
+
+    const session = activeSession(request, profile.userId);
+    if (session.setCookies !== null) reply.header('set-cookie', session.setCookies);
+
+    const headings = { title: 'Telegram notifications', heading: 'Telegram notifications', current: 'settings' as NavKey };
+
+    if (deps.botUsername === undefined) {
+      return sendPage(
+        reply,
+        200,
+        page({
+          ...headings,
+          body: html`<p>Telegram linking is not configured on this deployment
+(<code>TELEGRAM_BOT_USERNAME</code> is unset).</p>`,
+        }),
+      );
+    }
+
+    const body = html`<p>Notifications are delivered by the
+<a href="https://t.me/${deps.botUsername}">@${deps.botUsername}</a> bot.</p>
+<form method="post" action="/settings/telegram">
+<input type="hidden" name="_csrf" value="${session.csrfToken}">
+<button type="submit">Link my Telegram account</button>
+</form>
+<p class="hint">You will be sent to Telegram to press Start. The link is one-use and expires in
+10 minutes (ADR-0008).</p>`;
+    return sendPage(reply, 200, page({ ...headings, body }));
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // The form posts (ADR-0009)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The two mutating pages share one encapsulated scope (Fastify's `register`), for two reasons:
+   *
+   *  - the `application/x-www-form-urlencoded` parser belongs only to them. Registering it at the
+   *    root would let the media type leak into the JSON API, where an unsupported content type must
+   *    stay a 415 (a caller mistake) rather than being accepted and silently ignored;
+   *  - both are guarded the same way: a save needs a session and the CSRF token that session was
+   *    issued, and the two must agree. Without the session the token cannot be forged from another
+   *    origin, and without the token a cross-site form cannot ride the session cookie.
+   *
+   * A malformed submission is rejected and shown again filled in; a profile save then takes the
+   * same path as `PUT /api/profile` (same repository, same re-score request), so the two write
+   * paths cannot drift.
+   */
+  await app.register(async (form) => {
+    // Repeated keys (a checkbox group shares one name) collect into an array instead of
+    // overwriting, so the parser alone never loses part of a submission.
+    form.addContentTypeParser(
+      'application/x-www-form-urlencoded',
+      { parseAs: 'string' },
+      (_request, body, done) => {
+        const fields: Record<string, string | string[]> = {};
+        for (const [key, value] of new URLSearchParams(String(body))) {
+          const existing = fields[key];
+          if (existing === undefined) fields[key] = value;
+          else if (Array.isArray(existing)) existing.push(value);
+          else fields[key] = [existing, value];
+        }
+        done(null, fields);
+      },
+    );
+
+    form.post('/profile', async (request, reply) => {
+      const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+      const input = (request.body ?? {}) as Record<string, unknown>;
+      if (session === null || !verifyCsrf(session, input['_csrf'])) {
+        return sendPage(
+          reply,
+          403,
+          errorPage(403, 'Your form token is missing or wrong. Reload the profile page and try again.'),
+        );
+      }
+
+      const values = formValuesFromInput(input, input['requireDisclosed'] !== undefined);
+      const parsed = parseProfileForm(values);
+      if (!parsed.ok) {
+        return sendPage(
+          reply,
+          400,
+          page({
+            title: 'Edit profile',
+            heading: 'Edit profile',
+            current: 'profile',
+            body: profileForm(parsed.values, parsed.errors, session.csrfToken),
+          }),
+        );
+      }
+
+      await saveProfile(
+        { profiles: deps.profiles, rescore: deps.rescore },
+        session.userId,
+        toProfile(parsed.body),
+        request.log,
+      );
+      return reply.redirect('/dashboard');
+    });
+
+    /**
+     * Mints a token for **the session's** candidate, never for a user named in the form: a forged
+     * body could otherwise aim someone else's notifications at the attacker's chat.
+     */
+    form.post('/settings/telegram', async (request, reply) => {
+      const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+      const input = (request.body ?? {}) as Record<string, unknown>;
+      if (session === null || !verifyCsrf(session, input['_csrf'])) {
+        return sendPage(
+          reply,
+          403,
+          errorPage(403, 'Your form token is missing or wrong. Reload the page and try again.'),
+        );
+      }
+      if (deps.botUsername === undefined) {
+        return sendPage(
+          reply,
+          500,
+          errorPage(500, 'Telegram linking is not configured on this deployment.'),
+        );
+      }
+
+      const created = await new CreateTelegramLinkToken({ tokens: deps.telegramTokens }).run({
+        userId: session.userId,
+        now: new Date(),
+      });
+      return reply.redirect(
+        `https://t.me/${deps.botUsername}?start=${encodeURIComponent(created.token)}`,
+      );
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
-// Candidate resolution
+// Session & candidate resolution
 // ---------------------------------------------------------------------------------------------
 
 type CandidateResolution =
@@ -270,6 +528,48 @@ type CandidateResolution =
   | { kind: 'choose'; profiles: StoredCandidateProfile[] }
   | { kind: 'missing'; userId: string };
 
+/**
+ * Candidate resolution for a page: the session's candidate when there is one, otherwise the
+ * explicit `?userId=` override, otherwise the single stored profile, otherwise a chooser.
+ * Session first, so an operator who has signed in is not re-asked on every page.
+ */
+async function resolveCandidateForPage(
+  request: FastifyRequest,
+  profiles: CandidateProfileRepository,
+): Promise<CandidateResolution> {
+  const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+  if (session !== null) {
+    const profile = await profiles.findForUser(session.userId);
+    // A session naming a user whose profile is gone falls through to the chooser below.
+    if (profile !== null) return { kind: 'one', profile };
+  }
+  const { userId } = request.query as { userId?: string };
+  return resolveCandidate(profiles, userId);
+}
+
+/**
+ * The session a page should act through: the current one when it already names this candidate,
+ * otherwise a freshly created one and the cookies the caller must set on the reply.
+ *
+ * Rendering a form goes through this, so the page always carries a CSRF token to echo back — even
+ * for an operator who arrived without a session (a single stored profile needs no chooser).
+ */
+function activeSession(
+  request: FastifyRequest,
+  userId: string,
+): { csrfToken: string; setCookies: string[] | null } {
+  const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+  if (session !== null && session.userId === userId) {
+    return { csrfToken: session.csrfToken, setCookies: null };
+  }
+  const { sessionToken, csrfToken } = createSession(userId);
+  return { csrfToken, setCookies: [sessionSetCookie(sessionToken), csrfSetCookie(csrfToken)] };
+}
+
+/**
+ * Resolution from an explicit `?userId=` (a manual URL, and the miss case a page reports as 404),
+ * or from the stored profiles when there is no session to name one.
+ */
 async function resolveCandidate(
   profiles: CandidateProfileRepository,
   userId: string | undefined,
@@ -328,7 +628,7 @@ No candidate profile is stored, so there is nothing to score against. Seed one w
 <ul>
 ${resolution.profiles.map(
   (profile) =>
-    html`<li><a href="/dashboard?userId=${profile.userId}">Profile ${profile.profileVersion}</a></li>`,
+    html`<li><a href="/login?userId=${profile.userId}">Profile ${profile.profileVersion}</a></li>`,
 )}
 </ul>`,
       }),

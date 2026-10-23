@@ -50,7 +50,7 @@ export interface ProfileRoutesDeps {
 }
 
 /** The request body, as Ajv has already validated it against `putProfileBody`. */
-interface ProfileBody {
+export interface ProfileBody {
   experienceYears: number | null;
   remotePreference: RemotePreference;
   relocationPreference: RelocationPreference;
@@ -64,6 +64,12 @@ interface ProfileBody {
   skills: Array<{ canonicalSkill: string; skillType: SkillEvidence; confidence: number }>;
   targetRoles: Array<{ title: string; aliases: string[] }>;
   locationPreferences: Array<{ category: LocationCategory; text: string | null }>;
+}
+
+/** The two logger methods a save needs. Fastify's `request.log` satisfies it. */
+export interface ProfileLog {
+  info(meta: Record<string, unknown>, message: string): void;
+  warn(meta: Record<string, unknown>, message: string): void;
 }
 
 export async function registerProfileRoutes(
@@ -86,39 +92,63 @@ export async function registerProfileRoutes(
     async (request) => {
       const { userId } = request.query as { userId: string };
       const profile = toProfile(request.body as ProfileBody);
-
-      const before = await deps.profiles.findForUser(userId);
-      const stored = await deps.profiles.saveForUser({ userId, profile });
-
-      if (before?.profileVersion === stored.profileVersion) {
-        request.log.info(
-          { userId, profileVersion: stored.profileVersion },
-          'profile saved with an unchanged revision; no re-score requested',
-        );
-        return serializeProfile(stored);
-      }
-
-      try {
-        const result = await deps.rescore.run({ reason: 'PROFILE_CHANGED' });
-        request.log.info(
-          {
-            userId,
-            profileVersion: stored.profileVersion,
-            enqueued: result.enqueued.length,
-            alreadyQueued: result.alreadyQueued.length,
-          },
-          'requested a re-score after the profile changed',
-        );
-      } catch (error) {
-        request.log.warn(
-          { err: error, userId, profileVersion: stored.profileVersion },
-          'the profile changed but the re-score could not be requested',
-        );
-      }
-
+      const stored = await saveProfile(deps, userId, profile, request.log);
       return serializeProfile(stored);
     },
   );
+}
+
+/**
+ * Store a whole profile and, when the revision moved, ask for a re-score.
+ *
+ * Shared by `PUT /api/profile` and the `/profile` form (ADR-0009) so both write
+ * paths store the same thing and request the same follow-up work. A changed
+ * profile invalidates every stored match, because each was scored against inputs
+ * that no longer exist, so the save enqueues one `PROFILE_CHANGED` task per
+ * enabled source; the worker does the scoring (ENG-017).
+ *
+ * A failed request is logged, not fatal: the profile is already stored, a 5xx
+ * would invite a retry against a profile that is already correct, and every later
+ * collection re-scores that source's jobs against the current revision anyway.
+ * Saving an identical profile enqueues nothing, because the revision is
+ * content-derived and the stored matches are still valid.
+ */
+export async function saveProfile(
+  deps: ProfileRoutesDeps,
+  userId: string,
+  profile: UnversionedCandidateProfile,
+  log: ProfileLog,
+): Promise<StoredCandidateProfile> {
+  const before = await deps.profiles.findForUser(userId);
+  const stored = await deps.profiles.saveForUser({ userId, profile });
+
+  if (before?.profileVersion === stored.profileVersion) {
+    log.info(
+      { userId, profileVersion: stored.profileVersion },
+      'profile saved with an unchanged revision; no re-score requested',
+    );
+    return stored;
+  }
+
+  try {
+    const result = await deps.rescore.run({ reason: 'PROFILE_CHANGED' });
+    log.info(
+      {
+        userId,
+        profileVersion: stored.profileVersion,
+        enqueued: result.enqueued.length,
+        alreadyQueued: result.alreadyQueued.length,
+      },
+      'requested a re-score after the profile changed',
+    );
+  } catch (error) {
+    log.warn(
+      { err: error, userId, profileVersion: stored.profileVersion },
+      'the profile changed but the re-score could not be requested',
+    );
+  }
+
+  return stored;
 }
 
 /**
@@ -130,7 +160,7 @@ export async function registerProfileRoutes(
  * version stored labels exactly the facts stored — a version computed over `50000` would disagree
  * with the `50000.00` the table returns, and ENG-012's guarantee would be a lie.
  */
-function toProfile(body: ProfileBody): UnversionedCandidateProfile {
+export function toProfile(body: ProfileBody): UnversionedCandidateProfile {
   return {
     experienceYears: body.experienceYears,
     remotePreference: body.remotePreference,

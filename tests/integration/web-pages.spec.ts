@@ -253,8 +253,10 @@ describe('GET /dashboard', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('Choose a candidate');
-    expect(response.body).toContain(`/dashboard?userId=${userId}`);
-    expect(response.body).toContain(`/dashboard?userId=${other.id}`);
+    // Choosing is the login (ADR-0009), so the links establish a session rather than just
+    // re-render the same page with a query parameter.
+    expect(response.body).toContain(`/login?userId=${userId}`);
+    expect(response.body).toContain(`/login?userId=${other.id}`);
   });
 
   it('answers 404 for a candidate id that has no profile', async () => {

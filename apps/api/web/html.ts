@@ -88,12 +88,27 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:.5r
 dt{font-weight:600}
 dd{margin:0}
 ul.plain{padding-left:1.1rem;margin:.25rem 0 1rem}
+form{margin:1rem 0}
+fieldset{border:1px solid var(--line);border-radius:.35rem;margin:.9rem 0;padding:.6rem .85rem}
+legend{font-weight:600;padding:0 .35rem}
+label{display:block;margin:.6rem 0}
+label.checkbox{display:inline-block;margin-right:1rem}
+input,select,textarea{font:inherit;color:inherit;background:transparent;border:1px solid var(--line);border-radius:.25rem;padding:.35rem;max-width:100%}
+label input,label select,label textarea{margin-top:.25rem;display:block}
+textarea{width:100%;min-height:5rem}
+input[type=checkbox]{width:auto}
+button{font:inherit;padding:.5rem .9rem;border:1px solid var(--line);border-radius:.25rem;background:transparent;color:inherit;cursor:pointer}
+button:hover{background:var(--line)}
+.hint{color:var(--muted);font-size:.9rem}
+.errors{border-left:4px solid var(--accent);padding-left:.7rem}
 `;
 
 const NAV = [
   { href: '/dashboard', label: 'Dashboard', key: 'dashboard' },
   { href: '/jobs', label: 'Jobs', key: 'jobs' },
   { href: '/matches', label: 'Matches', key: 'matches' },
+  { href: '/profile', label: 'Profile', key: 'profile' },
+  { href: '/settings', label: 'Settings', key: 'settings' },
 ] as const;
 
 export type NavKey = (typeof NAV)[number]['key'];
@@ -142,8 +157,9 @@ ${body}
 
 /**
  * A page response. The CSP is the second line of defence behind escaping: even a template bug that
- * emitted a script tag could not execute it, and `form-action 'none'` states that these pages carry
- * no forms (ADR-0007 §5 decides what one would need).
+ * emitted a script tag could not execute it. `form-action 'self'` (ADR-0009) lets the pages post
+ * their own forms back to this origin and nothing else; `default-src 'none'` still forbids scripts
+ * and assets.
  */
 export function sendPage(reply: FastifyReply, status: number, document: Html): FastifyReply {
   return reply
@@ -151,7 +167,7 @@ export function sendPage(reply: FastifyReply, status: number, document: Html): F
     .type('text/html; charset=utf-8')
     .header(
       'content-security-policy',
-      "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     )
     .header('x-content-type-options', 'nosniff')
     .header('referrer-policy', 'no-referrer')

@@ -63,18 +63,6 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
     jobs: new PrismaJobReader(prisma),
   });
 
-  await registerWebRoutes(app, {
-    profiles: new PrismaCandidateProfileRepository(prisma),
-    jobs: new PrismaJobReader(prisma),
-    matches: new PrismaJobMatchRepository(prisma),
-    notifications: new PrismaNotificationRepository(prisma),
-    sources: new PrismaJobSourceRepository(prisma),
-  });
-
-  await registerNotificationRoutes(app, {
-    notifications: new PrismaNotificationRepository(prisma),
-  });
-
   // The worker's logger interface, over Fastify's logger: one logging configuration per process,
   // and silent under `NODE_ENV=test` like every other line the app writes.
   const logger: WorkerLogger = {
@@ -83,13 +71,32 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
     error: (message, meta) => app.log.error({ meta }, message),
   };
 
+  // The `PROFILE_CHANGED` re-score request, shared by `PUT /api/profile` and the web profile form
+  // (ADR-0009): the two write paths must store the same profile and ask for the same follow-up.
+  const rescore = new RequestMatchBackfill({
+    sources: new PrismaJobSourceRepository(prisma),
+    tasks: new PrismaWorkTaskRepository(prisma),
+    logger,
+  });
+
+  await registerWebRoutes(app, {
+    profiles: new PrismaCandidateProfileRepository(prisma),
+    jobs: new PrismaJobReader(prisma),
+    matches: new PrismaJobMatchRepository(prisma),
+    notifications: new PrismaNotificationRepository(prisma),
+    sources: new PrismaJobSourceRepository(prisma),
+    rescore,
+    telegramTokens: new PrismaTelegramLinkRepository(prisma),
+    botUsername: config.telegramBotUsername,
+  });
+
+  await registerNotificationRoutes(app, {
+    notifications: new PrismaNotificationRepository(prisma),
+  });
+
   await registerProfileRoutes(app, {
     profiles: new PrismaCandidateProfileRepository(prisma),
-    rescore: new RequestMatchBackfill({
-      sources: new PrismaJobSourceRepository(prisma),
-      tasks: new PrismaWorkTaskRepository(prisma),
-      logger,
-    }),
+    rescore,
   });
 
   await registerTelegramLinkRoutes(app, {
