@@ -148,6 +148,29 @@ runs at the head of every scoring task) but has nothing to act on until deadline
 Consequence: FR-019 is implemented and tested but inert. The listing-presence sweep is the cheap
 half — the evidence it needs ("not observed in the latest successful run") is already recorded.
 
+**Why it must not be wired as it stands (measured 2026-10-23).** The sweep's "informative run"
+definition (`SUCCEEDED` and `jobsDiscovered > 0`) assumes a run observed the whole catalogue.
+It does not: discovery is page-capped (I-08). Running the sweep's own read model against the
+current database shows what the first wired sweep would do:
+
+| Source | ACTIVE jobs | Latest qualifying run discovered | Would move to REMOVED |
+|---|---|---|---|
+| EffoySira | 62 | 18 | **44** |
+| Ethiojobs | 24 | 24 | 0 |
+| JobWebEthiopia | 6 | 6 | 0 |
+
+Those 44 EffoySira jobs are older postings that fell outside the two-page window; they are
+still published. Retiring them would convert "not looked at" into "gone" — exactly the
+missing-evidence-as-negative-evidence failure ENG-001 forbids, and it would also cancel any
+future notification for them.
+
+The prerequisite is therefore not a trigger but a **coverage signal**: a run may only qualify
+when the adapter reached the end of the source's listing (Ethiojobs' payload carries
+`meta.lastPage`; EffoySira and JobWebEthiopia expose pagination links). Proposed design: add a
+per-run "catalogue exhausted" flag, qualify the sweep on it, and only then invoke the sweep
+after a successful run. Until that exists, `REMOVED` stays unreachable by design, and the
+fix-order item is downgraded from "wire it" to "give it coverage evidence first".
+
 ### I-07 — Medium: Ethiojobs identity uses the full slug while the approval record declares only the id segment stable
 
 `docs/sources/ethiojobs.md` says "the leading id segment is a stable external identifier (ADR-0001
@@ -167,6 +190,10 @@ successful run of each produced exactly the cap. A posting pushed past the windo
 edits) is never observed, and there is no measurement of how often that happens. The page budgets
 are documented as a deliberate politeness/freshness trade-off, so this is a measurement gap rather
 than an error: compare `raw captures per run` against `discovered per run` before changing a budget.
+
+The cap also blocks removal detection: a run that stops at page 2 cannot support "unseen means
+gone", so the presence sweep stays unwired until a run can declare it covered the listing (see
+I-06). Raising the budget alone does not fix that — the signal is coverage, not volume.
 
 ### I-09 — Low: fixtures are synthetic, not captured, and there is no dead-link case
 
@@ -265,6 +292,23 @@ no trusted URL, in which case it falls to the `fp:` basis and the count is visib
 | 1 | I-01 expectation wiring | S | Restores the only automatic signal that a source went silent; blocks a false "healthy" during validation. |
 | 2 | I-05 error cause | XS | Six failures are currently undiagnosable. |
 | 3 | I-02 + I-03 structured application path and expiry | M | Unlocks 24 jobs and makes FR-019 work for the source that declares expiry. |
-| 4 | I-06 wire the presence sweep + ADR for dead links | M | FR-019's other half; the sweep is already written and tested. |
-| 5 | I-08 measure budget saturation, I-09 capture fixtures | S–M | Evidence before changing budgets. |
+| 4 | I-06 give the presence sweep a coverage signal, then wire it + ADR for dead links | M | Not a trigger problem: measured, wiring it today would retire 44 of 62 live EffoySira jobs (see I-06). |
+| 5 | I-08 measure budget saturation, I-09 capture fixtures | S-M | Evidence before changing budgets. |
 | 6 | I-04 staleness flag, I-07 identity basis | decision | Both are product/record decisions, not mechanical fixes. |
+
+## 8. Fix progress
+
+| Item | Status | Commit | Evidence |
+| --- | --- | --- | --- |
+| I-01 expectation wiring | done | `9855e1a` | All three registrations carry the approval record's `RESULTS_EXPECTED`; the handler forwards it. Regression drives scheduler → queue → worker → handler with an empty listing and asserts `PARTIAL` + `unexpectedZeroResults` + `DEGRADED`. |
+| I-05 error cause | done | `9855e1a` | `describeError` follows up to three `cause` links and bounds the line at 500 chars; a `fetch failed` now reads `(cause: read ECONNRESET)`. |
+| I-02 structured application path | done | `af02176` | Ethiojobs maps its declared method/email/link in the adapter; declared evidence outranks text; a malformed declared email and an ATS record with no target stay UNKNOWN. |
+| I-03 declared expiry | done | `af02176` | `date_expiry` is parsed by the shared date parser and stored as `applicationDeadline`; an unparsable declared value falls back to the description's labelled deadline. |
+| I-06 presence sweep | **blocked** | — | Measured above: wiring it today retires 44 of 62 live EffoySira jobs. Needs the coverage signal first. |
+| I-04, I-07 | open | — | Owner decisions. |
+| I-08, I-09, I-10, I-12 | open | — | Unchanged. |
+
+The I-01 remainder (a non-2xx during listing acquisition is still swallowed by the adapter and
+reported as zero records) is unchanged and deliberately out of this increment: it needs a
+port-level notion of a partial page. With the expectation wired, the visible outcome is now
+`PARTIAL`/`DEGRADED` rather than `SUCCEEDED`/`HEALTHY`, so the failure is no longer invisible.
