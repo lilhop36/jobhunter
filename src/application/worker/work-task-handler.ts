@@ -36,7 +36,13 @@ export class PermanentWorkTaskError extends Error {
   }
 }
 
-function describeError(error: unknown): string {
+/** A message longer than this is truncated; a log line is not an evidence store. */
+const MAX_ERROR_DESCRIPTION_LENGTH = 500;
+
+/** How many nested `cause`s are followed before the chain is cut. */
+const MAX_CAUSE_DEPTH = 3;
+
+function describeOne(error: unknown): string {
   if (error instanceof Error) {
     return error.name && error.name !== 'Error' ? `${error.name}: ${error.message}` : error.message;
   }
@@ -46,6 +52,29 @@ function describeError(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+/**
+ * A one-line description of a thrown value, including its `cause` chain.
+ *
+ * `cause` is where Node puts the diagnosis a bare `TypeError: fetch failed` hides:
+ * `ECONNRESET`, `ENOTFOUND`, `CERT_HAS_EXPIRED`, a connect timeout. Without it an acquisition
+ * failure is unactionable, which is exactly the state the EffoySira run history was in
+ * (six identical `fetch failed` rows). Bounded in both depth and length because the text
+ * ends up in a log line and a bounded `errorSummary` column.
+ */
+function describeError(error: unknown, depth = 0): string {
+  const text = describeOne(error);
+  const cause = error instanceof Error ? error.cause : undefined;
+  if (cause === undefined || cause === null || depth >= MAX_CAUSE_DEPTH) {
+    return text.length <= MAX_ERROR_DESCRIPTION_LENGTH
+      ? text
+      : `${text.slice(0, MAX_ERROR_DESCRIPTION_LENGTH - 3)}...`;
+  }
+  const described = `${text} (cause: ${describeError(cause, depth + 1)})`;
+  return described.length <= MAX_ERROR_DESCRIPTION_LENGTH
+    ? described
+    : `${described.slice(0, MAX_ERROR_DESCRIPTION_LENGTH - 3)}...`;
 }
 
 export { describeError };

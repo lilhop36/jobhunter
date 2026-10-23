@@ -83,6 +83,10 @@ export function createSourceCollectionHandler(
       trigger,
       staleRunSeconds: options.staleRunSeconds,
       acquisitionTimeoutMs: options.acquisitionTimeoutMs,
+      // The source's own approved declaration (Appendix E), not a pipeline default: a source
+      // approved as RESULTS_EXPECTED must report an empty listing (AC-018) instead of
+      // recording a clean run. Absent means UNKNOWN, which never raises the signal.
+      resultExpectation: adapter.config.resultExpectation,
       signal,
     });
   };

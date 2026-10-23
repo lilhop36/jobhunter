@@ -1,5 +1,11 @@
 import { CalendarType } from '@domain/enums';
-import { DeclaredDateFormat, HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
+import type {
+  DeclaredDateFormat,
+  HealthResult,
+  NormalizedJob,
+  RawJobEvidence,
+  SourceResultExpectation,
+} from '@domain/types';
 import { WorkerLogger } from './worker-logger';
 
 /**
@@ -52,6 +58,20 @@ export interface SourceAdapterConfig {
    * `resolveSourceRecordIdentity`).
    */
   canonicalUrlIdentityTrusted: boolean;
+  /**
+   * Declares whether a run of this source is expected to find postings (SRS Appendix E,
+   * "Expected results"; AC-018).
+   *
+   * It lives beside the other approved declarations because it is one: the approval record
+   * states it, nothing derives it. `UNKNOWN` (the default when absent) never raises the
+   * unexpected-zero-result signal, which is the safe direction for a source that genuinely
+   * publishes nothing some days. A source approved as `RESULTS_EXPECTED` that returns zero
+   * must be reported, or a dead source looks healthy.
+   *
+   * Optional so a source added before this declaration existed keeps its old behaviour
+   * rather than silently inheriting an expectation nobody approved.
+   */
+  resultExpectation?: SourceResultExpectation;
   /** Adapter-specific options (feed URL, selectors, ...); opaque to the pipeline. */
   options: Readonly<Record<string, unknown>>;
 }

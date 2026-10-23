@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { SourceResultExpectation } from '@domain/types';
 import { SourceRunStatus, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
 import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { SourceScheduler } from '@application/scheduling';
@@ -262,6 +263,48 @@ describe('scheduled collection end to end', () => {
     expect(await prisma.job.count()).toBe(1);
 
     const tasks = await activeTasks(sourceId);
+    expect(tasks).toHaveLength(1);
     expect(tasks[0].status).toBe(WorkTaskStatus.SUCCEEDED);
+  });
+
+  it('reports an empty listing from a source approved to produce results (AC-018)', async () => {
+    const sourceId = await createSource('empty-expected');
+    const registry = new WorkTaskHandlerRegistry().register(
+      SOURCE_COLLECTION_TASK_TYPE,
+      createSourceCollectionHandler({
+        resolveAdapter: async (id) =>
+          new FakeSourceAdapter(
+            makeFakeConfig({
+              sourceId: id,
+              resultExpectation: SourceResultExpectation.RESULTS_EXPECTED,
+            }),
+            [],
+          ),
+        collection,
+        staleRunSeconds: STALE_SECONDS,
+        acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+        now: () => NOW,
+      }),
+    );
+    const worker = new WorkTaskWorker(
+      taskRepo,
+      registry,
+      { workerId: 'scheduler-test' },
+      silentWorkerLogger,
+    );
+
+    await makeScheduler().runOnce(NOW, SourceRunTrigger.STARTUP);
+    expect(await worker.runOnce()).toBe(true);
+
+    // The only path that supplies the approval record's expectation is the handler, so this
+    // fails if the declaration stops being forwarded: the run would read SUCCEEDED/HEALTHY.
+    const run = await prisma.sourceRun.findFirst({ where: { sourceId } });
+    expect(run).toMatchObject({
+      status: SourceRunStatus.PARTIAL,
+      unexpectedZeroResults: true,
+      jobsAccepted: 0,
+    });
+    const source = await prisma.jobSource.findUnique({ where: { id: sourceId } });
+    expect(source?.healthStatus).toBe('DEGRADED');
   });
 });

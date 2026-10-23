@@ -1,4 +1,5 @@
 import { CalendarType } from '@domain/enums';
+import { SourceResultExpectation } from '@domain/types';
 import type { JobSourceAdapter, SourceAdapterConfig } from '@ports/source-adapter';
 import { createEffoySiraAdapter } from '@infrastructure/adapters/effoysira';
 import { createEthiojobsAdapter } from '@infrastructure/adapters/ethiojobs';
@@ -51,6 +52,7 @@ export const PRODUCTION_ADAPTERS: readonly ProductionAdapterRegistration[] = [
       declaredDateFormat: null,
       declaredCurrency: null,
       canonicalUrlIdentityTrusted: true,
+      resultExpectation: SourceResultExpectation.RESULTS_EXPECTED,
       options: { delayMs: 800, maxListingPages: 2 },
     },
     create: (config) => createEffoySiraAdapter(config),
@@ -66,6 +68,7 @@ export const PRODUCTION_ADAPTERS: readonly ProductionAdapterRegistration[] = [
       declaredDateFormat: null,
       declaredCurrency: null,
       canonicalUrlIdentityTrusted: true,
+      resultExpectation: SourceResultExpectation.RESULTS_EXPECTED,
       options: { delayMs: 800, maxListingPages: 2 },
     },
     create: (config) => createEthiojobsAdapter(config),
@@ -81,6 +84,7 @@ export const PRODUCTION_ADAPTERS: readonly ProductionAdapterRegistration[] = [
       declaredDateFormat: null,
       declaredCurrency: null,
       canonicalUrlIdentityTrusted: true,
+      resultExpectation: SourceResultExpectation.RESULTS_EXPECTED,
       // robots.txt `Crawl-delay: 30` is the politeness floor: one request per 30 s, and a
       // run budget of one listing page plus six posting pages (~190 s of waiting) under
       // the 300 s acquisition bound. Freshness comes from the source's shorter schedule.
