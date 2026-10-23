@@ -36,6 +36,16 @@ import { canonicalizeUrl } from './url-normalizer';
 /** Bump with any change to the rules below. */
 export const APPLICATION_TARGET_VERSION = 'APPLICATION_TARGET_V1';
 
+/**
+ * Version stamp for a target an adapter mapped from the source's own structured fields.
+ *
+ * Separate from `APPLICATION_TARGET_V1` because it is a different policy: a declared field
+ * outranks text inference. The mapping itself stays in the adapter (ENG-016); this module
+ * owns only the validation the mapping must pass, so a malformed declared email cannot
+ * become a notifiable path.
+ */
+export const DECLARED_APPLICATION_TARGET_VERSION = 'APPLICATION_TARGET_DECLARED_V1';
+
 /** Apply-ish keywords that qualify a nearby URL or email as the application path. */
 const APPLY_CONTEXT = /\b(?:appl(?:y|ication|ications)|send|submit|email|e-mail|cv|resume|cover\s+letter)\b/iu;
 
@@ -63,7 +73,12 @@ function hasApplyContext(text: string, index: number, length: number): boolean {
   return APPLY_CONTEXT.test(text.slice(start, end));
 }
 
-function isValidEmail(value: string): boolean {
+/**
+ * Whether a declared address is a syntactically usable application email. Exported because an
+ * adapter that maps a source's own `application_email` field must apply the same check the
+ * text extractor applies; a typo in a publisher field must not become a notifiable path.
+ */
+export function isValidApplicationEmail(value: string): boolean {
   return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/iu.test(value);
 }
 
@@ -98,13 +113,13 @@ function findApplicationUrl(text: string): { url: string; evidence: string; isPd
  */
 function findApplicationEmail(text: string): { email: string; evidence: string } | null {
   const mailto = /mailto:\s*([^\s"'<>?,]+)/iu.exec(text);
-  if (mailto && isValidEmail(mailto[1])) {
+  if (mailto && isValidApplicationEmail(mailto[1])) {
     return { email: mailto[1], evidence: mailto[0].trim() };
   }
   const pattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(text)) !== null) {
-    if (!isValidEmail(match[0])) continue;
+    if (!isValidApplicationEmail(match[0])) continue;
     if (!hasApplyContext(text, match.index, match[0].length)) continue;
     return { email: match[0], evidence: match[0] };
   }

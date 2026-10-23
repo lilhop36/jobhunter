@@ -1,12 +1,14 @@
-import { HealthStatus } from '@domain/enums';
+import { ApplicationMethod, HealthStatus } from '@domain/enums';
 import type {
   CollectionContext,
   HealthCheckContext,
   JobSourceAdapter,
   SourceAdapterConfig,
 } from '@ports/source-adapter';
-import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
-import { normalizeRawEvidence } from './normalize-evidence';
+import type { ApplicationTarget, HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
+import { isValidApplicationEmail } from '@domain/normalizers/application-target';
+import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
+import { normalizeRawEvidence, type DeclaredRecordEvidence } from './normalize-evidence';
 
 /**
  * Ethiojobs (ethiojobs.net) — the second production source adapter (SRS 7.2, Appendix E;
@@ -118,6 +120,86 @@ export function createEthiojobsAdapter(
     return null;
   }
 
+  // ── declared structured fields ──────────────────────────────────────────────
+
+  /**
+   * The application target the publisher declares in its own fields.
+   *
+   * Only the methods the site emits are mapped, and only when the field that method needs is
+   * present: a declared `ATS` arrives with neither a link nor an email, so it stays UNKNOWN
+   * rather than inventing a path. `application_form` is never populated in captured records,
+   * so its shape is unknown and it is deliberately not read.
+   */
+  function mapDeclaredApplication(
+    method: string | null,
+    email: string | null,
+    careerPageLink: string | null,
+  ): ApplicationTarget | null {
+    const usableEmail = email !== null && isValidApplicationEmail(email) ? email : null;
+    const usableUrl = careerPageLink === null ? null : canonicalizeUrl(careerPageLink);
+    // The evidence names the declared basis; the values live in rawPayload and, once mapped,
+    // in their own columns, so a reviewer can check both.
+    const evidence = `application_method=${method ?? 'UNKNOWN'}`;
+    switch (method) {
+      case 'EMAIL':
+        return usableEmail === null
+          ? null
+          : {
+              method: ApplicationMethod.EMAIL,
+              applyUrl: null,
+              applyEmail: usableEmail,
+              evidence,
+            };
+      case 'CAREER_PAGE_LINK':
+        return usableUrl === null
+          ? null
+          : {
+              method: ApplicationMethod.ONLINE_URL,
+              applyUrl: usableUrl,
+              applyEmail: null,
+              evidence,
+            };
+      case 'BOTH':
+        // Same precedence as the text extractor: a direct link is the more usable path.
+        if (usableUrl !== null) {
+          return {
+            method: ApplicationMethod.ONLINE_URL,
+            applyUrl: usableUrl,
+            applyEmail: null,
+            evidence,
+          };
+        }
+        return usableEmail === null
+          ? null
+          : {
+              method: ApplicationMethod.EMAIL,
+              applyUrl: null,
+              applyEmail: usableEmail,
+              evidence,
+            };
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Source-declared fields, read back from the preserved payload. The adapter owns this
+   * mapping because the field names and method codes are Ethiojobs-specific (ENG-016);
+   * everything downstream sees only canonical evidence or nothing.
+   */
+  function declaredRecord(payload: unknown): DeclaredRecordEvidence {
+    if (payload === null || typeof payload !== 'object') return {};
+    const record = payload as Record<string, unknown>;
+    return {
+      application: mapDeclaredApplication(
+        asString(record.applicationMethod),
+        asString(record.applicationEmail),
+        asString(record.careerPageLink),
+      ),
+      deadlineText: asString(record.dateExpiry),
+    };
+  }
+
   // ── HTTP (polite: fixed UA, delay between requests, abort-aware) ────────────
 
   async function get(url: string, signal?: AbortSignal): Promise<string | null> {
@@ -173,9 +255,9 @@ export function createEthiojobsAdapter(
           rawPublishedDateText: asString(entry.date_published),
           rawSalaryText:
             descriptionHtml === null ? null : extractSalaryLine(descriptionHtml),
-          // Structured fields the publisher itself declares, preserved verbatim for a
-          // later application-target/matching policy change (owner decision
-          // 2026-10-22). Nothing below is normalized yet — see the approval record.
+          // Structured fields the publisher itself declares, preserved verbatim so
+          // `normalize` can read them back and provenance can be audited against the
+          // original record.
           rawPayload: {
             applicationMethod: entry.application_method ?? null,
             applicationEmail: entry.application_email ?? null,
@@ -206,10 +288,14 @@ export function createEthiojobsAdapter(
   }
 
   async function normalize(raw: RawJobEvidence): Promise<NormalizedJob> {
-    return normalizeRawEvidence(raw, {
-      declaredCalendar: config.declaredCalendar,
-      declaredDateFormat: config.declaredDateFormat,
-    });
+    return normalizeRawEvidence(
+      raw,
+      {
+        declaredCalendar: config.declaredCalendar,
+        declaredDateFormat: config.declaredDateFormat,
+      },
+      declaredRecord(raw.rawPayload),
+    );
   }
 
   function countEntries(html: string): number {

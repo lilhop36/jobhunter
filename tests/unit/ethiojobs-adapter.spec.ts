@@ -37,6 +37,16 @@ const LISTING_PAGE_DUP = `<!DOCTYPE html><html><body>
 
 const EMPTY_PAGE = '<!DOCTYPE html><html><body></body></html>';
 
+/** Entries whose declared fields are the only evidence of an application path. */
+const DECLARED_TARGETS_PAGE = `<!DOCTYPE html><html><body>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":[
+{"id":"c1","title":"Career Link Role","slug":"c1-career-link","state":"Addis Ababa","description":"<p>Great role.</p>","date_expiry":"2026-11-02T23:59:59.000000Z","company":{"name":"Beta"},"application_method":"CAREER_PAGE_LINK","career_page_link":"https://careers.example.com/apply/42?job=42"},
+{"id":"c2","title":"In Person Role","slug":"c2-in-person","state":"Oromia","description":"<p>Apply in person at our office.</p>","company":{"name":"Gamma"},"application_method":"EMAIL","application_email":"jobs@example.com"},
+{"id":"c3","title":"Malformed Email Role","slug":"c3-bad-email","state":"Oromia","description":"<p>Application Deadline: October 30, 2026</p>","date_expiry":"soon","company":{"name":"Delta"},"application_method":"EMAIL","application_email":"not-an-email"},
+{"id":"c4","title":"Both Role","slug":"c4-both","state":"Amhara","description":"<p>Both channels.</p>","company":{"name":"Epsilon"},"application_method":"BOTH","application_email":"both@example.com","career_page_link":"https://careers.example.com/both"}
+]}}}</script>
+</body></html>`;
+
 function fetchRouter(routes: Record<string, string | number>): typeof fetch {
   return (async (input: string | URL) => {
     const url = String(input);
@@ -159,24 +169,87 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
     expect(job.title).toBe('Senior Accountant');
     expect(job.company).toBe('Alpha Clinic');
     expect(job.locationCategory).toBe('ADDIS_ABABA');
-    // application_method EMAIL + application_email present → EMAIL target.
+    // application_method EMAIL + application_email present → EMAIL target, sourced from the
+    // declared field rather than the description's incidental address.
     expect(job.application.method).toBe('EMAIL');
+    expect(job.application.applyEmail).toBe('hr@alpha.com');
+    expect(job.provenance.applicationMethod?.conversionMethod).toBe(
+      'APPLICATION_TARGET_DECLARED_V1',
+    );
+    expect(job.provenance.applicationMethod?.evidence).toBe('application_method=EMAIL');
+    // date_expiry is a declared ISO timestamp; the shared date parser resolves it and the
+    // deadline normalizer stores it at UTC midnight.
+    expect(job.applicationDeadline.deadlineAt?.toISOString()).toBe('2026-11-02T00:00:00.000Z');
+    expect(job.applicationDeadline.evidence).toBe('2026-11-02T23:59:59.000000Z');
     expect(job.provenance.title?.provenance).toBe('SOURCE');
     expect(job.provenance.canonicalUrl?.provenance).toBe('DETERMINISTIC');
     expect(job.provenance.locationCategory?.conversionMethod).toBe('LOCATION_GAZETTEER_V1');
   });
 
-  it('leaves ATS method without in-text email as UNKNOWN (structured wiring deferred)', async () => {
+  it('maps declared career-page and both-channel records to a usable path', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
+      delay: async () => {},
+    });
+    const evidence = await adapter.collect(context());
+    const normalized = await Promise.all(evidence.map((raw) => adapter.normalize(raw)));
+    const byTitle = new Map(normalized.map((job) => [job.title, job]));
+
+    const career = byTitle.get('Career Link Role')!;
+    expect(career.application).toMatchObject({
+      method: 'ONLINE_URL',
+      applyUrl: 'https://careers.example.com/apply/42?job=42',
+      applyEmail: null,
+    });
+
+    // Both channels declared: the direct link wins, matching the text extractor's precedence.
+    const both = byTitle.get('Both Role')!;
+    expect(both.application).toMatchObject({
+      method: 'ONLINE_URL',
+      applyUrl: 'https://careers.example.com/both',
+      applyEmail: null,
+    });
+  });
+
+  it('prefers the declared method over a conflicting in-text instruction', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
+      delay: async () => {},
+    });
+    const evidence = await adapter.collect(context());
+    const raw = evidence.find((e) => e.rawTitle === 'In Person Role')!;
+    const job = await adapter.normalize(raw);
+
+    // The description says "apply in person"; the publisher's own field says EMAIL. A declared
+    // field is the stronger evidence, so the text guess does not win.
+    expect(job.application.method).toBe('EMAIL');
+    expect(job.application.applyEmail).toBe('jobs@example.com');
+  });
+
+  it('never invents a path from a malformed declared field, and still reads a stated deadline', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
+      delay: async () => {},
+    });
+    const evidence = await adapter.collect(context());
+    const raw = evidence.find((e) => e.rawTitle === 'Malformed Email Role')!;
+    const job = await adapter.normalize(raw);
+
+    expect(job.application.method).toBe('UNKNOWN');
+    // The declared `date_expiry` is "soon" (unparsable), so the labelled description deadline
+    // supplies the date instead of the declared value being trusted or the deadline dropped.
+    expect(job.applicationDeadline.deadlineAt?.toISOString()).toBe('2026-10-30T00:00:00.000Z');
+  });
+
+  it('leaves a declared ATS record with no link or email as UNKNOWN', async () => {
     const adapter = createEthiojobsAdapter(config(), {
       fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': LISTING_PAGE_1 }),
       delay: async () => {},
     });
 
     const evidence = await adapter.collect(context());
-    // Second entry is "Driver" with application_method ATS, no email in description text.
-    // The shared text-based normalizer has no evidence → UNKNOWN (honest).
-    // Wiring structured application_method/application_email into the policy is a
-    // purposefully deferred follow-up (see docs/sources/ethiojobs.md notes).
+    // Second entry is "Driver" with application_method ATS and no email in the description.
+    // No usable path is declared, so the honest state is UNKNOWN - not a fabricated target.
     const driver = evidence.find((e) => e.rawTitle === 'Driver (Bishoftu / Night Shift)')!;
     const job = await adapter.normalize(driver);
 

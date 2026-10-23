@@ -5,7 +5,13 @@ import {
   ProvenanceSource,
   SalaryType,
 } from '@domain/enums';
-import type { DeclaredDateFormat, NormalizedJob, RawJobEvidence } from '@domain/types';
+import type {
+  ApplicationTarget,
+  DeadlineParsed,
+  DeclaredDateFormat,
+  NormalizedJob,
+  RawJobEvidence,
+} from '@domain/types';
 import { parseDate } from '@domain/normalizers/calendar';
 import { classifyLocation } from '@domain/normalizers/location/location-classifier';
 import { parseSalary } from '@domain/normalizers/salary-normalizer';
@@ -21,10 +27,53 @@ import {
 import { DEADLINE_EXTRACTION_VERSION, parseDeadline } from '@domain/normalizers/deadline';
 import {
   APPLICATION_TARGET_VERSION,
+  DECLARED_APPLICATION_TARGET_VERSION,
   resolveApplicationTarget,
 } from '@domain/normalizers/application-target';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type { SourceAdapterConfig } from '@ports/source-adapter';
+
+/**
+ * Declared, source-specific evidence an adapter has already mapped to canonical shapes.
+ *
+ * Kept out of `RawJobEvidence` because it is interpretation, not capture: the raw payload
+ * stays the audit trail, and a normalizer policy change can re-derive this block.
+ */
+export interface DeclaredRecordEvidence {
+  /**
+   * A canonical target the adapter mapped from the source's own structured fields. Declared
+   * evidence outranks text inference: the publisher stated it, a regex only guessed it. The
+   * adapter owns the mapping because the field names and codes are source-specific (ENG-016).
+   */
+  application?: ApplicationTarget | null;
+  /**
+   * Deadline text the source declares structurally (an ISO expiry, say). Parsed by the same
+   * shared date parser as every other date, so no format is guessed.
+   */
+  deadlineText?: string | null;
+}
+
+/** A declared deadline, or null when the text is absent or not a parsable date. */
+function parseDeclaredDeadline(
+  text: string | null | undefined,
+  declared: { declaredCalendar: CalendarType; declaredDateFormat: DeclaredDateFormat | null },
+): DeadlineParsed | null {
+  if (typeof text !== 'string' || text.trim() === '') return null;
+  const parsed = parseDate({
+    text,
+    sourceCalendarHint: declared.declaredCalendar,
+    declaredDateFormat: declared.declaredDateFormat,
+    // A deadline is an absolute date the publisher stated; there is no relative reference to
+    // resolve, and offering the collection time would let "in two weeks" invent one.
+    collectedAt: null,
+  });
+  if (parsed.publishedAt === null) return null;
+  return {
+    deadlineAt: parsed.publishedAt,
+    evidence: text,
+    conversionMethod: parsed.conversionMethod,
+  };
+}
 
 /**
  * The `normalize` half of the adapter contract (SRS 3.5, ENG-016): map raw evidence to
@@ -38,6 +87,7 @@ import type { SourceAdapterConfig } from '@ports/source-adapter';
 export async function normalizeRawEvidence(
   raw: RawJobEvidence,
   declared: { declaredCalendar: CalendarType; declaredDateFormat: DeclaredDateFormat | null },
+  record: DeclaredRecordEvidence = {},
 ): Promise<NormalizedJob> {
   const canonicalUrl = canonicalizeUrl(raw.sourceUrl);
   const location = classifyLocation({ text: raw.rawLocation });
@@ -46,17 +96,27 @@ export async function normalizeRawEvidence(
     title: raw.rawTitle,
     description: raw.rawDescription,
   });
-  const application = resolveApplicationTarget({
+  const extractedApplication = resolveApplicationTarget({
     title: raw.rawTitle,
     description: raw.rawDescription,
   });
+  const declaredApplication =
+    record.application && record.application.method !== ApplicationMethod.UNKNOWN
+      ? record.application
+      : null;
+  const application = declaredApplication ?? extractedApplication;
   // Read from the description's own labelled text; a source that states no deadline leaves
-  // this UNKNOWN, which is not the same claim as "the posting never closes".
-  const applicationDeadline = parseDeadline({
+  // this UNKNOWN, which is not the same claim as "the posting never closes". A deadline the
+  // source declares structurally (a `date_expiry` field) is stronger evidence than a text
+  // scan, so it wins; an unparsable declared value falls back to the text rather than
+  // discarding a deadline the description states.
+  const extractedDeadline = parseDeadline({
     description: raw.rawDescription,
     sourceCalendarHint: declared.declaredCalendar,
     declaredDateFormat: declared.declaredDateFormat,
   });
+  const applicationDeadline =
+    parseDeclaredDeadline(record.deadlineText, declared) ?? extractedDeadline;
 
   // Delegated to the shared versioned fingerprint module (ENG-016, ADR-0001). Unlike
   // `rawContentHash`, an all-absent record yields null rather than a digest of nothing:
@@ -168,22 +228,29 @@ export async function normalizeRawEvidence(
     };
   }
   if (application.method !== ApplicationMethod.UNKNOWN) {
+    // The version records which policy produced the target: text inference or a source's own
+    // declared field. Both are deterministic derivations, not source-stated canon, because a
+    // source code was mapped to a canonical enum.
+    const applicationVersion =
+      declaredApplication === null
+        ? APPLICATION_TARGET_VERSION
+        : DECLARED_APPLICATION_TARGET_VERSION;
     provenance.applicationMethod = {
       provenance: ProvenanceSource.DETERMINISTIC,
-      conversionMethod: APPLICATION_TARGET_VERSION,
+      conversionMethod: applicationVersion,
       evidence: application.evidence,
     };
     if (application.applyUrl !== null) {
       provenance.applyUrl = {
         provenance: ProvenanceSource.DETERMINISTIC,
-        conversionMethod: APPLICATION_TARGET_VERSION,
+        conversionMethod: applicationVersion,
         evidence: application.evidence,
       };
     }
     if (application.applyEmail !== null) {
       provenance.applyEmail = {
         provenance: ProvenanceSource.DETERMINISTIC,
-        conversionMethod: APPLICATION_TARGET_VERSION,
+        conversionMethod: applicationVersion,
         evidence: application.evidence,
       };
     }

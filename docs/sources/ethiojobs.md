@@ -47,17 +47,22 @@ found no clause that blocks this collection.
   - Salary: no salary fields exist in the structured record; a colon/period salary line
     inside the description text ("Salary. Negotiable.") is the only in-text evidence,
     lifted as `rawSalaryText`.
-  - `application_method`/`application_email` are structured fields, but the shared
-    application-target policy is text-based (`APPLICATION_TARGET_VERSION`); ATS postings
-    whose description carries no email/URL yield UNKNOWN and are therefore records with
-    no usable application path (legitimately not notifiable). Wiring the structured
-    fields into the versioned policy is a purposefully deferred follow-up change.
+  - `application_method`/`application_email`/`career_page_link` are structured fields and are
+    now mapped by the adapter itself (2026-10-23): `EMAIL` → `EMAIL` + `applyEmail`,
+    `CAREER_PAGE_LINK` → `ONLINE_URL` + `applyUrl`, `BOTH` → the link (same precedence as
+    the text extractor). Observed split of the 24 captured postings: 13 `EMAIL`, 5
+    `CAREER_PAGE_LINK`, 5 `ATS`, 1 `BOTH`. `ATS` arrives with neither a link nor an email,
+    so those 5 stay UNKNOWN — an honest "no usable path", not an invented one.
+  - `date_expiry` is now parsed with the shared date parser and stored as
+    `applicationDeadline` when no labelled description deadline outranks it (2026-10-23).
+    A malformed declared value falls back to the description text instead of being trusted.
 - **Structured capture (rawPayload):** the listing's structured non-text fields —
   `application_method`, `application_email`, `date_expiry`, `level`, `location_type`,
   `type`, category names, company email, opaque internal `id` — are preserved verbatim in
-  `rawPayload` for later policy use and debugging; nothing is normalized from them yet
-  (owner decision 2026-10-22: matcher wiring for skills/employment is a separate
-  sign-off-gated increment).
+  `rawPayload` for debugging and reprocessing. Application method/email/link and expiry are
+  read back by `normalize` through the adapter's own mapping (ENG-016); `level`,
+  `location_type`, `type` and categories stay raw until the sign-off-gated matcher wiring
+  (owner decision 2026-10-22).
 - The job pages additionally embed a schema.org `JobPosting` `ld+json` block (title,
   description, employmentType, location, datePosted, `validThrough`, hiring organization);
   captured as well when the posting page is fetched, but the listing record is the
@@ -72,9 +77,10 @@ found no clause that blocks this collection.
   ADDIS_ABABA / ETHIOPIA_REGION, `date_published` parsed, description quality SUFFICIENT,
   employment type FULL_TIME where the description states it and UNKNOWN otherwise, salary
   UNKNOWN (no structured salary), application target UNKNOWN on the sample postings (their
-  descriptions carry no in-text email/URL; ATS postings have no text evidence — see the
-  deferred structured-field wiring above). Matcher scored all 24; no notification was
-  reserved because the eligibility gates (minScore 60, minConfidence 45) were not both met —
+  descriptions carry no in-text email/URL; the declared fields are read only since the
+  2026-10-23 mapping change, so the next run updates those rows in place). Matcher scored
+  all 24; no notification was reserved because the eligibility gates (minScore 60,
+  minConfidence 45) were not both met —
   the highest scores were 72/confidence 33 and 50/confidence 47.
 - **Operational note:** on a host that reaches the internet only through an HTTP proxy,
   Node's `fetch` ignores `HTTP_PROXY`/`HTTPS_PROXY` unless the worker is started with
