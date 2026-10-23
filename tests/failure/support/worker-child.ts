@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { WorkTaskHandlerRegistry, WorkTaskWorker } from '@application/worker';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
 import { BLOCKING_TASK_TYPE, KILLED_WORKER_HEARTBEAT_MS, KILLED_WORKER_LEASE_SECONDS } from './failure-fixtures';
+import { requireTestDatabaseUrl } from '../../support/db';
 
 /**
  * Child-process harness for the abrupt-kill failure test (AC-014, ENG-031).
@@ -16,8 +17,9 @@ import { BLOCKING_TASK_TYPE, KILLED_WORKER_HEARTBEAT_MS, KILLED_WORKER_LEASE_SEC
  * exactly as a crashed worker would.
  */
 async function main(): Promise<void> {
-  const databaseUrl = process.env.TEST_DATABASE_URL;
-  if (!databaseUrl) throw new Error('TEST_DATABASE_URL is required');
+  // Fails closed for a URL that is not a dedicated disposable database, like every
+  // other entry point: a direct invocation must not run a real worker against dev data.
+  const databaseUrl = requireTestDatabaseUrl();
 
   const workerId = process.env.FAILURE_WORKER_ID ?? 'failure-child';
   const leaseSeconds = Number(process.env.FAILURE_LEASE_SECONDS ?? KILLED_WORKER_LEASE_SECONDS);
