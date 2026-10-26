@@ -1,6 +1,7 @@
 # SRS ↔ Implementation Drift Report
 
 **Date:** 2026-10-23
+**Last updated:** 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill (2026-10-25), migration count refreshed.
 **Baseline commit:** `31db910` (working tree clean except untracked `.freebuff/`)
 **Authoritative specification:** `docs/SRS/JobHunter-v1.1-SRS.md`
 **Method:** read-only inspection of the SRS, schema, migrations, routes, domain/application/infrastructure code, tests and docs. No SRS, schema or code was changed to produce this report. Nothing was executed against a real source or Telegram.
@@ -19,7 +20,7 @@ One internal inconsistency remains inside v1.1: the Document Control row still s
 
 - **API:** Fastify 4 (not NestJS, which §2.5 and §7.2 name), one process, loopback-bound by default.
 - **Worker:** separate Node.js process; PostgreSQL-backed `WorkTask` queue with `SKIP LOCKED` claiming, lease tokens and expiry reaping.
-- **Database:** PostgreSQL, 12 versioned migrations, Prisma schema plus hand-written partial indexes.
+- **Database:** PostgreSQL, 14 versioned migrations, Prisma schema plus hand-written partial indexes.
 - **Web:** server-rendered HTML, no client JavaScript, CSP `default-src 'none'`.
 - **Telegram:** outbox → dispatcher → `sendMessage`, plain text, retry/backoff, 429 `retry_after`.
 - **Sources:** 3 approved adapters — Ethiojobs, JobWebEthiopia, Effoysira (AC-001 met: 3, the SRS minimum of "3–5").
@@ -88,7 +89,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
 | D8 | FR-008 "detect duplicates using multiple signals"; AC-005 | **PARTIAL** | Dedupe is **source-scoped**: `Job` is unique on `(sourceId, identityKey)`, and the schema comment states the same listing in two sources stays two Jobs. Cross-source duplicates are not detected. | intentional (ADR-0001) | high |
-| D9 | FR-019 / Appendix A `NOT_FOUND`; AC-018 | **PARTIAL** | `ACTIVE/EXPIRED/REMOVED` implemented; `NOT_FOUND` is never set (no dead-link probe). `SweepSourceLifecycle` exists but is **not wired** into the worker, so `REMOVED` is also unreachable in production. | intentional deferral | medium |
+| D9 | FR-019 / Appendix A `NOT_FOUND`; AC-018 | **PARTIAL** | `ACTIVE/EXPIRED/REMOVED` implemented; the presence sweep is now wired after a coverage-claiming run under `LIFECYCLE_V2` (ADR-0010), but it retires only Jobs published strictly inside the part of the listing a run actually read. `NOT_FOUND` is never set (no dead-link probe). | intentional deferral (`NOT_FOUND` only) | medium |
 | D10 | FR-006 "verify application targets" | **PARTIAL** | URLs are normalised and an application method is required for notification, but no URL is ever fetched to verify it resolves. | intentional (bundled with D9) | medium |
 | D11 | FR-001/FR-002/FR-003, §7.7 pipeline | **MATCH** | Adapter registry, per-source exclusivity, SourceRun counters, unexpected-zero-result flag, isolation per source task. | intentional | low |
 | D12 | §7.7 step 10 "schedule enrichment/matching work" | **MATCH** | `run-source-collection.ts:482` enqueues matching and records `enrichmentScheduled`. The schema comment claiming "no registered handler yet" is stale. | accidental (comment only) | low |
@@ -113,7 +114,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
-| D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **MISSING** | No `BackupRun` model, no backup script, no restore drill. | not built | high |
+| D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **PARTIAL** | `scripts/backup.mjs` (validated custom-format dump) and `scripts/restore-drill.mjs` (restores into a disposable database, compares table sets and exact row counts, drops it in a `finally` block) exist and passed on 2026-10-25: 17/17 tables, 484/484 rows. Restore, scheduling and retention are documented in `docs/engineering/backup-and-restore.md`. No `BackupRun` model (intentional, §7); no schedule or off-machine copy is installed yet — those are deployment steps. | deployment step | medium |
 | D20 | FR-020 / §7.8 source metrics and drift detection | **MATCH** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health. AI metrics N/A with D17. Funnel view (collected→…→notified) is not a page. | intentional | low |
 | D21 | AC-020 14-day precision | **MISSING** | No measurement tooling or log; feedback storage exists, so this is process, not code. | not started | high |
 
@@ -123,7 +124,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | --- | --- | --- | --- | --- | --- |
 | D22 | §2.5/§7.2 "Backend API: NestJS" | **DIVERGENT** | Fastify. `docs/architecture/architecture.md` is a **placeholder** ("Status: Placeholder"), so no ADR records the substitution. | accidental (undocumented) | medium |
 | D23 | ENG-015 "dependency direction enforced by an automated check in continuous integration" | **MISSING** | Direction is respected in practice but nothing enforces it: no layering test, and **no CI configuration at all** (no `.github/`). | accidental | medium |
-| D24 | ENG-020 versioned migrations; ENG-021 DB invariants guarded by tests | **MATCH** | 12 migrations; partial unique indexes covered by `tests/integration/partial-indexes.spec.ts`. | intentional | low |
+| D24 | ENG-020 versioned migrations; ENG-021 DB invariants guarded by tests | **MATCH** | 14 migrations; partial unique indexes covered by `tests/integration/partial-indexes.spec.ts`. | intentional | low |
 | D25 | ENG-023/024/025/026 durable work | **MATCH** | SKIP LOCKED claim, per-claim lease token, attempt-on-claim, reaping, `FAILED`/`DEAD_LETTER` retained. | intentional | low |
 | D26 | ENG-028 numeric units | **MATCH** | `Percent` and `Probability` are distinct branded types; DB uses exact `Decimal`. | intentional | low |
 | D27 | ENG-031 failure tests | **PARTIAL** | Worker kill, SIGTERM, source timeout and zero-result are covered; AI timeout/invalid output cannot be (D17); dead-URL recovery cannot be (D9). | depends on D9/D17 | low |
@@ -133,7 +134,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 
 | ID | SRS | Status | Evidence |
 | --- | --- | --- | --- |
-| D29 | §5.1 entities present | **PARTIAL** | Present: User, CandidateProfile, CandidateSkill, TargetRole, LocationPreference, JobSource, SourceRun, RawJob, Job, JobMatch, NotificationOutbox, NotificationFeedback, SystemLog. Missing: **JobSkill, AiAnalysisRequest, AiEvidence, BackupRun**. WorkTask, TelegramLinkToken, TelegramDestination, NotificationOutbox.event are engineering additions (Appendix E covers WorkTask and the event key). |
+| D29 | §5.1 entities present | **PARTIAL** | Present: User, CandidateProfile, CandidateSkill, TargetRole, LocationPreference, JobSource, SourceRun, RawJob, Job, JobMatch, NotificationOutbox, NotificationFeedback, SystemLog. Missing: **JobSkill, AiAnalysisRequest, AiEvidence**; `BackupRun` is deliberately omitted (D19 records backups as archives, not rows). WorkTask, TelegramLinkToken, TelegramDestination, NotificationOutbox.event are engineering additions (Appendix E covers WorkTask and the event key). |
 | D30 | Appendix A `SalaryPeriod` | **DIVERGENT** | Implementation adds `OTHER`; the SRS allows HOUR/DAY/WEEK/MONTH/YEAR/UNKNOWN. Rendered as "period stated by the source". | intentional | low |
 | D31 | §5.2 required Job columns | **MATCH** | All listed columns exist; additions (`identityKey`, `provenance`, `applicationDeadline`) are documented in the schema. | intentional | low |
 
@@ -161,7 +162,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | AC-016 no duplicate events | **PASS** | unique event key |
 | AC-017 classify delivered alerts | **PARTIAL** | API + storage only; no button, no web form (D13) |
 | AC-018 zero-result visibility | **PASS** | `unexpectedZeroResults` + dashboard |
-| AC-019 backup restorable | **FAIL (not built)** | D19 |
+| AC-019 backup restorable | **PASS (verified 2026-10-25)** | D19; fresh and existing-archive drills restored 17 tables / 484 rows and dropped the disposable database |
 | AC-020 14-day precision | **FAIL (not started)** | D21 |
 
 ---
@@ -192,11 +193,11 @@ Ordered by cost, not importance; each is independently reviewable.
 | D22 Fastify vs NestJS | One ADR: "Fastify is the API framework" (framework substitution), with the SRS §2.5 line flagged for v1.2. No code change. |
 | D23 no layering check | One test that imports every domain file and asserts it imports no `@infrastructure`/`@adapters`/`@app`, plus the reverse for infrastructure. No CI account needed. |
 | D30 `OTHER` | Either remove `OTHER` or add it to a v1.2 Appendix A note; it is already rendered explicitly. |
-| D9 `REMOVED`/`NOT_FOUND` | Wire `SweepSourceLifecycle` behind an explicit ADR (presence sweep has the same HTTP-budget question as the dead-link probe); add `NOT_FOUND` only with that ADR. |
+| D9 `NOT_FOUND` | The presence sweep is wired (ADR-0010). Add `NOT_FOUND` only with an ADR for the dead-link probe; `REMOVED` needs no further work. |
 | D13 feedback actions | Ship `reply_markup` buttons **only if** callback handling is added; otherwise state plainly that feedback is web/API-only and stop calling AC-017 met. |
 | D8 cross-source dedupe | Write the ADR that decides whether cross-source merging is in scope; do not change the key before that decision. |
 | D17/D18 AI | Leave deferred. The milestone is M4; nothing else depends on it. |
-| D19 backup | One `scripts/backup.mjs` (`pg_dump` to file) + one restore drill in a disposable database, recorded. No `BackupRun` model needed for a single-operator MVP. |
+| D19 backup | **Done 2026-10-25** — scripts plus a recorded restore drill (17 tables / 484 rows). Remaining deployment steps: install a schedule and an off-machine copy, then run the drill against it. No `BackupRun` model is needed for a single-operator MVP. |
 | D21 precision | Spreadsheet, not code. |
 | D1 API auth | Decide the trust boundary first (see §8); the code change follows the decision. |
 
@@ -213,6 +214,6 @@ Ordered by cost, not importance; each is independently reviewable.
 
 ## 9. Limits of this report
 
-- Not executed in this pass: live source collection, live Telegram delivery, a restore drill. Statuses for AC-001/AC-002/AC-015 rely on earlier recorded runs plus the current code and tests.
+- Not executed in this pass: live source collection, live Telegram delivery. A restore drill **was** executed on 2026-10-25 (D19). Statuses for AC-001/AC-002/AC-015 rely on earlier recorded runs plus the current code and tests; AC-019 is backed by the 2026-10-25 drill record in `docs/engineering/backup-and-restore.md`.
 - The SRS is internally inconsistent in two places: Document Control status (`Draft`) vs header (`Implementation Baseline`), and §8.1 "seeded user shall be authenticated" vs §3.4 defining endpoints with no authentication. Both are recorded here rather than resolved.
 - No claim is made that the drift register is exhaustive; it covers every requirement with a concrete implementation counterpart.
