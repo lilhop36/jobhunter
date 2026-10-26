@@ -26,7 +26,9 @@ function config(overrides: Partial<SourceAdapterConfig> = {}) {
   });
 }
 
-function listingPage(urls: string[]): string {
+function listingPage(urls: string[], options: { hasNext?: boolean } = {}): string {
+  // `rel="next"` is the pagination signal the live pages carry; it is what the adapter
+  // reads to know the listing ended (2026-10-24 live check).
   return `<!doctype html><html><body>
 <nav><a href="https://effoysira.com/category/job/">Jobs</a></nav>
 <div class="entries">${urls
@@ -35,6 +37,7 @@ function listingPage(urls: string[]): string {
         `<article><h2 class="entry-title"><a href="${url}" rel="bookmark">Some Title</a></h2></article>`,
     )
     .join('\n')}</div>
+${options.hasNext === true ? '<link rel="next" href="https://effoysira.com/category/job/page/2/" />' : ''}
 </body></html>`;
 }
 
@@ -74,7 +77,7 @@ const POST_2 = 'https://effoysira.com/addis-bank-job-vacancy-2026/';
 function makeRoutes(): Record<string, string | number> {
   const post = postPage();
   return {
-    'https://effoysira.com/category/job/': listingPage([POST_1, POST_2]),
+    'https://effoysira.com/category/job/': listingPage([POST_1, POST_2], { hasNext: true }),
     'https://effoysira.com/category/job/page/2/': listingPage([POST_2, POST_1]),
     [POST_1]: post,
     [POST_2]: post,
@@ -98,7 +101,7 @@ describe('EffoySira adapter — collect (fixture HTML, no network)', () => {
       delay: noDelay,
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
 
     expect(evidence).toHaveLength(2);
     const first = evidence[0];
@@ -132,7 +135,7 @@ describe('EffoySira adapter — collect (fixture HTML, no network)', () => {
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     // The nested ad div must not truncate the description.
     expect(evidence[0]?.rawDescription).toContain('Deadline: October 20, 2026');
   });
@@ -159,7 +162,7 @@ ${adSlot}
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence[0]?.rawTitle).toBe('MSA Trading Vacancy Fresh Graduates');
     expect(evidence[0]?.rawDescription).toContain('MSA Trading PLC would like');
     expect(evidence[0]?.rawDescription).toContain('How to Apply: send your CV to hr@example.com');
@@ -172,14 +175,14 @@ ${adSlot}
   it('deduplicates a post linked on two listing pages', async () => {
     const adapter = createEffoySiraAdapter(config(), {
       fetchImpl: fetchRouter({
-        'https://effoysira.com/category/job/': listingPage([POST_1]),
+        'https://effoysira.com/category/job/': listingPage([POST_1], { hasNext: true }),
         'https://effoysira.com/category/job/page/2/': listingPage([POST_1]),
         [POST_1]: postPage(),
       }),
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence).toHaveLength(1);
   });
 
@@ -189,7 +192,11 @@ ${adSlot}
       delay: async () => {},
     });
 
-    await expect(adapter.collect(context())).resolves.toEqual([]);
+    await expect(adapter.collect(context())).resolves.toEqual({
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
   });
 
   it('skips an unreachable post but still collects the reachable one', async () => {
@@ -202,7 +209,7 @@ ${adSlot}
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence).toHaveLength(1);
     expect(evidence[0]?.sourceUrl).toBe(POST_2);
   });
@@ -221,7 +228,7 @@ ${adSlot}
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context({ signal: controller.signal }));
+    const { records: evidence } = await adapter.collect(context({ signal: controller.signal }));
     expect(evidence).toHaveLength(1);
   });
 
@@ -235,8 +242,116 @@ ${adSlot}
     });
 
     await adapter.collect(context());
-    // page1 -> page2, post1, post2 (no trailing delay after the last page's loop).
-    expect(delays).toBe(3);
+    // page1 -> page2, page2 -> end probe, then after each of the two posts.
+    expect(delays).toBe(4);
+  });
+});
+
+describe('EffoySira adapter — catalogue coverage (FR-019)', () => {
+  it('reports the listing exhausted when the last page has no next link', async () => {
+    const adapter = createEffoySiraAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1]),
+        [POST_1]: postPage(),
+      }),
+      delay: async () => {},
+    });
+
+    await expect(adapter.collect(context())).resolves.toMatchObject({
+      catalogueExhausted: true,
+    });
+  });
+
+  it('stops at the listing end instead of requesting a page that does not exist', async () => {
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 3, delayMs: 0 } }), {
+      // Page 1 of 2: no next link, so page 2 must never be requested (it would 404 live).
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1]),
+        [POST_1]: postPage(),
+      }),
+      delay: async () => {},
+    });
+
+    const { records, catalogueExhausted } = await adapter.collect(context());
+    expect(catalogueExhausted).toBe(true);
+    expect(records).toHaveLength(1);
+  });
+
+  it('does not report coverage when the page budget stops before the end', async () => {
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1], { hasNext: true }),
+        [POST_1]: postPage(),
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.records).toHaveLength(1);
+    // The post's date still describes the window the run read.
+    expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-17T00:00:00.000Z'));
+  });
+
+  it('reports the oldest publication date the capped run read', async () => {
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1, POST_2], { hasNext: true }),
+        [POST_1]: postPage({ published: '2026-10-17T09:57:17+00:00' }),
+        [POST_2]: postPage({ published: '2026-10-09T12:00:00+00:00' }),
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-09T00:00:00.000Z'));
+  });
+
+  it('makes no window claim when a post it read carries no parseable date', async () => {
+    const undated = postPage().replace(
+      /<meta property="article:published_time"[^>]*\/>/,
+      '',
+    );
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1], { hasNext: true }),
+        [POST_1]: undated,
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    // An undated entry could be the oldest one read, so the floor would be a guess.
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('makes no window claim when a listed post could not be read', async () => {
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1, POST_2], { hasNext: true }),
+        [POST_1]: postPage(),
+        [POST_2]: 500,
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('does not report coverage from an unreachable listing', async () => {
+    const adapter = createEffoySiraAdapter(config(), {
+      fetchImpl: fetchRouter({ 'https://effoysira.com/category/job/': 503 }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result).toEqual({
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
   });
 });
 
@@ -247,7 +362,8 @@ describe('EffoySira adapter — normalize delegates to domain normalizers (ENG-0
       delay: async () => {},
     });
 
-    const [raw] = await adapter.collect(context());
+    const { records } = await adapter.collect(context());
+    const [raw] = records;
     const job = await adapter.normalize(raw);
 
     expect(job.canonicalUrl).toBe(canonicalizeUrl(POST_1));

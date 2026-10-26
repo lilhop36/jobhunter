@@ -19,7 +19,7 @@ import {
 } from '@application/matching';
 import type { JobRepository } from '@ports/job-repository';
 import type { RawJobRepository } from '@ports/raw-job-repository';
-import type { JobSourceAdapter } from '@ports/source-adapter';
+import type { CollectionResult, JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
 import type { WorkTaskRepository } from '@ports/work-task-repository';
 import type { WorkerLogger } from '@ports/worker-logger';
@@ -250,7 +250,7 @@ export class RunSourceCollection {
       trigger: input.trigger,
     });
 
-    let records: RawJobEvidence[];
+    let collection: CollectionResult;
 
     // SRS 9.5 / ENG-031: acquisition is bounded. The bound is enforced here, at the
     // boundary that owns run finalization, not inside the adapter, so a non-cooperative
@@ -293,9 +293,13 @@ export class RunSourceCollection {
               sourceId,
               runId: run.id,
               timeoutMs: input.acquisitionTimeoutMs,
-              records: value.length,
+              records: value.records.length,
             });
-            return [] as RawJobEvidence[];
+            return {
+              records: [],
+              catalogueExhausted: false,
+              oldestListingPublishedAt: null,
+            } satisfies CollectionResult;
           }
           return value;
         },
@@ -307,12 +311,16 @@ export class RunSourceCollection {
               timeoutMs: input.acquisitionTimeoutMs,
               error: describeError(error),
             });
-            return [] as RawJobEvidence[];
+            return {
+              records: [],
+              catalogueExhausted: false,
+              oldestListingPublishedAt: null,
+            } satisfies CollectionResult;
           }
           throw error;
         },
       );
-      records = await Promise.race([observed, timeout]);
+      collection = await Promise.race([observed, timeout]);
     } catch (error) {
       if (timedOut) {
         // The bound elapsed. It is an acquisition failure, so it is counted once in the
@@ -321,6 +329,8 @@ export class RunSourceCollection {
         return this.finish(run, funnel, {
           status: SourceRunStatus.FAILED,
           unexpectedZeroResults: false,
+          catalogueExhausted: false,
+          oldestListingPublishedAt: null,
           attributableToSource: true,
           errorSummary:
             `source acquisition timed out after ${input.acquisitionTimeoutMs}ms; ` +
@@ -333,6 +343,8 @@ export class RunSourceCollection {
         return this.finish(run, funnel, {
           status: SourceRunStatus.PARTIAL,
           unexpectedZeroResults: false,
+          catalogueExhausted: false,
+          oldestListingPublishedAt: null,
           attributableToSource: false,
           errorSummary: 'collection aborted during acquisition (worker shutdown)',
         });
@@ -344,6 +356,8 @@ export class RunSourceCollection {
       return this.finish(run, funnel, {
         status: SourceRunStatus.FAILED,
         unexpectedZeroResults: false,
+        catalogueExhausted: false,
+        oldestListingPublishedAt: null,
         attributableToSource: true,
         errorSummary: `source acquisition failed: ${describeError(error)}`,
       });
@@ -352,6 +366,7 @@ export class RunSourceCollection {
       externalSignal?.removeEventListener('abort', onExternalAbort);
     }
 
+    const records = collection.records;
     funnel.collected = records.length;
     let abortedAt: number | null = null;
 
@@ -458,6 +473,11 @@ export class RunSourceCollection {
     return this.finish(run, funnel, {
       status,
       unexpectedZeroResults,
+      // Coverage is only claimable when the run finished reading the listing; a run that
+      // aborted part-way leaves both the end and the window floor uncertain.
+      catalogueExhausted: collection.catalogueExhausted && abortedAt === null,
+      oldestListingPublishedAt:
+        abortedAt === null ? collection.oldestListingPublishedAt : null,
       // A run that only ended because the worker shut down is not the source's doing.
       attributableToSource: abortedAt === null,
       errorSummary: notes.length === 0 ? null : bound(notes.join('; ')),
@@ -470,6 +490,10 @@ export class RunSourceCollection {
     outcome: {
       status: TerminalRunStatus;
       unexpectedZeroResults: boolean;
+      /** Whether the run read its source's listing to the end (FR-019 evidence basis). */
+      catalogueExhausted: boolean;
+      /** Oldest listing publication date the run read, or null when it claims no window. */
+      oldestListingPublishedAt: Date | null;
       /** False when the run ended because of the worker (shutdown), not the source. */
       attributableToSource: boolean;
       errorSummary: string | null;
@@ -492,6 +516,8 @@ export class RunSourceCollection {
       parseFailures: funnel.parseFailures,
       httpFailures: funnel.httpFailures,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
+      catalogueExhausted: outcome.catalogueExhausted,
+      oldestListingPublishedAt: outcome.oldestListingPublishedAt,
       enrichmentScheduled,
       errorSummary: outcome.errorSummary,
     };

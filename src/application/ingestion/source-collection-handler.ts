@@ -1,6 +1,11 @@
-import { SourceRunTrigger } from '@domain/enums';
+import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 import type { JobSourceAdapter } from '@ports/source-adapter';
-import { PermanentWorkTaskError, type WorkTaskHandler } from '@application/worker';
+import type { WorkerLogger } from '@ports/worker-logger';
+import {
+  PermanentWorkTaskError,
+  describeError,
+  type WorkTaskHandler,
+} from '@application/worker';
 import { RunSourceCollection } from './run-source-collection';
 
 /**
@@ -54,10 +59,19 @@ export interface SourceCollectionHandlerOptions {
    */
   resolveAdapter: (sourceId: string) => Promise<JobSourceAdapter | null>;
   collection: RunSourceCollection;
-  /** Safety bound for abandoned runs, forwarded to `RunSourceCollection` (ENG-025). */
-  staleRunSeconds: number;
   /** Upper bound on a single acquisition, forwarded to `RunSourceCollection` (ENG-031). */
   acquisitionTimeoutMs: number;
+  /** Safety bound for abandoned runs, forwarded to `RunSourceCollection` (ENG-025). */
+  staleRunSeconds: number;
+  /**
+   * Post-collection lifecycle sweep (FR-019). Called only after a run that finished
+   * `SUCCEEDED` and made a coverage claim — read the listing to the end, or at least read a
+   * dated window of it. Every other run says nothing about what it did not see. Absent means
+   * the sweep never runs.
+   */
+  sweep?: (sourceId: string) => Promise<{ retired: number; restored: number; examined: number }>;
+  /** Optional logger for the sweep outcome; absent means silent. */
+  logger?: WorkerLogger;
   /** Injected clock (ENG-012). Defaults to the wall clock. */
   now?: () => Date;
 }
@@ -77,7 +91,7 @@ export function createSourceCollectionHandler(
     if (adapter === null) {
       throw new PermanentWorkTaskError(`no adapter is configured for source ${sourceId}`);
     }
-    await options.collection.run({
+    const result = await options.collection.run({
       adapter,
       now: now(),
       trigger,
@@ -89,5 +103,35 @@ export function createSourceCollectionHandler(
       resultExpectation: adapter.config.resultExpectation,
       signal,
     });
+
+    // FR-019: reconcile lifecycles against this run's coverage. Only a SUCCEEDED run that
+    // made a coverage claim may retire anything; every other run says nothing about what it
+    // did not see. A sweep failure must not turn a good run into a retried task — the
+    // collection data is durable and the next covered run sweeps again.
+    if (
+      options.sweep &&
+      result.run !== null &&
+      result.status === SourceRunStatus.SUCCEEDED &&
+      (result.run.catalogueExhausted || result.run.oldestListingPublishedAt !== null)
+    ) {
+      try {
+        const swept = await options.sweep(result.run.sourceId);
+        if (swept.retired > 0 || swept.restored > 0) {
+          options.logger?.info('lifecycle sweep retired stale jobs', {
+            sourceId,
+            runId: result.run.id,
+            retired: swept.retired,
+            restored: swept.restored,
+            examined: swept.examined,
+          });
+        }
+      } catch (error) {
+        options.logger?.warn('lifecycle sweep failed after a complete collection', {
+          sourceId,
+          runId: result.run.id,
+          error: describeError(error),
+        });
+      }
+    }
   };
 }

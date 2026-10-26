@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { RunSourceCollection } from '@application/ingestion';
 import { HealthStatus, SourceRunStatus } from '@domain/enums';
 import { SourceResultExpectation, type RawJobEvidence } from '@domain/types';
-import type { CollectionContext } from '@ports/source-adapter';
+import type { CollectionContext, CollectionResult } from '@ports/source-adapter';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
@@ -35,7 +35,7 @@ const ACQUISITION_TIMEOUT_MS = 30_000;
 
 /** Fails acquisition, the way an unreachable source does. */
 class FailingAdapter extends FakeSourceAdapter {
-  override async collect(_context: CollectionContext): Promise<RawJobEvidence[]> {
+  override async collect(_context: CollectionContext): Promise<CollectionResult> {
     throw new Error('connection reset by peer');
   }
 }
@@ -45,8 +45,8 @@ class FailingAdapter extends FakeSourceAdapter {
  * acquisition bound can end this run - the adapter itself never settles.
  */
 class HangingAdapter extends FakeSourceAdapter {
-  override collect(_context: CollectionContext): Promise<RawJobEvidence[]> {
-    return new Promise<RawJobEvidence[]>(() => undefined);
+  override collect(_context: CollectionContext): Promise<CollectionResult> {
+    return new Promise<CollectionResult>(() => undefined);
   }
 }
 
@@ -55,12 +55,12 @@ class HangingAdapter extends FakeSourceAdapter {
  * run already terminal and discards its outcome - exactly what a reaped stale run does.
  */
 class ReapingAdapter extends FakeSourceAdapter {
-  override async collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+  override async collect(context: CollectionContext): Promise<CollectionResult> {
     await prisma.sourceRun.update({
       where: { id: context.sourceRunId },
       data: { status: SourceRunStatus.FAILED, finishedAt: NOW, errorSummary: 'lease expired' },
     });
-    return [];
+    return { records: [], catalogueExhausted: false, oldestListingPublishedAt: null };
   }
 }
 

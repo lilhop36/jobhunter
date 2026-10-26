@@ -1,6 +1,8 @@
 import { HealthStatus } from '@domain/enums';
+import { parseDate } from '@domain/normalizers/calendar';
 import type {
   CollectionContext,
+  CollectionResult,
   HealthCheckContext,
   JobSourceAdapter,
   SourceAdapterConfig,
@@ -230,7 +232,12 @@ export function createJobWebEthiopiaAdapter(
 
   // ── port implementation ─────────────────────────────────────────────────────
 
-  async function collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+  /** The listing advertises the next page with a `rel="next"` link (verified live 2026-10-23). */
+  function hasNextPage(html: string): boolean {
+    return /\brel=["']next["']/i.test(html);
+  }
+
+  async function collect(context: CollectionContext): Promise<CollectionResult> {
     const { signal, now } = context;
     const evidence: RawJobEvidence[] = [];
 
@@ -245,18 +252,64 @@ export function createJobWebEthiopiaAdapter(
     // Discovery: newest postings first; the budget bounds the run, dedupe is downstream.
     const cards: Array<{ url: string; title: string }> = [];
     const seen = new Set<string>();
+    // Coverage (FR-019): true only when the listing was read to a confirmed end and every
+    // card it listed was read. A budget, an unreachable page or an unreadable posting leaves
+    // it false.
+    let reachedListingEnd = false;
+    let unreadablePostings = 0;
+    // Window claim (FR-019): the oldest publication date among the posts this pass read. The
+    // listing is served newest-first, so those posts are its newest prefix; an unobserved
+    // posting published strictly after this floor was inside the part the run saw. A posting
+    // that could not be read or carries no parseable date voids the claim, because the pass
+    // can then no longer place an unobserved posting outside the window it saw.
+    let windowKnown = true;
+    let oldestPublishedAt: Date | null = null;
+
+    /**
+     * A missing `rel="next"` is not proof of the end: a theme change or a soft-404 shell
+     * drops it from *every* page, which would let one run retire the whole back catalogue.
+     * The positive evidence is the page past the last one answering 404/410.
+     */
+    async function pastListingEnd(url: string): Promise<boolean> {
+      if (requests > 0) await delay(delayMs);
+      requests += 1;
+      try {
+        const res = await fetchImpl(url, { signal, headers: { 'User-Agent': USER_AGENT } });
+        return res.status === 404 || res.status === 410;
+      } catch {
+        return false;
+      }
+    }
+
     for (let page = 1; page <= maxListingPages && cards.length < maxPosts; page++) {
       if (signal?.aborted) break;
       const html = await politeGet(listingUrl(page));
       if (html === null) break;
+      const cardsOnPage = countCards(html);
+      let addedFromPage = 0;
       const re = new RegExp(CARD_LINK.source, 'gi');
       let match: RegExpExecArray | null;
-      while ((match = re.exec(html)) !== null && cards.length < maxPosts) {
+      while ((match = re.exec(html)) !== null) {
+        if (cards.length >= maxPosts) break;
         const url = match[1];
         if (seen.has(url)) continue;
         seen.add(url);
         cards.push({ url, title: extractText(match[2]) });
+        addedFromPage += 1;
       }
+      if (cards.length >= maxPosts && addedFromPage < cardsOnPage) {
+        // The post cap cut this page short, so the listing was not read in full.
+        break;
+      }
+      if (!hasNextPage(html)) {
+        // An empty page is a shell, not an end, and an aborted run must not send a request.
+        if (!signal?.aborted && cardsOnPage > 0) {
+          reachedListingEnd = await pastListingEnd(listingUrl(page + 1));
+        }
+        break;
+      }
+      // A page budget that ended on a page with a next link says nothing about the rest.
+      if (cards.length >= maxPosts) break;
     }
 
     for (const card of cards) {
@@ -264,7 +317,12 @@ export function createJobWebEthiopiaAdapter(
       const html = await politeGet(card.url);
       // A posting page that cannot be read yields no record: the listing excerpt is a
       // truncated preview, not a description, and inventing one would be fabrication.
-      if (html === null) continue;
+      if (html === null) {
+        // It also means the record behind it stays unobserved, so this pass did not see
+        // everything the listing held.
+        unreadablePostings += 1;
+        continue;
+      }
 
       const decode = decodeObfuscatedEmails(stripNoise(html));
       const page = decode.html;
@@ -285,6 +343,22 @@ export function createJobWebEthiopiaAdapter(
       const locationText = listField(page, 'Location');
       const stateText = listField(page, 'State');
 
+      const publishedDateText = extractPublishedDateText(page);
+      if (publishedDateText === null) {
+        windowKnown = false;
+      } else {
+        const parsed = parseDate({
+          text: publishedDateText,
+          sourceCalendarHint: config.declaredCalendar,
+          declaredDateFormat: config.declaredDateFormat,
+        });
+        if (parsed.publishedAt === null) {
+          windowKnown = false;
+        } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
+          oldestPublishedAt = parsed.publishedAt;
+        }
+      }
+
       evidence.push({
         // The permalink slug is derived from the title, not published as an id: identity is
         // the canonical URL (record: identifier none).
@@ -298,7 +372,7 @@ export function createJobWebEthiopiaAdapter(
         rawDescription,
         // The page states `16 Oct 2026` (a named month, parsed by the shared normalizer).
         // The listing's `16/Oct/2026` numeric form is ambiguous to the parser and is not used.
-        rawPublishedDateText: extractPublishedDateText(page),
+        rawPublishedDateText: publishedDateText,
         rawSalaryText: descriptionBlock === null ? null : extractSalaryText(descriptionBlock),
         // Structured header fields the publisher declares, preserved verbatim for a later
         // policy change (same convention as the Ethiojobs adapter). Nothing below is
@@ -318,7 +392,14 @@ export function createJobWebEthiopiaAdapter(
       });
     }
 
-    return evidence;
+    // A run cut short by its budget or by an unreachable page still makes a window claim if
+    // every posting it did read was dated; only an abort or an unreadable posting voids it.
+    const claimable = unreadablePostings === 0 && !signal?.aborted && windowKnown;
+    return {
+      records: evidence,
+      catalogueExhausted: reachedListingEnd && claimable,
+      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+    };
   }
 
   async function normalize(raw: RawJobEvidence): Promise<NormalizedJob> {

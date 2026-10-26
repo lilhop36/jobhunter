@@ -43,6 +43,10 @@ function listingHtml(...cards: string[]): string {
   return `<!DOCTYPE html><html><body><ol class="jobs">${cards.join('\n')}</ol></body></html>`;
 }
 
+/** Adds the pagination signal the live listing carries (verified 2026-10-23). */
+const NEXT_LINK = '<link rel="next" href="https://jobwebethiopia.com/jobs/page/2/" />';
+const withNext = (html: string): string => html.replace('</body>', `${NEXT_LINK}</body>`);
+
 const LISTING_PAGE_1 = listingHtml(
   card(TM_URL, 'Secretary and Receptionist at TM Law firm'),
   card(BANK_URL, 'Customer Service Officer at Alpha Bank'),
@@ -163,7 +167,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
 
     expect(evidence).toHaveLength(2);
     const first = evidence[0];
@@ -196,7 +200,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       delay: async () => {},
     });
 
-    const [first] = await adapter.collect(context());
+    const { records: [first] } = await adapter.collect(context());
 
     expect(first.rawDescription).toContain('jobs@mytmlawfirm.com');
     expect(first.rawDescription).not.toContain('[email');
@@ -226,7 +230,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       { fetchImpl, delay: async () => {} },
     );
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence).toHaveLength(2);
     expect(fetched).not.toContain(THIRD_URL);
   });
@@ -237,7 +241,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence).toHaveLength(1);
     expect(evidence[0].sourceUrl).toBe(TM_URL);
   });
@@ -247,7 +251,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       config({ options: { delayMs: 0, maxListingPages: 2, maxPosts: 10 } }),
       {
         fetchImpl: fetchRouter({
-          [LISTING]: LISTING_PAGE_1,
+          [LISTING]: withNext(LISTING_PAGE_1),
           [PAGE_2]: listingHtml(
             card(TM_URL, 'Secretary and Receptionist at TM Law firm'),
             card(THIRD_URL, 'Driver at Beta Transport'),
@@ -260,7 +264,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       },
     );
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     expect(evidence.map((row) => row.sourceUrl)).toEqual([TM_URL, BANK_URL, THIRD_URL]);
   });
 
@@ -274,8 +278,8 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
     });
 
     await adapter.collect(context());
-    // Three requests (one listing + two postings) â†’ two waits.
-    expect(delays).toBe(2);
+    // Four requests (listing, two postings, and the probe page past the listing end) → three waits.
+    expect(delays).toBe(3);
   });
 
   it('stops between requests once the signal is aborted', async () => {
@@ -305,7 +309,160 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       delay: async () => {},
     });
 
-    await expect(adapter.collect(context())).resolves.toEqual([]);
+    await expect(adapter.collect(context())).resolves.toEqual({
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
+  });
+});
+
+describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {
+  it('reports the listing exhausted when the last page has no next link', async () => {
+    const adapter = createJobWebEthiopiaAdapter(config(), {
+      fetchImpl: fetchRouter({ [LISTING]: LISTING_PAGE_1, [TM_URL]: TM_DETAIL, [BANK_URL]: BANK_DETAIL }),
+      delay: async () => {},
+    });
+
+    await expect(adapter.collect(context())).resolves.toMatchObject({ catalogueExhausted: true });
+  });
+
+  it('reports coverage when the cap is reached exactly at the page end', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 2 } }),
+      {
+        fetchImpl: fetchRouter({ [LISTING]: LISTING_PAGE_1, [TM_URL]: TM_DETAIL, [BANK_URL]: BANK_DETAIL }),
+        delay: async () => {},
+      },
+    );
+
+    const { records, catalogueExhausted } = await adapter.collect(context());
+    // The page held exactly two cards, so the cap ended the run at the page's end...
+    expect(records).toHaveLength(2);
+    // ...but a live page 1 carries 11 cards, so this fixture claims no full-catalogue view
+    // unless the page was fully consumed. Two cards, both read: exhausted.
+    expect(catalogueExhausted).toBe(true);
+  });
+
+  it('does not report coverage when the cap stops before the page end', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 1 } }),
+      {
+        fetchImpl: fetchRouter({
+          [LISTING]: listingHtml(
+            card(TM_URL, 'Secretary and Receptionist at TM Law firm'),
+            card(BANK_URL, 'Customer Service Officer at Alpha Bank'),
+          ),
+          [TM_URL]: TM_DETAIL,
+        }),
+        delay: async () => {},
+      },
+    );
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.records).toHaveLength(1);
+  });
+
+  it('does not report coverage when the page budget stops on a page with a next link', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 10 } }),
+      {
+        fetchImpl: fetchRouter({
+          [LISTING]: withNext(LISTING_PAGE_1),
+          [TM_URL]: TM_DETAIL,
+          [BANK_URL]: BANK_DETAIL,
+        }),
+        delay: async () => {},
+      },
+    );
+
+    const { records, catalogueExhausted, oldestListingPublishedAt } =
+      await adapter.collect(context());
+    expect(catalogueExhausted).toBe(false);
+    expect(records).toHaveLength(2);
+    // Both postings were read and dated, so the run still knows the window it saw.
+    expect(oldestListingPublishedAt).toEqual(new Date('2026-10-16T00:00:00.000Z'));
+  });
+
+  it('reports the oldest publication date among the postings it read', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 10 } }),
+      {
+        fetchImpl: fetchRouter({
+          [LISTING]: withNext(LISTING_PAGE_1),
+          [TM_URL]: detailHtml({
+            title: 'Secretary at TM Law firm',
+            company: 'TM Law firm',
+            state: 'Addis Ababa Jobs',
+            date: '16 Oct 2026',
+          }),
+          [BANK_URL]: detailHtml({
+            title: 'Customer Service Officer at Alpha Bank',
+            company: 'Alpha Bank',
+            state: 'Oromia Jobs',
+            date: '10 Oct 2026',
+          }),
+        }),
+        delay: async () => {},
+      },
+    );
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-10T00:00:00.000Z'));
+  });
+
+  it('makes no window claim when a posting it read states no usable date', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 1 } }),
+      {
+        fetchImpl: fetchRouter({
+          [LISTING]: withNext(LISTING_PAGE_1),
+          [TM_URL]: detailHtml({
+            title: 'Secretary at TM Law firm',
+            company: 'TM Law firm',
+            state: 'Addis Ababa Jobs',
+            date: '',
+          }),
+        }),
+        delay: async () => {},
+      },
+    );
+
+    const result = await adapter.collect(context());
+    // An undated posting could be the oldest one read, so the floor would be a guess.
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('makes no window claim when a listed posting could not be read', async () => {
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 10 } }),
+      {
+        fetchImpl: fetchRouter({
+          [LISTING]: withNext(LISTING_PAGE_1),
+          [TM_URL]: TM_DETAIL,
+          [BANK_URL]: 500,
+        }),
+        delay: async () => {},
+      },
+    );
+
+    const result = await adapter.collect(context());
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('does not report coverage from an unreachable listing', async () => {
+    const adapter = createJobWebEthiopiaAdapter(config(), {
+      fetchImpl: fetchRouter({ [LISTING]: 503 }),
+      delay: async () => {},
+    });
+
+    await expect(adapter.collect(context())).resolves.toEqual({
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
   });
 });
 
@@ -316,7 +473,7 @@ describe('JobWebEthiopia adapter â€” normalize delegates to domain normaliz
       delay: async () => {},
     });
 
-    const [raw] = await adapter.collect(context());
+    const { records: [raw] } = await adapter.collect(context());
     const job = await adapter.normalize(raw);
 
     expect(job.canonicalUrl).toBe(canonicalizeUrl(TM_URL));
@@ -338,7 +495,7 @@ describe('JobWebEthiopia adapter â€” normalize delegates to domain normaliz
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     const bank = evidence.find((row) => row.sourceUrl === BANK_URL)!;
     const job = await adapter.normalize(bank);
 
@@ -366,7 +523,7 @@ describe('JobWebEthiopia adapter â€” normalize delegates to domain normaliz
       },
     );
 
-    const [raw] = await adapter.collect(context());
+    const { records: [raw] } = await adapter.collect(context());
     const job = await adapter.normalize(raw);
 
     expect(job.publishedDate.calendar).toBe('UNKNOWN');

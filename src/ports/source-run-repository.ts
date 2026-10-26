@@ -42,6 +42,14 @@ export interface SourceRunOutcome {
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
+  /** Whether the run read its source's listing to the end (FR-019 evidence basis). */
+  catalogueExhausted: boolean;
+  /**
+   * Oldest publication date among the listing entries the run read; null when it made no
+   * window claim. Retirement may use the narrower window when the listing was not read in
+   * full (FR-019).
+   */
+  oldestListingPublishedAt: Date | null;
   /** Whether downstream enrichment/matching work was scheduled (SRS 7.7 step 10). */
   enrichmentScheduled: boolean;
   errorSummary?: string | null;

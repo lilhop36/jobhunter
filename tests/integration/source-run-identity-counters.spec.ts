@@ -28,6 +28,8 @@ const OUTCOME: SourceRunOutcome = {
   undeduplicable: 3,
   fallbackIdentities: 2,
   unexpectedZeroResults: false,
+  catalogueExhausted: true,
+  oldestListingPublishedAt: new Date('2026-10-21T00:00:00.000Z'),
   enrichmentScheduled: false,
   errorSummary: null,
 };
@@ -71,5 +73,48 @@ describe('source run identity counters', () => {
     const reread = await repo.findById(run.id);
     expect(reread?.undeduplicable).toBe(3);
     expect(reread?.fallbackIdentities).toBe(2);
+  });
+
+  it('defaults both coverage fields to "no claim" on a newly started run', async () => {
+    const sourceId = await createSource('coverage-default');
+    const run = await repo.start({ sourceId });
+    expect(run.catalogueExhausted).toBe(false);
+    expect(run.oldestListingPublishedAt).toBeNull();
+  });
+
+  it("persists the run's publication-date floor and survives a re-read", async () => {
+    const sourceId = await createSource('coverage-window');
+    const run = await repo.start({ sourceId });
+
+    const finalized = await repo.finalize(
+      run.id,
+      { ...OUTCOME, catalogueExhausted: false },
+      null,
+    );
+    expect(finalized?.oldestListingPublishedAt).toEqual(new Date('2026-10-21T00:00:00.000Z'));
+    expect((await repo.findById(run.id))?.oldestListingPublishedAt).toEqual(
+      new Date('2026-10-21T00:00:00.000Z'),
+    );
+  });
+
+  it("persists the run's listing coverage on finalize and survives a re-read", async () => {
+    const sourceId = await createSource('coverage-persist');
+    const runTrue = await repo.start({ sourceId });
+    const finalizedTrue = await repo.finalize(
+      runTrue.id,
+      { ...OUTCOME, catalogueExhausted: true },
+      null,
+    );
+    expect(finalizedTrue?.catalogueExhausted).toBe(true);
+    expect((await repo.findById(runTrue.id))?.catalogueExhausted).toBe(true);
+
+    const runFalse = await repo.start({ sourceId });
+    const finalizedFalse = await repo.finalize(
+      runFalse.id,
+      { ...OUTCOME, catalogueExhausted: false },
+      null,
+    );
+    expect(finalizedFalse?.catalogueExhausted).toBe(false);
+    expect((await repo.findById(runFalse.id))?.catalogueExhausted).toBe(false);
   });
 });

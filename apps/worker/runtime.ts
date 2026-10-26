@@ -12,7 +12,7 @@ import {
   createMatchScoringHandler,
 } from '@application/matching';
 import { DispatchNotifications } from '@application/notification';
-import { ExpireDeadlines } from '@application/lifecycle';
+import { ExpireDeadlines, SweepSourceLifecycle } from '@application/lifecycle';
 import { WorkTaskHandlerRegistry, WorkTaskWorker, describeError, sleep as abortableSleep } from '@application/worker';
 import { MATCHER_VERSION } from '@domain/matching';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
@@ -89,6 +89,12 @@ export function createWorkerRuntime(
    * configured, bounded, or tested.
    */
   const expireDeadlines = new ExpireDeadlines({ jobs: jobRepository, logger });
+
+  // FR-019 lifecycle reconciliation. Wired as a post-collection step (not a timer): the
+  // handler sweeps only after a run that finished SUCCEEDED and made a coverage claim — it
+  // read the listing to the end or recorded the publication-date window it read. Absence is
+  // evidence only inside that coverage, so no other run may retire a Job.
+  const sweepLifecycle = new SweepSourceLifecycle({ jobs: jobRepository, logger });
 
   // Matching (SRS 11.2, FR-013/FR-014). The reader narrows to matchable jobs, the profile
   // repository is the non-negotiable input, and the match repository owns the idempotent write.
@@ -169,6 +175,8 @@ export function createWorkerRuntime(
         collection,
         staleRunSeconds: config.staleRunSeconds,
         acquisitionTimeoutMs: config.acquisitionTimeoutMs,
+        sweep: (sourceId) => sweepLifecycle.sweep(sourceId),
+        logger,
       }),
     )
     .register(MATCH_SCORING_TASK_TYPE, createMatchScoringHandler({ scoring, expire: expireDeadlines, logger }));

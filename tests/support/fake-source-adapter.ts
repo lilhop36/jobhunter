@@ -27,6 +27,7 @@ import {
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import type {
   CollectionContext,
+  CollectionResult,
   HealthCheckContext,
   JobSourceAdapter,
   SourceAdapterConfig,
@@ -77,14 +78,36 @@ export function makeRawJob(overrides: Partial<RawJobEvidence> = {}): RawJobEvide
 export class FakeSourceAdapter implements JobSourceAdapter {
   readonly config: SourceAdapterConfig;
   private readonly rows: RawJobEvidence[];
+  /**
+   * Whether the fake's fixture represents the source's whole catalogue. Default `true`:
+   * the fake returns exactly its declared rows, so it has by definition seen everything.
+   * Pass `false` for tests of capped or partial coverage.
+   */
+  private readonly exhaustive: boolean;
+  /**
+   * The fake's declared publication-date coverage floor, or null for "no window claim".
+   * Only meaningful with `catalogueExhausted = false`: a full read needs no window.
+   */
+  private readonly oldestListingPublishedAt: Date | null;
 
-  constructor(config: SourceAdapterConfig = makeFakeConfig(), rows: RawJobEvidence[] = []) {
+  constructor(
+    config: SourceAdapterConfig = makeFakeConfig(),
+    rows: RawJobEvidence[] = [],
+    catalogueExhausted = true,
+    oldestListingPublishedAt: Date | null = null,
+  ) {
     this.config = config;
     this.rows = rows;
+    this.exhaustive = catalogueExhausted;
+    this.oldestListingPublishedAt = oldestListingPublishedAt;
   }
 
-  async collect(_context: CollectionContext): Promise<RawJobEvidence[]> {
-    return this.rows.map((row) => ({ ...row }));
+  async collect(_context: CollectionContext): Promise<CollectionResult> {
+    return {
+      records: this.rows.map((row) => ({ ...row })),
+      catalogueExhausted: this.exhaustive,
+      oldestListingPublishedAt: this.oldestListingPublishedAt,
+    };
   }
 
   async normalize(raw: RawJobEvidence): Promise<NormalizedJob> {

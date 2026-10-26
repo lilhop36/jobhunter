@@ -16,6 +16,7 @@ import {
 import { SourceRunActiveError } from '@ports/source-run-repository';
 import type {
   CollectionContext,
+  CollectionResult,
   HealthCheckContext,
   JobSourceAdapter,
 } from '@ports/source-adapter';
@@ -149,10 +150,10 @@ class AbortAfterCollectAdapter implements JobSourceAdapter {
     return this.inner.config;
   }
 
-  async collect(context: CollectionContext): Promise<RawJobEvidence[]> {
-    const rows = await this.inner.collect(context);
+  async collect(context: CollectionContext): Promise<CollectionResult> {
+    const outcome = await this.inner.collect(context);
     this.controller.abort();
-    return rows;
+    return { ...outcome };
   }
 
   normalize(raw: RawJobEvidence) {
@@ -175,7 +176,7 @@ class AbortDuringCollectAdapter implements JobSourceAdapter {
     return this.inner.config;
   }
 
-  async collect(): Promise<RawJobEvidence[]> {
+  async collect(): Promise<CollectionResult> {
     this.controller.abort();
     throw new Error('socket closed during shutdown');
   }
@@ -200,7 +201,7 @@ class FailingCollectAdapter implements JobSourceAdapter {
     return this.inner.config;
   }
 
-  async collect(): Promise<RawJobEvidence[]> {
+  async collect(): Promise<CollectionResult> {
     throw this.error;
   }
 
@@ -232,7 +233,7 @@ class SlowCollectAdapter implements JobSourceAdapter {
     return this.inner.config;
   }
 
-  async collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+  async collect(context: CollectionContext): Promise<CollectionResult> {
     this.capturedSignal = context.signal;
     await delay(this.delayMs);
     return this.inner.collect(context);

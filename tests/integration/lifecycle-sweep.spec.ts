@@ -20,6 +20,8 @@ const sweep = new SweepSourceLifecycle({ jobs, logger: silentWorkerLogger });
 const RUN_AT = new Date('2026-05-01T00:00:00.000Z');
 const OBSERVED_BEFORE = new Date('2026-04-29T00:00:00.000Z');
 const OBSERVED_AFTER = new Date('2026-05-01T06:00:00.000Z');
+/** The oldest publication date a capped run read; published dates are date-only UTC. */
+const WINDOW_FLOOR = new Date('2026-04-15T00:00:00.000Z');
 
 async function createSource(name: string): Promise<string> {
   const source = await prisma.jobSource.create({
@@ -33,6 +35,7 @@ async function createJob(
   identityKey: string,
   observedAt: Date,
   lifecycleStatus: LifecycleStatus = LifecycleStatus.ACTIVE,
+  publishedAt: Date | null = null,
 ): Promise<string> {
   const raw = await prisma.rawJob.create({
     data: {
@@ -50,6 +53,7 @@ async function createJob(
       identityKey,
       descriptionQuality: DescriptionQuality.UNUSABLE,
       lifecycleStatus,
+      publishedAt,
     },
   });
   return job.id;
@@ -61,6 +65,10 @@ async function createRun(
     status?: SourceRunStatus;
     jobsDiscovered?: number;
     startedAt?: Date;
+    /** Defaults true: a healthy run in these tests is a complete catalogue view. */
+    catalogueExhausted?: boolean;
+    /** The publication-date window a capped run read; null means no window claim. */
+    oldestListingPublishedAt?: Date | null;
   } = {},
 ): Promise<void> {
   await prisma.sourceRun.create({
@@ -69,6 +77,8 @@ async function createRun(
       status: options.status ?? SourceRunStatus.SUCCEEDED,
       jobsDiscovered: options.jobsDiscovered ?? 5,
       startedAt: options.startedAt ?? RUN_AT,
+      catalogueExhausted: options.catalogueExhausted ?? true,
+      oldestListingPublishedAt: options.oldestListingPublishedAt ?? null,
     },
   });
 }
@@ -98,7 +108,7 @@ describe('lifecycle sweep - retiring jobs', () => {
 
     const result = await sweep.sweep(sourceId);
 
-    expect(result).toEqual({ sourceId, examined: 1, changed: 1 });
+    expect(result).toEqual({ sourceId, examined: 1, retired: 1, restored: 0 });
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
 
@@ -109,7 +119,7 @@ describe('lifecycle sweep - retiring jobs', () => {
 
     const result = await sweep.sweep(sourceId);
 
-    expect(result.changed).toBe(0);
+    expect(result.retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 });
@@ -120,7 +130,7 @@ describe('lifecycle sweep - evidence boundaries', () => {
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
     await createRun(sourceId, { status: SourceRunStatus.FAILED });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -129,7 +139,19 @@ describe('lifecycle sweep - evidence boundaries', () => {
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
     await createRun(sourceId, { status: SourceRunStatus.PARTIAL });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('does not retire when a capped run made no window claim', async () => {
+    // A capped or error-cut run discovered records but saw only part of the listing and
+    // recorded no date floor: absence from it says nothing about what the unvisited pages
+    // held (FR-019), so it is not even a qualifying run.
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
+    await createRun(sourceId, { catalogueExhausted: false });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -138,7 +160,7 @@ describe('lifecycle sweep - evidence boundaries', () => {
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
     await createRun(sourceId, { jobsDiscovered: 0 });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -146,7 +168,7 @@ describe('lifecycle sweep - evidence boundaries', () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -156,7 +178,7 @@ describe('lifecycle sweep - evidence boundaries', () => {
     await createRun(sourceId);
     await prisma.job.update({ where: { id: jobId }, data: { rawJobId: null } });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -167,7 +189,7 @@ describe('lifecycle sweep - evidence boundaries', () => {
     await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
     await createRun(sourceId, { startedAt: RUN_AT });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(1);
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
 
@@ -178,8 +200,150 @@ describe('lifecycle sweep - evidence boundaries', () => {
     await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
     await createRun(sourceId, { status: SourceRunStatus.FAILED, startedAt: RUN_AT });
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(0);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('ignores a newer capped run that claimed no window when an older informative run exists', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'gone',
+      new Date('2026-04-01T00:00:00.000Z'),
+      LifecycleStatus.ACTIVE,
+      new Date('2026-03-01T00:00:00.000Z'),
+    );
+    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
+    await createRun(sourceId, {
+      startedAt: RUN_AT,
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
+
+    // The newer run says nothing about coverage, so the older complete read still stands.
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+  });
+});
+
+describe('lifecycle sweep - windowed coverage (capped runs)', () => {
+  it('retires a job published strictly inside the window a capped run read', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'gone',
+      OBSERVED_BEFORE,
+      LifecycleStatus.ACTIVE,
+      new Date('2026-04-20T00:00:00.000Z'),
+    );
+    await createRun(sourceId, {
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+  });
+
+  it('does not retire a job published on the window floor', async () => {
+    // Published dates are date-only, so the floor date may be split by the page boundary:
+    // an equally-dated entry could sit on the unread next page.
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'floor',
+      OBSERVED_BEFORE,
+      LifecycleStatus.ACTIVE,
+      WINDOW_FLOOR,
+    );
+    await createRun(sourceId, {
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('does not retire a job older than the window', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'older',
+      OBSERVED_BEFORE,
+      LifecycleStatus.ACTIVE,
+      new Date('2026-04-10T00:00:00.000Z'),
+    );
+    await createRun(sourceId, {
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    // It may sit on a page the run never read: no evidence either way (ENG-001).
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('does not retire an undated job from a windowed run', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(sourceId, 'undated', OBSERVED_BEFORE);
+    await createRun(sourceId, {
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('retires an undated job when the run read the whole listing', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(sourceId, 'undated', OBSERVED_BEFORE);
+    await createRun(sourceId, { catalogueExhausted: true });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+  });
+
+  it('restores a retired job observed by a windowed run', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'back',
+      OBSERVED_AFTER,
+      LifecycleStatus.REMOVED,
+      new Date('2026-03-01T00:00:00.000Z'),
+    );
+    await createRun(sourceId, {
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    // Presence is direct evidence and needs no window: it was observed by this run.
+    expect((await sweep.sweep(sourceId)).restored).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
+
+  it('retires from an older full read when newer capped runs cannot reach the job', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(
+      sourceId,
+      'older',
+      new Date('2026-04-01T00:00:00.000Z'),
+      LifecycleStatus.ACTIVE,
+      new Date('2026-04-10T00:00:00.000Z'),
+    );
+    // A complete read, then the source moved to capped runs above this job's date.
+    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
+    await createRun(sourceId, {
+      startedAt: RUN_AT,
+      catalogueExhausted: false,
+      oldestListingPublishedAt: WINDOW_FLOOR,
+    });
+
+    // The newer runs cannot speak for this Job; the older complete read still can.
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
 });
 
@@ -194,7 +358,7 @@ describe('lifecycle sweep - restoring and isolating', () => {
     );
     await createRun(sourceId);
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(1);
+    expect((await sweep.sweep(sourceId)).restored).toBe(1);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
@@ -237,10 +401,10 @@ describe('lifecycle sweep - restoring and isolating', () => {
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
     await createRun(sourceId);
 
-    expect((await sweep.sweep(sourceId)).changed).toBe(1);
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
     // Still examined (it is a status this policy owns) but no longer a change.
     const second = await sweep.sweep(sourceId);
-    expect(second).toEqual({ sourceId, examined: 1, changed: 0 });
+    expect(second).toEqual({ sourceId, examined: 1, retired: 0, restored: 0 });
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
 });

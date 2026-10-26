@@ -33,10 +33,20 @@ export interface SourceRunRecord {
   httpFailures: number;
   unexpectedZeroResults: boolean;
   /**
+   * Whether the run read its source's listing to the end. Only such a run is evidence that
+   * a record it did not observe is no longer published (FR-019). A capped run can still
+   * support retirement inside its narrower coverage window (see `oldestListingPublishedAt`).
+   */
+  catalogueExhausted: boolean;
+  /**
+   * Oldest publication date among the listing entries this run read, or null when it made no
+   * window claim. An unobserved record published strictly after this floor was inside the
+   * window the run saw; records at or before it may lie beyond the pages read (FR-019).
+   */
+  oldestListingPublishedAt: Date | null;
+  /**
    * Whether this run scheduled downstream enrichment/matching work (SRS 7.7 step 10).
-   * Always `false` today: the stage has no registered handler, so enqueueing would
-   * produce guaranteed permanent failures. Recorded explicitly so a `SUCCEEDED` status
-   * never implies step 10 ran.
+   * Recorded explicitly so a `SUCCEEDED` status never implies step 10 ran.
    */
   enrichmentScheduled: boolean;
   errorSummary: string | null;

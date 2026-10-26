@@ -104,8 +104,11 @@ function asTimestamp(value: Date | null): string | null {
 interface LifecycleCandidateRow {
   jobId: string;
   lifecycleStatus: string;
+  publishedAt: Date | string | null;
   lastObservedAt: Date | string | null;
   latestQualifyingRunStartedAt: Date | string | null;
+  latestQualifyingCatalogueExhausted: boolean | null;
+  latestQualifyingOldestListingPublishedAt: Date | string | null;
 }
 
 interface DeadlineCandidateRow {
@@ -212,11 +215,15 @@ export class PrismaJobRepository implements JobRepository {
   /**
    * Read model for one source's lifecycle reconciliation (FR-019, SRS 4.4).
    *
-   * The correlated subquery is the "informative collection" definition held by
-   * `@domain/lifecycle`: a run that finished `SUCCEEDED` and discovered at least one record.
-   * Enum columns are compared as text (`::text`) so the bound parameter is a plain string,
-   * exactly as the other stores do - a bare `enum = $1` has no Postgres operator.
+   * The lateral join selects the newest "informative collection" **that can speak for this
+   * Job** as `@domain/lifecycle` defines it: a run that finished `SUCCEEDED`, discovered at
+   * least one record, and either captured the Job (presence is direct evidence), read the
+   * listing to the end (`catalogueExhausted`), or recorded a publication-date floor below the
+   * Job's own date. Choosing per Job rather than taking the newest run overall matters: when a
+   * source moves to capped runs, a newer capped run cannot speak for an old Job, but an
+   * earlier complete read still can. Runs that did none of these never qualify.
    *
+   * The policy re-checks the window itself; this filter only narrows what it has to consider.
    * Only the statuses this policy owns are returned, so a Job whose state came from other
    * evidence is never even loaded.
    */
@@ -225,24 +232,56 @@ export class PrismaJobRepository implements JobRepository {
     const rows = await this.prisma.$queryRaw<LifecycleCandidateRow[]>`
       SELECT j."id" AS "jobId",
              j."lifecycleStatus"::text AS "lifecycleStatus",
+             j."publishedAt" AS "publishedAt",
              rj."lastSeenAt" AS "lastObservedAt",
-             (SELECT max(r."startedAt")
-                FROM "source_runs" r
-               WHERE r."sourceId" = j."sourceId"
-                 AND r."status"::text = ${SourceRunStatus.SUCCEEDED}
-                 AND r."jobsDiscovered" > 0) AS "latestQualifyingRunStartedAt"
+             run."startedAt" AS "latestQualifyingRunStartedAt",
+             run."catalogueExhausted" AS "latestQualifyingCatalogueExhausted",
+             run."oldestListingPublishedAt" AS "latestQualifyingOldestListingPublishedAt"
         FROM "jobs" j
         LEFT JOIN "raw_jobs" rj ON rj."id" = j."rawJobId"
+        LEFT JOIN LATERAL (
+          SELECT r."startedAt", r."catalogueExhausted", r."oldestListingPublishedAt"
+            FROM "source_runs" r
+           WHERE r."sourceId" = j."sourceId"
+             AND r."status"::text = ${SourceRunStatus.SUCCEEDED}
+             AND r."jobsDiscovered" > 0
+             AND (
+               r."catalogueExhausted" = true
+               OR (j."publishedAt" IS NOT NULL
+                   AND r."oldestListingPublishedAt" IS NOT NULL
+                   AND j."publishedAt" > r."oldestListingPublishedAt")
+               -- A run that captured this Job is relevant even when the Job's date sits
+               -- outside its window: presence restores, and needs no coverage claim.
+               OR (rj."lastSeenAt" IS NOT NULL AND rj."lastSeenAt" >= r."startedAt")
+             )
+           ORDER BY r."startedAt" DESC
+           LIMIT 1
+        ) run ON true
        WHERE j."sourceId" = ${sourceId}::uuid
          AND j."lifecycleStatus"::text IN (${reconciledStatuses})
     `;
 
-    return rows.map((row) => ({
-      jobId: row.jobId,
-      currentStatus: row.lifecycleStatus as LifecycleStatus,
-      lastObservedAt: toNullableDate(row.lastObservedAt),
-      latestQualifyingRunStartedAt: toNullableDate(row.latestQualifyingRunStartedAt),
-    }));
+    return rows.map((row) => {
+      const runStartedAt = toNullableDate(row.latestQualifyingRunStartedAt);
+      return {
+        jobId: row.jobId,
+        currentStatus: row.lifecycleStatus as LifecycleStatus,
+        publishedAt: toNullableDate(row.publishedAt),
+        lastObservedAt: toNullableDate(row.lastObservedAt),
+        latestQualifyingRun:
+          runStartedAt === null
+            ? null
+            : {
+                startedAt: runStartedAt,
+                // A run with no claim cannot reach the lateral join, so both fields are
+                // meaningful here.
+                catalogueExhausted: row.latestQualifyingCatalogueExhausted === true,
+                oldestListingPublishedAt: toNullableDate(
+                  row.latestQualifyingOldestListingPublishedAt,
+                ),
+              },
+      };
+    });
   }
 
   /**

@@ -1,6 +1,8 @@
 import { HealthStatus } from '@domain/enums';
+import { parseDate } from '@domain/normalizers/calendar';
 import type {
   CollectionContext,
+  CollectionResult,
   HealthCheckContext,
   JobSourceAdapter,
   SourceAdapterConfig,
@@ -178,9 +180,41 @@ export function createEffoySiraAdapter(
 
   // ── port implementation ─────────────────────────────────────────────────────
 
-  async function collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+  /** WordPress advertises the next listing page with a `rel="next"` link. */
+  function hasNextPage(html: string): boolean {
+    return /\brel=["']next["']/i.test(html);
+  }
+
+  async function collect(context: CollectionContext): Promise<CollectionResult> {
     const { signal, now } = context;
     const evidence: RawJobEvidence[] = [];
+    // Only a pass that saw the whole listing *and* read every posting it listed can support
+    // "not observed, therefore gone" (FR-019). A page budget, an unreachable page, an abort
+    // or an unreadable posting all leave it false.
+    let reachedListingEnd = false;
+    let unreadablePostings = 0;
+    // Window claim (FR-019): the oldest publication date among the posts this pass read.
+    // A post with no parseable date, or one that could not be read, voids the claim: the
+    // pass can no longer place an unobserved posting outside the window it saw.
+    let windowKnown = true;
+    let oldestPublishedAt: Date | null = null;
+
+    /**
+     * A missing `rel="next"` is not proof of the end: a theme change or a soft-404 shell
+     * drops it from *every* page, which would let one run retire the whole back catalogue.
+     * The positive evidence is the page past the last one answering 404/410.
+     */
+    async function pastListingEnd(page: number): Promise<boolean> {
+      try {
+        const res = await fetchImpl(`${BASE}/category/job/page/${page}/`, {
+          signal,
+          headers: { 'User-Agent': USER_AGENT },
+        });
+        return res.status === 404 || res.status === 410;
+      } catch {
+        return false;
+      }
+    }
 
     // Discover post URLs from the category listing. Only recent pages are read per run;
     // the schedule governs freshness and the pipeline's dedupe makes re-observation free.
@@ -200,17 +234,44 @@ export function createEffoySiraAdapter(
           postUrls.push(m[1]);
         }
       }
+      if (!hasNextPage(html)) {
+        // An empty page is a shell, not an end, and an aborted run must not send a request.
+        if (!signal?.aborted && countPostLinks(html) > 0) {
+          await delay(delayMs);
+          reachedListingEnd = await pastListingEnd(page + 1);
+        }
+        break;
+      }
       if (page < maxListingPages) await delay(delayMs);
     }
 
     for (const postUrl of postUrls) {
       if (signal?.aborted) break;
       const html = await get(postUrl, signal);
-      if (html === null) continue;
+      if (html === null) {
+        // The posting was listed but could not be read: the record it would have refreshed
+        // stays unobserved, so this pass cannot claim it saw everything.
+        unreadablePostings += 1;
+        continue;
+      }
 
       const title = extractTitle(html);
       const contentHtml = extractContent(html);
       const publishedTime = extractPublishedTime(html);
+      if (publishedTime === null) {
+        windowKnown = false;
+      } else {
+        const parsed = parseDate({
+          text: publishedTime,
+          sourceCalendarHint: config.declaredCalendar,
+          declaredDateFormat: config.declaredDateFormat,
+        });
+        if (parsed.publishedAt === null) {
+          windowKnown = false;
+        } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
+          oldestPublishedAt = parsed.publishedAt;
+        }
+      }
       const locationLine = contentHtml === null ? null : extractLocation(contentHtml);
       const salaryLine = contentHtml === null ? null : extractSalaryText(contentHtml);
       // The description is the block's text; fields are matched on paragraph boundaries
@@ -240,7 +301,12 @@ export function createEffoySiraAdapter(
       await delay(delayMs);
     }
 
-    return evidence;
+    const claimable = unreadablePostings === 0 && !signal?.aborted && windowKnown;
+    return {
+      records: evidence,
+      catalogueExhausted: reachedListingEnd && claimable,
+      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+    };
   }
 
   async function normalize(raw: RawJobEvidence): Promise<NormalizedJob> {

@@ -70,6 +70,11 @@ found no clause that blocks this collection.
 - **Bound expectations:** two listing pages at the 800 ms politeness delay ≈ a run under
   2 s of transfer; the worker's `SOURCE_ACQUISITION_TIMEOUT_MS=300000` leaves ample
   headroom.
+- **Coverage window (FR-019, ADR-0010):** each run records `oldestListingPublishedAt` from the
+  listing's `date_published` values. Exhaustion is claimed only when the run reads up to the
+  advertised `meta.lastPage` (with each payload's `pageNumber` matching the page requested);
+  at the two-page budget (24 of `lastPage` 94) a run makes a window claim instead, floored at
+  the 24th-newest posting's date. An undated or unreadable entry voids the claim.
 - **Live observation (2026-10-22), first real collection — 24 postings, run SUCCEEDED
   (3.98 s):** `jobsDiscovered` 24, `jobsAccepted` 24, 0 duplicates, 0 rejected, 0 parse
   failures, 0 HTTP failures; source health HEALTHY. Observed field yield: `title` and

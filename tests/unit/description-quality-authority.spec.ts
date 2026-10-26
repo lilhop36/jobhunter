@@ -19,7 +19,7 @@ import type {
   RawJobRecord,
   RawJobRepository,
 } from '@ports/raw-job-repository';
-import type { JobSourceAdapter } from '@ports/source-adapter';
+import type { CollectionResult, JobSourceAdapter } from '@ports/source-adapter';
 import type {
   SourceRunOutcome,
   SourceRunRepository,
@@ -54,6 +54,8 @@ const RUN: SourceRunRecord = {
   parseFailures: 0,
   httpFailures: 0,
   unexpectedZeroResults: false,
+  catalogueExhausted: true,
+  oldestListingPublishedAt: null,
   enrichmentScheduled: false,
   errorSummary: null,
 };
@@ -232,8 +234,12 @@ class LyingAdapter implements JobSourceAdapter {
     this.rows = rows;
   }
 
-  async collect(): Promise<RawJobEvidence[]> {
-    return this.rows.map((row) => ({ ...row }));
+  async collect(): Promise<CollectionResult> {
+    return {
+      records: this.rows.map((row) => ({ ...row })),
+      catalogueExhausted: true,
+      oldestListingPublishedAt: null,
+    };
   }
 
   async normalize(raw: RawJobEvidence): Promise<NormalizedJob> {

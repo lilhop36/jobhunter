@@ -236,11 +236,20 @@ model SourceRun {
   parseFailures         Int              @default(0)
   httpFailures          Int              @default(0)
   unexpectedZeroResults Boolean          @default(false)
+  /// FR-019 evidence basis: the run read its source's listing to the end, so a record it
+  /// did not observe is evidence the source stopped publishing it. Capped, failed or
+  /// aborted runs leave it false; the lifecycle sweep only qualifies on runs that made a
+  /// coverage claim (this flag, or a window floor).
+  catalogueExhausted    Boolean          @default(false)
+  /// FR-019 coverage window: the oldest publication date among the listing entries this run
+  /// read. A record published strictly after it was inside the window the run observed, so
+  /// its absence is evidence of removal; records at or before it may lie beyond the pages
+  /// read (published dates are date-only, so the floor date itself is excluded). NULL means
+  /// the run made no window claim.
+  oldestListingPublishedAt DateTime?
   /// SRS 7.7 step 10 ("schedule enrichment/matching work"). Engineering-owned
-  /// observability, like the counters: the enrichment/matching stage has no registered
-  /// handler yet, so the hand-off cannot be enqueued. Recording it per run makes the
-  /// deferral an explicit state instead of an implicit gap behind a SUCCEEDED status.
-  /// `false` means the run did not schedule downstream work.
+  /// observability, like the counters: recorded per run so a `SUCCEEDED` status never
+  /// implies the hand-off ran. `false` means the run did not schedule downstream work.
   enrichmentScheduled   Boolean          @default(false)
   errorSummary          String?
   createdAt             DateTime         @default(now())

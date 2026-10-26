@@ -171,6 +171,18 @@ per-run "catalogue exhausted" flag, qualify the sweep on it, and only then invok
 after a successful run. Until that exists, `REMOVED` stays unreachable by design, and the
 fix-order item is downgraded from "wire it" to "give it coverage evidence first".
 
+**Update (2026-10-24): resolved via ADR-0010.** The coverage signal landed as a *window*, not
+a boolean. Every adapter now records `oldestListingPublishedAt` — the oldest publication date
+among the entries it actually read — and claims it only when every entry it read was
+identifiable and dated; `catalogueExhausted` is reserved for a confirmed end of listing.
+`LIFECYCLE_V2` retires a Job only when a qualifying run did not observe it and either the run
+exhausted the listing or the Job's date lies strictly inside the run's window; the sweep is
+now called after a `SUCCEEDED` run that made either claim. Replaying the table above with the
+new signal: EffoySira's floor is the 18th-newest posting (2026-10-21), so all 44 unobserved
+jobs are outside the window and stay `ACTIVE`; every stored Ethiojobs and JobWebEthiopia job
+was in the newest prefix its latest run read and was observed there, so nothing moves either.
+`NOT_FOUND` is still unimplemented (ADR-0010 §6), so D9 remains partial.
+
 ### I-07 — Medium: Ethiojobs identity uses the full slug while the approval record declares only the id segment stable
 
 `docs/sources/ethiojobs.md` says "the leading id segment is a stable external identifier (ADR-0001
@@ -191,9 +203,9 @@ edits) is never observed, and there is no measurement of how often that happens.
 are documented as a deliberate politeness/freshness trade-off, so this is a measurement gap rather
 than an error: compare `raw captures per run` against `discovered per run` before changing a budget.
 
-The cap also blocks removal detection: a run that stops at page 2 cannot support "unseen means
-gone", so the presence sweep stays unwired until a run can declare it covered the listing (see
-I-06). Raising the budget alone does not fix that — the signal is coverage, not volume.
+The cap also limits removal detection: a run that stops at page 2 cannot support "unseen means
+gone", so the presence sweep can only retire Jobs inside the read prefix (I-06, ADR-0010).
+Raising the budget widens that window; a full-listing claim needs the whole archive read.
 
 ### I-09 — Low: fixtures are synthetic, not captured, and there is no dead-link case
 
@@ -292,7 +304,7 @@ no trusted URL, in which case it falls to the `fp:` basis and the count is visib
 | 1 | I-01 expectation wiring | S | Restores the only automatic signal that a source went silent; blocks a false "healthy" during validation. |
 | 2 | I-05 error cause | XS | Six failures are currently undiagnosable. |
 | 3 | I-02 + I-03 structured application path and expiry | M | Unlocks 24 jobs and makes FR-019 work for the source that declares expiry. |
-| 4 | I-06 give the presence sweep a coverage signal, then wire it + ADR for dead links | M | Not a trigger problem: measured, wiring it today would retire 44 of 62 live EffoySira jobs (see I-06). |
+| 4 | I-06 presence sweep — **done 2026-10-24** via ADR-0010; dead-link `NOT_FOUND` remains | M | Not a trigger problem: measured, wiring it without a coverage signal would retire 44 of 62 live EffoySira jobs (see I-06). |
 | 5 | I-08 measure budget saturation, I-09 capture fixtures | S-M | Evidence before changing budgets. |
 | 6 | I-04 staleness flag, I-07 identity basis | decision | Both are product/record decisions, not mechanical fixes. |
 
@@ -304,7 +316,7 @@ no trusted URL, in which case it falls to the `fp:` basis and the count is visib
 | I-05 error cause | done | `9855e1a` | `describeError` follows up to three `cause` links and bounds the line at 500 chars; a `fetch failed` now reads `(cause: read ECONNRESET)`. |
 | I-02 structured application path | done | `af02176` | Ethiojobs maps its declared method/email/link in the adapter; declared evidence outranks text; a malformed declared email and an ATS record with no target stay UNKNOWN. |
 | I-03 declared expiry | done | `af02176` | `date_expiry` is parsed by the shared date parser and stored as `applicationDeadline`; an unparsable declared value falls back to the description's labelled deadline. |
-| I-06 presence sweep | **blocked** | — | Measured above: wiring it today retires 44 of 62 live EffoySira jobs. Needs the coverage signal first. |
+| I-06 presence sweep | done (dead-link probe still absent) | — | ADR-0010 + `LIFECYCLE_V2`: adapters record a dated coverage window, the handler sweeps after a `SUCCEEDED` run that claimed coverage, and the policy retires only strictly inside it. Replayed on live data: 0 of 62 EffoySira jobs move (floor 2026-10-21); every stored Ethiojobs/JobWebEthiopia job was observed in the newest prefix. Covered by 20 real-PostgreSQL lifecycle tests plus per-adapter window tests. |
 | I-04, I-07 | open | — | Owner decisions. |
 | I-08, I-09, I-10, I-12 | open | — | Unchanged. |
 

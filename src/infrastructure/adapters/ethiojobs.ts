@@ -1,6 +1,8 @@
 import { ApplicationMethod, HealthStatus } from '@domain/enums';
+import { parseDate } from '@domain/normalizers/calendar';
 import type {
   CollectionContext,
+  CollectionResult,
   HealthCheckContext,
   JobSourceAdapter,
   SourceAdapterConfig,
@@ -22,8 +24,9 @@ import { normalizeRawEvidence, type DeclaredRecordEvidence } from './normalize-e
  * record for its twelve entries inside `<script id="__NEXT_DATA__" …>`, so one listing
  * request yields everything the pipeline consumes — title, description HTML, region,
  * published/expiry dates, company, application method — without per-post fetches.
- * Page 1 embeds `props.pageProps.jobs` as an array, page N as `{ data, meta }`; both are
- * accepted (verified live 2026-10-22).
+ * `props.pageProps.jobs` is `{ data, meta }` on the pages observed live (2026-10-23) and a
+ * bare array on older captures; both are accepted. `meta.lastPage` is what makes the
+ * listing's coverage knowable.
  *
  * ponytail: no HTML-parser dependency — the JSON blob is lifted with a single regex and
  * parsed; text extraction is the same entity-and-tags strip the EffoySira adapter carries.
@@ -78,11 +81,28 @@ export function createEthiojobsAdapter(
     return typeof value === 'string' && value.trim() !== '' ? value : null;
   }
 
+  type ListingPage = {
+    entries: ListingEntry[];
+    /**
+     * The listing's last page number when the payload declares one (`meta.lastPage`); null on
+     * payloads that carry no pagination metadata. Only a known last page makes "this run saw
+     * the whole listing" a fact rather than a guess.
+     */
+    lastPage: number | null;
+    /** The page number the payload claims to be (`meta.pageNumber`); null when undeclared. */
+    pageNumber: number | null;
+  };
+
+  /** A declared pagination number is usable only as a positive integer. */
+  function asPositiveInt(value: unknown): number | null {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : null;
+  }
+
   /**
    * The structured `__NEXT_DATA__` payload of a listing page, or null when the page
    * carries none (shell/loading state) or malformed JSON.
    */
-  function extractListingEntries(html: string): ListingEntry[] | null {
+  function extractListingPage(html: string): ListingPage | null {
     const match =
       /<script id="__NEXT_DATA__" type="application\/json"[^>]*>([\s\S]*?)<\/script>/i.exec(
         html,
@@ -94,14 +114,22 @@ export function createEthiojobsAdapter(
     } catch {
       return null;
     }
-    // `jobs` is an array on page 1 and `{ data: [...] }` on page N (live-verified).
+    // `jobs` is `{ data, meta }` on page N and a bare array on older captures (both accepted).
     const props = (parsed as { props?: { pageProps?: { jobs?: unknown } } }).props;
     const jobs = props?.pageProps?.jobs;
     const entries =
-      Array.isArray(jobs) ? jobs : Array.isArray((jobs as { data?: unknown })?.data)
-        ? ((jobs as { data: unknown[] }).data as ListingEntry[])
-        : null;
-    return entries;
+      Array.isArray(jobs)
+        ? (jobs as ListingEntry[])
+        : Array.isArray((jobs as { data?: unknown })?.data)
+          ? ((jobs as { data: unknown[] }).data as ListingEntry[])
+          : null;
+    if (entries === null) return null;
+    const meta = (jobs as { meta?: Record<string, unknown> } | undefined)?.meta;
+    return {
+      entries,
+      lastPage: asPositiveInt(meta?.lastPage),
+      pageNumber: asPositiveInt(meta?.pageNumber),
+    };
   }
 
   /**
@@ -217,7 +245,7 @@ export function createEthiojobsAdapter(
 
   // ── port implementation ─────────────────────────────────────────────────────
 
-  async function collect(context: CollectionContext): Promise<RawJobEvidence[]> {
+  async function collect(context: CollectionContext): Promise<CollectionResult> {
     const { signal, now } = context;
     const evidence: RawJobEvidence[] = [];
 
@@ -225,21 +253,60 @@ export function createEthiojobsAdapter(
     // schedule governs freshness, and the raw store's identifier dedupe makes
     // re-observation free.
     const seen = new Set<string>();
+    // Coverage (FR-019): the run read the listing to its last page. Unknown pagination
+    // (payload without `meta`), a fetch failure or an abort all leave it false.
+    let lastPage: number | null = null;
+    let reachedListingEnd = false;
+    let unreadableEntries = 0;
+    // Window claim (FR-019): the oldest `date_published` among the entries this run read.
+    // Pages are served newest-first, so those entries are the listing's newest prefix; an
+    // unobserved Job published strictly after this floor was inside the part the run saw. An
+    // entry without a parseable date voids the claim: it might be the oldest one read.
+    let windowKnown = true;
+    let oldestPublishedAt: Date | null = null;
     for (let page = 1; page <= maxListingPages; page++) {
       if (signal?.aborted) break;
       const html = await get(listingUrl(page), signal);
       if (html === null) break;
-      const entries = extractListingEntries(html);
-      if (entries === null) break;
+      const listing = extractListingPage(html);
+      if (listing === null) break;
+      // A page that names a different page number than the one requested is not this
+      // page's listing (stale cache, soft redirect): nothing it says describes the
+      // catalogue, so the run stops trusting it here.
+      if (listing.pageNumber !== null && listing.pageNumber !== page) break;
+      // A later page may not shrink the declared end: a stale payload must never make the
+      // run believe it finished early.
+      if (listing.lastPage !== null) lastPage = Math.max(lastPage ?? 0, listing.lastPage);
 
-      for (const entry of entries) {
+      for (const entry of listing.entries) {
         const slug = asString(entry.slug);
         const title = asString(entry.title);
-        if (slug === null || title === null || seen.has(slug)) continue;
+        if (slug === null || title === null) {
+          // A listed entry this adapter cannot identify is a record it did not observe.
+          unreadableEntries += 1;
+          continue;
+        }
+        if (seen.has(slug)) continue;
         seen.add(slug);
 
         const descriptionHtml = asString(entry.description);
         const company = entry.company as { name?: unknown; email?: unknown } | null | undefined;
+        const publishedDateText = asString(entry.date_published);
+
+        if (publishedDateText === null) {
+          windowKnown = false;
+        } else {
+          const parsed = parseDate({
+            text: publishedDateText,
+            sourceCalendarHint: config.declaredCalendar,
+            declaredDateFormat: config.declaredDateFormat,
+          });
+          if (parsed.publishedAt === null) {
+            windowKnown = false;
+          } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
+            oldestPublishedAt = parsed.publishedAt;
+          }
+        }
 
         evidence.push({
           // The slug's leading id segment is the site's stable external identifier
@@ -252,7 +319,7 @@ export function createEthiojobsAdapter(
           // The description HTML is reduced to text so the shared text-based
           // normalizers (application target, description quality) read rows as usual.
           rawDescription: descriptionHtml === null ? null : extractText(descriptionHtml),
-          rawPublishedDateText: asString(entry.date_published),
+          rawPublishedDateText: publishedDateText,
           rawSalaryText:
             descriptionHtml === null ? null : extractSalaryLine(descriptionHtml),
           // Structured fields the publisher itself declares, preserved verbatim so
@@ -281,10 +348,21 @@ export function createEthiojobsAdapter(
           collectedAt: now,
         });
       }
+      if (lastPage !== null && page >= lastPage) {
+        reachedListingEnd = true;
+        break;
+      }
       if (page < maxListingPages) await delay(delayMs);
     }
 
-    return evidence;
+    // A page budget that stopped before the end still makes a window claim when every entry
+    // read was dated; an abort or an unidentifiable entry voids it.
+    const claimable = unreadableEntries === 0 && !signal?.aborted && windowKnown;
+    return {
+      records: evidence,
+      catalogueExhausted: reachedListingEnd && claimable,
+      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+    };
   }
 
   async function normalize(raw: RawJobEvidence): Promise<NormalizedJob> {
@@ -299,10 +377,11 @@ export function createEthiojobsAdapter(
   }
 
   function countEntries(html: string): number {
-    const entries = extractListingEntries(html);
-    if (entries === null) return 0;
-    return entries.filter((entry) => asString(entry.slug) !== null && asString(entry.title) !== null)
-      .length;
+    const listing = extractListingPage(html);
+    if (listing === null) return 0;
+    return listing.entries.filter(
+      (entry) => asString(entry.slug) !== null && asString(entry.title) !== null,
+    ).length;
   }
 
   async function healthCheck(context: HealthCheckContext): Promise<HealthResult> {

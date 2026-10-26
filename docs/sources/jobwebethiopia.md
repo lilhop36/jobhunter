@@ -73,6 +73,11 @@ path — the two fields the matcher and the notification depend on.
 - **Failure behaviour:** a posting page that cannot be read yields no record for that
   posting (the listing excerpt is a truncated preview, not a description). The run's
   counters therefore show it as never discovered, and the next run reads it again.
+- **Coverage window (FR-019, ADR-0010):** each run records `oldestListingPublishedAt` from the
+  posting page's `<div class="date">`. At the one-listing-page budget (six newest postings of
+  126 pages) a run makes a window claim; an exhaustion claim would require reading to the end
+  of the listing, confirmed by the page past it answering 404/410. A posting that is
+  unreadable or undated voids the claim.
 - **Health check:** counts listing cards on `/jobs/`; HEALTHY with cards, DEGRADED with a
   readable page holding none, FAILING when the page is unreachable or errors.
 - **Operational note:** on a host that reaches the internet only through an HTTP proxy, the

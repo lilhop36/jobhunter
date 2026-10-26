@@ -41,7 +41,8 @@ const SOURCE_RUN_COLUMNS = Prisma.raw(`
   "startedAt", "finishedAt", "durationMs", "jobsDiscovered", "jobsAccepted",
   "jobsDuplicate", "jobsRejected", "undeduplicable", "fallbackIdentities",
   "parseFailures", "httpFailures",
-  "unexpectedZeroResults", "enrichmentScheduled", "errorSummary"
+  "unexpectedZeroResults", "catalogueExhausted", "oldestListingPublishedAt",
+  "enrichmentScheduled", "errorSummary"
 `);
 
 /** The partial unique index that enforces FR-003 source exclusivity. */
@@ -65,12 +66,23 @@ interface SourceRunRow {
   parseFailures: number;
   httpFailures: number;
   unexpectedZeroResults: boolean;
+  catalogueExhausted: boolean;
+  oldestListingPublishedAt: Date | string | null;
   enrichmentScheduled: boolean;
   errorSummary: string | null;
 }
 
 function toDate(value: Date | string): Date {
   return value instanceof Date ? value : new Date(value);
+}
+
+/**
+ * A Date bound straight into a `timestamp(3)` column is written in the session's zone, which
+ * would shift a UTC-midnight publication date by that offset. Send UTC-naive text instead, the
+ * same way `publishedAt` is written, so both sides compare like for like.
+ */
+function asUtcTimestamp(value: Date | null): string | null {
+  return value === null ? null : value.toISOString();
 }
 
 function toRecord(row: SourceRunRow): SourceRunRecord {
@@ -91,6 +103,9 @@ function toRecord(row: SourceRunRow): SourceRunRecord {
     parseFailures: row.parseFailures,
     httpFailures: row.httpFailures,
     unexpectedZeroResults: row.unexpectedZeroResults,
+    catalogueExhausted: row.catalogueExhausted,
+    oldestListingPublishedAt:
+      row.oldestListingPublishedAt === null ? null : toDate(row.oldestListingPublishedAt),
     enrichmentScheduled: row.enrichmentScheduled,
     errorSummary: row.errorSummary,
   };
@@ -175,6 +190,8 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
             "parseFailures" = ${outcome.parseFailures},
             "httpFailures" = ${outcome.httpFailures},
             "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},
+            "catalogueExhausted" = ${outcome.catalogueExhausted},
+            "oldestListingPublishedAt" = ${asUtcTimestamp(outcome.oldestListingPublishedAt)}::timestamp,
             "enrichmentScheduled" = ${outcome.enrichmentScheduled},
             "errorSummary" = ${outcome.errorSummary ?? null},
             "updatedAt" = ${NOW_UTC}

@@ -7,6 +7,7 @@ import {
   SOURCE_COLLECTION_TASK_TYPE,
 } from '@application/ingestion';
 import { PermanentWorkTaskError, describeError } from '@application/worker';
+import type { WorkerLogger } from '@ports/worker-logger';
 import type { JobSourceAdapter } from '@ports/source-adapter';
 import { FakeSourceAdapter, makeFakeConfig } from '../support/fake-source-adapter';
 
@@ -21,6 +22,7 @@ const TASK = {
   type: SOURCE_COLLECTION_TASK_TYPE,
   payload: { sourceId: '00000000-0000-0000-0000-000000000001', trigger: 'SCHEDULE' },
 } as WorkTaskRecord;
+const SOURCE_ID = '00000000-0000-0000-0000-000000000001';
 
 function adapterWithExpectation(
   expectation: SourceResultExpectation | undefined,
@@ -34,13 +36,30 @@ function adapterWithExpectation(
 
 function handlerCapturingRun(
   adapter: JobSourceAdapter,
-): { input(): RunSourceCollectionInput; handler: ReturnType<typeof createSourceCollectionHandler> } {
+  overrides: {
+    outcome?: Partial<{
+      status: SourceRunStatus;
+      catalogueExhausted: boolean;
+      oldestListingPublishedAt: Date | null;
+    }>;
+    sweep?: (sourceId: string) => Promise<{ retired: number; restored: number; examined: number }>;
+    logger?: WorkerLogger;
+  } = {},
+): {
+  input(): RunSourceCollectionInput;
+  handler: ReturnType<typeof createSourceCollectionHandler>;
+} {
   let captured: RunSourceCollectionInput | undefined;
   const collection = {
     run: async (input: RunSourceCollectionInput) => {
       captured = input;
       return {
-        run: null,
+        run: {
+          id: 'run-1',
+          sourceId: SOURCE_ID,
+          catalogueExhausted: overrides.outcome?.catalogueExhausted ?? false,
+          oldestListingPublishedAt: overrides.outcome?.oldestListingPublishedAt ?? null,
+        },
         funnel: {
           collected: 1,
           parsed: 1,
@@ -52,7 +71,7 @@ function handlerCapturingRun(
           parseFailures: 0,
           httpFailures: 0,
         },
-        status: SourceRunStatus.SUCCEEDED,
+        status: overrides.outcome?.status ?? SourceRunStatus.SUCCEEDED,
         unexpectedZeroResults: false,
       };
     },
@@ -63,6 +82,8 @@ function handlerCapturingRun(
     collection,
     staleRunSeconds: 300,
     acquisitionTimeoutMs: 120_000,
+    sweep: overrides.sweep,
+    logger: overrides.logger,
   });
 
   return {
@@ -104,6 +125,86 @@ describe('source collection handler — approved expectations reach the run', ()
     await expect(
       handler({ task: TASK, signal: new AbortController().signal }),
     ).rejects.toBeInstanceOf(PermanentWorkTaskError);
+  });
+});
+
+describe('source collection handler — post-collection lifecycle sweep (FR-019)', () => {
+  it('sweeps after a SUCCEEDED run that read the whole listing', async () => {
+    const swept: string[] = [];
+    const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
+      outcome: { status: SourceRunStatus.SUCCEEDED, catalogueExhausted: true },
+      sweep: async (sourceId) => {
+        swept.push(sourceId);
+        return { retired: 2, restored: 0, examined: 5 };
+      },
+    });
+
+    await handler({ task: TASK, signal: new AbortController().signal });
+
+    expect(swept).toEqual([SOURCE_ID]);
+  });
+
+  it('sweeps after a SUCCEEDED run that recorded a dated coverage window', async () => {
+    const swept: string[] = [];
+    const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
+      outcome: {
+        status: SourceRunStatus.SUCCEEDED,
+        catalogueExhausted: false,
+        oldestListingPublishedAt: new Date('2026-10-21T00:00:00.000Z'),
+      },
+      sweep: async (sourceId) => {
+        swept.push(sourceId);
+        return { retired: 1, restored: 0, examined: 5 };
+      },
+    });
+
+    await handler({ task: TASK, signal: new AbortController().signal });
+    expect(swept).toEqual([SOURCE_ID]);
+  });
+
+  it('does not sweep when the run left part of the listing unread and claimed no window', async () => {
+    const swept: string[] = [];
+    const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
+      outcome: {
+        status: SourceRunStatus.SUCCEEDED,
+        catalogueExhausted: false,
+        oldestListingPublishedAt: null,
+      },
+      sweep: async (sourceId) => {
+        swept.push(sourceId);
+        return { retired: 0, restored: 0, examined: 5 };
+      },
+    });
+
+    await handler({ task: TASK, signal: new AbortController().signal });
+    expect(swept).toEqual([]);
+  });
+
+  it('does not sweep a partial run even if the adapter reported coverage', async () => {
+    const swept: string[] = [];
+    const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
+      outcome: { status: SourceRunStatus.PARTIAL, catalogueExhausted: true },
+      sweep: async (sourceId) => {
+        swept.push(sourceId);
+        return { retired: 0, restored: 0, examined: 5 };
+      },
+    });
+
+    await handler({ task: TASK, signal: new AbortController().signal });
+    expect(swept).toEqual([]);
+  });
+
+  it('swallows a sweep error and still resolves the task', async () => {
+    const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
+      outcome: { status: SourceRunStatus.SUCCEEDED, catalogueExhausted: true },
+      sweep: async () => {
+        throw new Error('sweep blew up');
+      },
+    });
+
+    await expect(
+      handler({ task: TASK, signal: new AbortController().signal }),
+    ).resolves.toBeUndefined();
   });
 });
 

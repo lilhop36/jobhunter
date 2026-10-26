@@ -25,9 +25,9 @@ const LISTING_PAGE_1 = `<!DOCTYPE html><html><body>
 <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":[{"id":"abc","title":"Senior Accountant","slug":"2qdbkevrhp-senior-accountant","type":8,"date_published":"2026-10-22T08:48:44.235Z","state":"Addis Ababa","description":"<p>We need an accountant. Send your CV to hr@alpha.com</p>","date_expiry":"2026-11-02T23:59:59.000000Z","company":{"name":"Alpha Clinic","logo":"logo.png"},"application_method":"EMAIL","application_email":"hr@alpha.com"},{"id":"def","title":"Driver (Bishoftu / Night Shift)","slug":"t8jxf0tin5-driver-bishoftu","type":8,"date_published":"2026-10-22T08:44:05.000000Z","state":"Oromia","description":"<p>Drive safely.</p>","date_expiry":"2026-11-02T23:59:59.000000Z","company":{"name":"Holland Dairy P.L.C"},"application_method":"ATS","application_email":null}]}}}</script>
 </body></html>`;
 
-/** Page 2 returns one different job to verify dedup + pagination. */
+/** Page 2 returns one different job to verify dedup + pagination; live page N is `{ data, meta }`. */
 const LISTING_PAGE_2 = `<!DOCTYPE html><html><body>
-<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":[{"id":"ghi","title":"Data Collector","slug":"9kablwen6z-data-collector","type":10,"date_published":"2026-10-22T07:19:05.000000Z","state":"Tigray","description":"<p>Collect data.</p>","date_expiry":"2026-11-04T23:59:59.000000Z","company":{"name":"NRC"},"application_method":"ATS","application_email":null}]}}}</script>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":{"data":[{"id":"ghi","title":"Data Collector","slug":"9kablwen6z-data-collector","type":10,"date_published":"2026-10-22T07:19:05.000000Z","state":"Tigray","description":"<p>Collect data.</p>","date_expiry":"2026-11-04T23:59:59.000000Z","company":{"name":"NRC"},"application_method":"ATS","application_email":null}],"meta":{"pageNumber":2,"itemsPerPage":12,"lastPage":2,"total":13}}}}}</script>
 </body></html>`;
 
 /** Duplicate of page 1's first entry to verify cross-page dedup. */
@@ -76,7 +76,7 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
 
     expect(evidence).toHaveLength(3);
     const first = evidence[0];
@@ -105,7 +105,7 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     // Page 1 had 2, page 2 re-emits the first → only 2 survive.
     expect(evidence).toHaveLength(2);
   });
@@ -116,7 +116,11 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       delay: async () => {},
     });
 
-    await expect(adapter.collect(context())).resolves.toEqual([]);
+    await expect(adapter.collect(context())).resolves.toEqual({
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
   });
 
   it('stops between requests once the signal is aborted', async () => {
@@ -134,7 +138,7 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context({ signal: controller.signal }));
+    const { records: evidence } = await adapter.collect(context({ signal: controller.signal }));
     // Page 1 was served before abort; page 2 must not be fetched.
     expect(evidence.length).toBeGreaterThanOrEqual(1);
   });
@@ -155,6 +159,102 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
   });
 });
 
+describe('Ethiojobs adapter — catalogue coverage (FR-019)', () => {
+  it('reports the listing exhausted when the run reaches meta.lastPage', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://ethiojobs.net/jobs': LISTING_PAGE_1,
+        'https://ethiojobs.net/jobs?page=2': LISTING_PAGE_2,
+      }),
+      delay: async () => {},
+    });
+
+    // Page 2's meta declares lastPage 2: the run read the listing to its end.
+    const { records, catalogueExhausted } = await adapter.collect(context());
+    expect(catalogueExhausted).toBe(true);
+    expect(records).toHaveLength(3);
+  });
+
+  it('does not report coverage while pages remain beyond the page budget', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://ethiojobs.net/jobs': LISTING_PAGE_1,
+        'https://ethiojobs.net/jobs?page=2': EMPTY_PAGE.replace(
+          '<body>',
+          '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":{"data":[],"meta":{"pageNumber":2,"lastPage":101}}}}}</script>',
+        ) + '</body></html>',
+      }),
+      delay: async () => {},
+    });
+
+    const { catalogueExhausted, oldestListingPublishedAt } = await adapter.collect(context());
+    expect(catalogueExhausted).toBe(false);
+    // Every entry read was dated, so the run still knows the window it covered.
+    expect(oldestListingPublishedAt).toEqual(new Date('2026-10-22T00:00:00.000Z'));
+  });
+
+  it('reports the oldest publication date across the pages it read', async () => {
+    const olderEntry = LISTING_PAGE_1.replace('2026-10-22T08:48:44.235Z', '2026-10-20T08:48:44.235Z');
+    const cappedPage2 = LISTING_PAGE_2.replace('"lastPage":2', '"lastPage":101');
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://ethiojobs.net/jobs': olderEntry,
+        'https://ethiojobs.net/jobs?page=2': cappedPage2,
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-20T00:00:00.000Z'));
+  });
+
+  it('makes no window claim when an entry it read carries no date', async () => {
+    const undated = LISTING_PAGE_1.replace('"date_published":"2026-10-22T08:44:05.000000Z",', '');
+    const adapter = createEthiojobsAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': undated }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    // An undated entry could be the oldest one read, so the floor would be a guess.
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('makes no window claim when an entry cannot be identified', async () => {
+    const unidentifiable = `<!DOCTYPE html><html><body>
+<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"jobs":{"data":[
+{"title":"No slug","date_published":"2026-10-22T08:00:00.000Z","company":{"name":"X"}},
+{"id":"ok","title":"Usable Role","slug":"ok-usable-role","date_published":"2026-10-21T08:00:00.000Z","company":{"name":"Y"}}
+],"meta":{"pageNumber":1,"lastPage":50}}}}}</script>
+</body></html>`;
+    const adapter = createEthiojobsAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': unidentifiable }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    // The unidentifiable entry is a record the run did not observe, so it saw nothing
+    // bounded it can claim.
+    expect(result.records).toHaveLength(1);
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
+
+  it('does not report coverage when the payload carries no pagination metadata', async () => {
+    // The array shape (older captures) declares no lastPage, so the run cannot claim it
+    // saw everything even though it stopped at its page budget.
+    const adapter = createEthiojobsAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': LISTING_PAGE_1 }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.records).toHaveLength(2);
+    expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-22T00:00:00.000Z'));
+  });
+});
+
 describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-016)', () => {
   it('maps structured evidence through the shared normalizers and records provenance', async () => {
     const adapter = createEthiojobsAdapter(config(), {
@@ -162,7 +262,8 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
       delay: async () => {},
     });
 
-    const [raw] = await adapter.collect(context());
+    const { records } = await adapter.collect(context());
+    const [raw] = records;
     const job = await adapter.normalize(raw);
 
     expect(job.canonicalUrl).toBe(canonicalizeUrl('https://ethiojobs.net/job/2qdbkevrhp-senior-accountant'));
@@ -191,7 +292,7 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
       fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
       delay: async () => {},
     });
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     const normalized = await Promise.all(evidence.map((raw) => adapter.normalize(raw)));
     const byTitle = new Map(normalized.map((job) => [job.title, job]));
 
@@ -216,7 +317,7 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
       fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
       delay: async () => {},
     });
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     const raw = evidence.find((e) => e.rawTitle === 'In Person Role')!;
     const job = await adapter.normalize(raw);
 
@@ -231,7 +332,7 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
       fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
       delay: async () => {},
     });
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     const raw = evidence.find((e) => e.rawTitle === 'Malformed Email Role')!;
     const job = await adapter.normalize(raw);
 
@@ -247,7 +348,7 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
       delay: async () => {},
     });
 
-    const evidence = await adapter.collect(context());
+    const { records: evidence } = await adapter.collect(context());
     // Second entry is "Driver" with application_method ATS and no email in the description.
     // No usable path is declared, so the honest state is UNKNOWN - not a fabricated target.
     const driver = evidence.find((e) => e.rawTitle === 'Driver (Bishoftu / Night Shift)')!;

@@ -56,3 +56,9 @@ never touches the robots-disallowed REST API.
 - **Observed field yield (18 postings):** locations resolved (ADDIS_ABABA, ETHIOPIA_CITY),
   application targets resolved (EMAIL, ONLINE_URL, IN_PERSON), salary mostly non-numeric
   (AS_PER_SCALE/NEGOTIABLE, one EXACT/ETB), description quality SUFFICIENT on all 18.
+- **Coverage window (FR-019, ADR-0010):** each run records `oldestListingPublishedAt` from
+  `article:published_time` on the posts it reads. At the two-page budget the floor is the
+  18th-newest post (2026-10-21, measured 2026-10-24), so the presence sweep may retire only
+  postings published strictly after it; older unseen postings stay `ACTIVE`. The 84-page
+  archive is never read to its end at this budget, so runs make window claims and never an
+  exhaustion claim; an undated or unreadable post voids the window claim entirely.

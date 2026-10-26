@@ -99,6 +99,27 @@ export interface HealthCheckContext {
 }
 
 /**
+ * What one collection pass returned.
+ *
+ * `catalogueExhausted` says this pass read the source's listing to its end, so a record it
+ * did not observe is evidence that the source stopped publishing it (FR-019). A pass cut
+ * short by a page budget, a fetch failure or an abort says nothing about what it did not
+ * see, and must report `false`. Reporting `true` without having reached the end of the
+ * listing would let the lifecycle sweep retire live postings.
+ *
+ * `oldestListingPublishedAt` is the narrower claim a capped pass can still make: the oldest
+ * publication date among the listing entries it read. A record published strictly after
+ * this floor was inside the window the pass saw; entries at or before it may lie beyond the
+ * pages read (published dates are date-only, so the floor date itself is excluded). `null`
+ * means no window claim: an entry was unreadable or undated, or the pass was aborted.
+ */
+export interface CollectionResult {
+  records: RawJobEvidence[];
+  catalogueExhausted: boolean;
+  oldestListingPublishedAt: Date | null;
+}
+
+/**
  * Port for a single job source (SRS 3.5 / 7.7).
  *
  * An implementation represents exactly one configured source and is built from
@@ -112,8 +133,8 @@ export interface HealthCheckContext {
  */
 export interface JobSourceAdapter {
   readonly config: SourceAdapterConfig;
-  /** Fetch and parse source content into canonical raw evidence. */
-  collect(context: CollectionContext): Promise<RawJobEvidence[]>;
+  /** Fetch and parse source content into canonical raw evidence, and report listing coverage. */
+  collect(context: CollectionContext): Promise<CollectionResult>;
   /** Map raw evidence to canonical Job fields (SRS 3.5 `normalize`). */
   normalize(raw: RawJobEvidence): Promise<NormalizedJob>;
   /** Report source health, without a full collection where feasible. */

@@ -15,7 +15,7 @@ describe('JobSourceAdapter contract', () => {
     const row = makeRawJob({ sourceJobIdentifier: 'job-1', rawTitle: 'Backend Engineer' });
     const adapter = new FakeSourceAdapter(makeFakeConfig(), [row]);
 
-    const collected = await adapter.collect(CONTEXT);
+    const { records: collected } = await adapter.collect(CONTEXT);
 
     expect(collected).toHaveLength(1);
     expect(collected[0]).toEqual(row);

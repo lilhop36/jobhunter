@@ -33,6 +33,8 @@ const HEALTHY_RUN: SourceRunOutcome = {
   parseFailures: 1,
   httpFailures: 0,
   unexpectedZeroResults: false,
+  catalogueExhausted: true,
+  oldestListingPublishedAt: null,
   enrichmentScheduled: false,
   errorSummary: null,
 };

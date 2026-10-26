@@ -1,4 +1,5 @@
 import { DescriptionQuality, LifecycleStatus } from '@domain/enums';
+import type { LifecycleRunEvidence } from '@domain/lifecycle/lifecycle-policy';
 import { NormalizedJob } from '@domain/types';
 
 /**
@@ -51,8 +52,19 @@ export interface LifecycleCandidate {
   currentStatus: LifecycleStatus;
   /** `lastSeenAt` of the Job's newest capture, or null when that capture is gone. */
   lastObservedAt: Date | null;
-  /** Start of the source's most recent informative run, or null when it has none. */
-  latestQualifyingRunStartedAt: Date | null;
+  /**
+   * The Job's stored publication date, used to place it inside a run's coverage window.
+   * Null when the source evidence yielded no date.
+   */
+  publishedAt: Date | null;
+  /**
+   * The source's most recent informative run whose coverage includes this Job - it read the
+   * whole listing, or its publication-date floor is below the Job's date - or null when no
+   * run could have seen it. A newer capped run that does not reach this Job is skipped in
+   * favour of an older complete read: it cannot speak for the Job, but it does not erase what
+   * an earlier run covered.
+   */
+  latestQualifyingRun: LifecycleRunEvidence | null;
 }
 
 export interface LifecycleStatusUpdate {
