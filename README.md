@@ -31,7 +31,7 @@ createdb jobhunter            # or: CREATE DATABASE jobhunter;
 createdb jobhunter_test       # integration tests; the name MUST end in _test
 
 npx prisma generate
-npx prisma migrate deploy     # applies the 12 versioned migrations
+npx prisma migrate deploy     # applies all versioned migrations
 
 npm run seed:sources          # registers the 3 approved sources
 npm run seed:candidate -- --template   # shows the profile file format, writes nothing
@@ -60,6 +60,8 @@ Node's `--env-file`, so `.env` must exist. Tests load it themselves (`tests/supp
 | `SOURCE_SCHEDULER_INTERVAL_MS`, `NOTIFICATION_DISPATCH_INTERVAL_MS` | worker | no | Default 30 s |
 | `LOG_LEVEL` | API | no | Fastify level, default `info` |
 | `AI_PROVIDER` | nothing yet | — | Reserved: documented but currently unread (drift report D17) |
+| `BACKUP_DIR` | `npm run backup` | no | Output directory; defaults to git-ignored `backups/`. Point it at another disk |
+| `PG_BIN` | backup scripts | no | PostgreSQL bin directory; auto-detected on Windows, otherwise from `PATH` |
 
 Secrets belong in `.env` only. It is git-ignored; `.env.example` holds placeholders.
 
@@ -92,7 +94,10 @@ The JSON API has **no authentication**; it binds to loopback by default and must
 - Some invariants are hand-written SQL (partial unique indexes, the `SKIP LOCKED` claim query).
   They live in `prisma/migrations/**/migration.sql` and are covered by
   `tests/integration/partial-indexes.spec.ts`.
-- No automated backup exists yet (FR-021 open). Take manual dumps: `pg_dump "$DATABASE_URL" > dump.sql`.
+- Backups: `npm run backup` writes a compressed, validated `pg_dump` archive. The `backup:drill`
+  command restores a fresh backup into a disposable database and compares table sets and row
+  counts. Scheduling, retention, and off-machine storage are operator steps. See
+  [`docs/engineering/backup-and-restore.md`](docs/engineering/backup-and-restore.md).
 
 ## Tests
 
@@ -134,7 +139,8 @@ build: the UI is server-rendered HTML.
 1. Stop the API and worker (SIGTERM; both shut down gracefully and release their in-flight work).
 2. Migrations are forward-only. Roll back the code, not the database; an already-applied migration
    stays applied. If a migration failed midway, Prisma records it in `_prisma_migrations`; restore
-   from a `pg_dump` and re-apply.
+   from a verified backup (see
+   [`backup-and-restore.md`](docs/engineering/backup-and-restore.md)) and re-apply.
 3. Restarting the worker is safe. On start it reaps expired leases and stale `RUNNING` source runs
    (`SOURCE_STALE_RUN_SECONDS`) before claiming new work, so a killed process cannot wedge a source.
 4. Stuck work is inspectable:
@@ -149,9 +155,11 @@ build: the UI is server-rendered HTML.
 
 ## Known gaps
 
-No API authentication, no backup automation, no AI provider, no CI, and no cross-source
-deduplication. See the [drift report](docs/engineering/srs-implementation-drift-2026-10-23.md) for
-evidence and the smallest correction for each.
+No API authentication, no installed backup schedule (the backup and restore-drill scripts exist and
+have been verified; scheduling and off-machine storage are deployment steps), no AI provider, no
+CI, and no cross-source deduplication. See the
+[drift report](docs/engineering/srs-implementation-drift-2026-10-23.md) for evidence and the
+smallest correction for each.
 
 ## Layout
 
@@ -164,6 +172,6 @@ src/ports           interfaces the application depends on
 src/infrastructure  Prisma repositories, Telegram sender, source adapters
 prisma              schema + versioned migrations
 tests               unit / integration / failure suites
-scripts             operator commands (seeds, telegram resolve, disk check)
+scripts             operator commands (seeds, telegram resolve, disk check, backup/restore drill)
 docs                SRS, ADRs, source approvals, reports
 ```

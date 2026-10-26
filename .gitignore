@@ -13,6 +13,9 @@ coverage/
 .vitest/
 .vite/
 
+# Database backups (contain candidate and notification data)
+backups/
+
 # Environment / secrets
 .env
 .env.*
