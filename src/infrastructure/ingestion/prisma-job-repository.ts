@@ -247,9 +247,12 @@ export class PrismaJobRepository implements JobRepository {
              AND r."jobsDiscovered" > 0
              AND (
                r."catalogueExhausted" = true
+               -- publishedAt is a naive timestamp holding a UTC value, so it is interpreted as
+               -- UTC here rather than left for PostgreSQL to resolve against the session's zone
+               -- (ENG-022). The floor itself is stored as timestamptz.
                OR (j."publishedAt" IS NOT NULL
                    AND r."oldestListingPublishedAt" IS NOT NULL
-                   AND j."publishedAt" > r."oldestListingPublishedAt")
+                   AND (j."publishedAt" AT TIME ZONE 'UTC') > r."oldestListingPublishedAt")
                -- A run that captured this Job is relevant even when the Job's date sits
                -- outside its window: presence restores, and needs no coverage claim.
                OR (rj."lastSeenAt" IS NOT NULL AND rj."lastSeenAt" >= r."startedAt")

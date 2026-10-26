@@ -50,6 +50,11 @@ A window claim requires every read entry to be identified and dated. One unreada
 entry could be the oldest one read, which would make the floor a guess; the run then records no
 floor and the sweep ignores it. An aborted run records neither signal.
 
+The floor is stored as `timestamptz(3)` (ENG-022), while `jobs.publishedAt` remains the existing
+naive `timestamp(3)` holding a UTC value. The read model therefore compares them as
+`(publishedAt AT TIME ZONE 'UTC') > oldestListingPublishedAt`, so the window boundary cannot move
+with the session's zone.
+
 The floor is compared with a **strict** `>` because publication dates are date-only: a page
 boundary can split a day, so an equally-dated entry may sit on the unread next page. The floor
 date itself is therefore excluded from the window.

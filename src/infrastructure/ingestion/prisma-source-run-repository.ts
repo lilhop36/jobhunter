@@ -77,9 +77,9 @@ function toDate(value: Date | string): Date {
 }
 
 /**
- * A Date bound straight into a `timestamp(3)` column is written in the session's zone, which
- * would shift a UTC-midnight publication date by that offset. Send UTC-naive text instead, the
- * same way `publishedAt` is written, so both sides compare like for like.
+ * Sent as an explicit UTC instant so the `timestamptz` column cannot resolve the value against
+ * the session's zone (ENG-022). The floor is a UTC midnight, like the `publishedAt` it is
+ * compared against.
  */
 function asUtcTimestamp(value: Date | null): string | null {
   return value === null ? null : value.toISOString();
@@ -191,7 +191,7 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
             "httpFailures" = ${outcome.httpFailures},
             "unexpectedZeroResults" = ${outcome.unexpectedZeroResults},
             "catalogueExhausted" = ${outcome.catalogueExhausted},
-            "oldestListingPublishedAt" = ${asUtcTimestamp(outcome.oldestListingPublishedAt)}::timestamp,
+            "oldestListingPublishedAt" = ${asUtcTimestamp(outcome.oldestListingPublishedAt)}::timestamptz,
             "enrichmentScheduled" = ${outcome.enrichmentScheduled},
             "errorSummary" = ${outcome.errorSummary ?? null},
             "updatedAt" = ${NOW_UTC}
