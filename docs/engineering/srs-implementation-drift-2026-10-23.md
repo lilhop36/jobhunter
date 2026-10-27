@@ -1,7 +1,7 @@
 # SRS ↔ Implementation Drift Report
 
 **Date:** 2026-10-23
-**Last updated:** 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill (2026-10-25), migration count refreshed.
+**Last updated:** 2026-10-27 — D20 corrected to PARTIAL (the §7.8 reduced-yield rule is not implemented), migration count refreshed to 15, ENG-022 resolution recorded (D32). Earlier: 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill.
 **Baseline commit:** `31db910` (working tree clean except untracked `.freebuff/`)
 **Authoritative specification:** `docs/SRS/JobHunter-v1.1-SRS.md`
 **Method:** read-only inspection of the SRS, schema, migrations, routes, domain/application/infrastructure code, tests and docs. No SRS, schema or code was changed to produce this report. Nothing was executed against a real source or Telegram.
@@ -20,7 +20,7 @@ One internal inconsistency remains inside v1.1: the Document Control row still s
 
 - **API:** Fastify 4 (not NestJS, which §2.5 and §7.2 name), one process, loopback-bound by default.
 - **Worker:** separate Node.js process; PostgreSQL-backed `WorkTask` queue with `SKIP LOCKED` claiming, lease tokens and expiry reaping.
-- **Database:** PostgreSQL, 14 versioned migrations, Prisma schema plus hand-written partial indexes.
+- **Database:** PostgreSQL, 15 versioned migrations, Prisma schema plus hand-written partial indexes.
 - **Web:** server-rendered HTML, no client JavaScript, CSP `default-src 'none'`.
 - **Telegram:** outbox → dispatcher → `sendMessage`, plain text, retry/backoff, 429 `retry_after`.
 - **Sources:** 3 approved adapters — Ethiojobs, JobWebEthiopia, Effoysira (AC-001 met: 3, the SRS minimum of "3–5").
@@ -115,7 +115,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
 | D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **PARTIAL** | `scripts/backup.mjs` (validated custom-format dump) and `scripts/restore-drill.mjs` (restores into a disposable database, compares table sets and exact row counts, drops it in a `finally` block) exist and passed on 2026-10-25: 17/17 tables, 484/484 rows. Restore, scheduling and retention are documented in `docs/engineering/backup-and-restore.md`. No `BackupRun` model (intentional, §7); no schedule or off-machine copy is installed yet — those are deployment steps. | deployment step | medium |
-| D20 | FR-020 / §7.8 source metrics and drift detection | **MATCH** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health. AI metrics N/A with D17. Funnel view (collected→…→notified) is not a page. | intentional | low |
+| D20 | FR-020 / §7.8 source metrics and drift detection | **PARTIAL** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health — the metrics list is met. §7.8 "Drift detection" (`docs/SRS/JobHunter-v1.1-SRS.md:1264`) also requires an operator-visible warning for a source whose **extraction yield is sharply reduced**, not only zero: `isUnexpectedZeroResult` (`src/domain/types/source-run.ts:94-99`) fires on `collected === 0` and nothing compares a run against the source's recent yield, so an 18→1 collapse reports HEALTHY. Also absent: nothing warns when a source stops being collected at all — `lastSuccessfulRunAt` is stored and rendered (`apps/api/routes/web.ts:747`, `apps/api/routes/sources.ts:155`) but never compared with the source's schedule interval, and `classifySourceHealth` (`src/domain/health/source-health-policy.ts:70-98`) reads only run status and the zero flag, so a source whose scheduler never fires keeps its last verdict. Funnel view (collected→…→notified) is not a page. AI metrics N/A with D17. | accidental (the yield rule was never implemented; this row previously claimed MATCH) | high |
 | D21 | AC-020 14-day precision | **MISSING** | No measurement tooling or log; feedback storage exists, so this is process, not code. | not started | high |
 
 ### 4.7 Architecture and engineering rules
@@ -124,11 +124,12 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | --- | --- | --- | --- | --- | --- |
 | D22 | §2.5/§7.2 "Backend API: NestJS" | **DIVERGENT** | Fastify. `docs/architecture/architecture.md` is a **placeholder** ("Status: Placeholder"), so no ADR records the substitution. | accidental (undocumented) | medium |
 | D23 | ENG-015 "dependency direction enforced by an automated check in continuous integration" | **MISSING** | Direction is respected in practice but nothing enforces it: no layering test, and **no CI configuration at all** (no `.github/`). | accidental | medium |
-| D24 | ENG-020 versioned migrations; ENG-021 DB invariants guarded by tests | **MATCH** | 14 migrations; partial unique indexes covered by `tests/integration/partial-indexes.spec.ts`. | intentional | low |
+| D24 | ENG-020 versioned migrations; ENG-021 DB invariants guarded by tests | **MATCH** | 15 migrations; partial unique indexes covered by `tests/integration/partial-indexes.spec.ts`. | intentional | low |
 | D25 | ENG-023/024/025/026 durable work | **MATCH** | SKIP LOCKED claim, per-claim lease token, attempt-on-claim, reaping, `FAILED`/`DEAD_LETTER` retained. | intentional | low |
 | D26 | ENG-028 numeric units | **MATCH** | `Percent` and `Probability` are distinct branded types; DB uses exact `Decimal`. | intentional | low |
 | D27 | ENG-031 failure tests | **PARTIAL** | Worker kill, SIGTERM, source timeout and zero-result are covered; AI timeout/invalid output cannot be (D17); dead-URL recovery cannot be (D9). | depends on D9/D17 | low |
 | D28 | ENG-033 "verification evidence reported before merge" | **PARTIAL** | Done manually and consistently in this repo; no CI to enforce it. | process | low |
+| D32 | ENG-022 "New timestamp columns use a timezone-aware type" | **MATCH** (for new columns) | `source_runs.oldestListingPublishedAt` is `timestamptz(3)` as of `20261024150000`, written as an explicit UTC instant; ADR-0010 §2.1 records the comparison against the still-naive `jobs.publishedAt` as `(publishedAt AT TIME ZONE 'UTC') > oldestListingPublishedAt` so the window boundary cannot move with the session zone. The conversion was **forward-only**: `20261024140000` created the column naive and had already been applied to `jobhunter_test`, so amending it would change a recorded checksum and break `migrate deploy`. Pre-existing naive columns (`publishedAt`, `createdAt`, …) are untouched — converting them rewrites data and is a separate decision. | resolved (was: audit M10) | low |
 
 ### 4.8 Data model
 
@@ -199,6 +200,7 @@ Ordered by cost, not importance; each is independently reviewable.
 | D17/D18 AI | Leave deferred. The milestone is M4; nothing else depends on it. |
 | D19 backup | **Done 2026-10-25** — scripts plus a recorded restore drill (17 tables / 484 rows). Remaining deployment steps: install a schedule and an off-machine copy, then run the drill against it. No `BackupRun` model is needed for a single-operator MVP. |
 | D21 precision | Spreadsheet, not code. |
+| D20 yield drift (§7.8) | One domain rule beside `isUnexpectedZeroResult` that compares a run's `jobsDiscovered` with the source's recent successful runs and raises `DEGRADED`, plus the same treatment for `lastSuccessfulRunAt` ageing past the source's interval. Both need a threshold the owner picks; the code change is small, the decision is not. The row claimed MATCH until 2026-10-27, which overstated §7.8; the status is now corrected, the rule is still unimplemented. |
 | D1 API auth | Decide the trust boundary first (see §8); the code change follows the decision. |
 
 ---
@@ -217,3 +219,8 @@ Ordered by cost, not importance; each is independently reviewable.
 - Not executed in this pass: live source collection, live Telegram delivery. A restore drill **was** executed on 2026-10-25 (D19). Statuses for AC-001/AC-002/AC-015 rely on earlier recorded runs plus the current code and tests; AC-019 is backed by the 2026-10-25 drill record in `docs/engineering/backup-and-restore.md`.
 - The SRS is internally inconsistent in two places: Document Control status (`Draft`) vs header (`Implementation Baseline`), and §8.1 "seeded user shall be authenticated" vs §3.4 defining endpoints with no authentication. Both are recorded here rather than resolved.
 - No claim is made that the drift register is exhaustive; it covers every requirement with a concrete implementation counterpart.
+- The 2026-10-27 refresh: D32 and the migration count were checked against `prisma migrate status`
+  on `jobhunter` (15 applied, schema up to date) and live 200 responses from `/dashboard`,
+  `/api/jobs`, `/api/matches` and `/api/sources`. The D20 correction is read from code
+  (`isUnexpectedZeroResult` fires only on `collected === 0`; `classifySourceHealth` reads only run
+  status and that flag) — no yield-collapse alert was reproduced, because none exists to reproduce.

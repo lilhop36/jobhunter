@@ -5,7 +5,9 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations only. Nothing here has been fixed.
+**Status of this document:** findings and recommendations. Two items were fixed afterwards, on
+2026-10-27: P0 item 1 (the drifted schema) and M10 (the timestamp type), recorded in §7. Every
+other finding stands as written, and the evidence below describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -24,7 +26,9 @@ The system is **not safe to operate as-is**, for four independent reasons:
 
 1. **The running API is ahead of or behind its database.** The current working tree needs 14
    migrations; the local `jobhunter` database has 13. `/dashboard` and `/api/sources` return 500
-   today, while `/health` still returns `{"status":"ok"}`.
+   today, while `/health` still returns `{"status":"ok"}`. *(Resolved 2026-10-27 for the schema:
+   `jobhunter` is at 15 migrations and both pages return 200. `/health` is still the static stub,
+   so the detection gap that made this outage invisible is open.)*
 2. **There is no authorization boundary.** Every JSON route and the web "login" trust a
    caller-supplied `userId`; the only control is the default loopback binding, and even the `Host`
    header is unchecked (DNS rebinding).
@@ -86,6 +90,15 @@ already recorded in `srs-implementation-drift-2026-10-23.md`; "new" means not pr
 **Fix:** apply the migration now; make migration deployment a release step; add a readiness check
 that opens a trivial query and verifies the expected migration; commit the two migrations and the
 working increment.
+
+**Resolved 2026-10-27 (partially).** The schema is deployed: `jobhunter` is at 15 migrations, and
+`/health`, `/dashboard`, `/login`, `/api/jobs`, `/api/matches` and `/api/sources` all return 200
+with no `P2022` in the log. The column was converted to `timestamptz(3)` in a second, forward-only
+migration rather than by editing `20261024140000`, because `jobhunter_test` had already recorded
+that migration's naive checksum — amending it would have broken `migrate deploy` against every
+database that applied it. The unfixed half of this finding is the half that matters operationally:
+`/health` is still the static `{status:'ok'}` with no connectivity or migration preflight, and the
+suite still cannot detect a skipped deploy, so the same drift would recur undetected.
 
 #### H2 — No authorization boundary anywhere; loopback is the only control — **known (D1), wider than documented, verified**
 
@@ -369,6 +382,14 @@ column to `TIMESTAMPTZ(3)` (and record the project-wide convention), or record a
 that accepts naive UTC columns despite ENG-022.
 **Fix:** decide before applying the still-pending migration; do not let the existing convention
 silently override a written engineering requirement.
+**Resolved 2026-10-27:** the convention was decided in favour of ENG-022. The floor is
+`timestamptz(3)` (`20261024150000_source_run_listing_coverage_floor_timestamptz`), written as an
+explicit UTC instant, and the window predicate compares
+`(publishedAt AT TIME ZONE 'UTC') > oldestListingPublishedAt` so the retirement boundary cannot
+move with the session's zone. The conversion is forward-only, for the checksum reason recorded
+under H1. `jobs.publishedAt` deliberately stays a naive `timestamp(3)` holding UTC — converting
+the pre-existing columns is a separate change with a data rewrite, and ADR-0010 §2.1 records the
+mixed-type comparison instead.
 
 ### Low
 
@@ -463,6 +484,9 @@ marked theoretical or downgraded.
 
 1. **Apply `20261024140000_source_run_listing_coverage_floor`** to `jobhunter`; verify
    `/dashboard` and `/api/sources`; commit both migrations and the working increment after review.
+   **Done 2026-10-27** — applied, endpoints verified returning 200, committed as `062dae6` and
+   `c093e97`; the second migration converts the floor to `timestamptz(3)` (M10). The remaining P0
+   items below are still open.
 2. **Fix crash recovery (H3)** — do not burn work-task attempts on a fresh `SourceRunActiveError`,
    and re-enqueue sources whose runs were reaped.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
@@ -485,6 +509,7 @@ marked theoretical or downgraded.
 12. Fastify 5 upgrade and dependency re-audit (M8).
 13. Accessibility labels/error association and test strengthening (M9).
 14. Decide the ENG-022 timestamp convention before applying the pending migration (M10).
+    **Done 2026-10-27** — ENG-022 won; see the resolution note under M10.
 15. Low items L1–L10, starting with cursor validation and docs corrections.
 
 The known requirement gaps (D4, D8, D13, D21) are product decisions, not audit fixes; they should
