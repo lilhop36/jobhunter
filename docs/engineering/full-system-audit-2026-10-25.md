@@ -37,7 +37,8 @@ The system is **not safe to operate as-is**, for four independent reasons:
    source after reaping.
 4. **Two data-integrity rules are violated in the direction AGENTS.md forbids:** a partial capture
    can overwrite known facts with UNKNOWN, and the deadline parser can invent a deadline from an
-   unrelated date elsewhere on the same line.
+   unrelated date elsewhere on the same line. *(The deadline half was fixed 2026-10-27 — see H5;
+   the overwrite half, H4, is open.)*
 
 None of these is architectural. They are bounded bugs and one deployment step, but they must be
 fixed before the pipeline is trusted for real alerts.
@@ -183,6 +184,16 @@ This is fabricated data in the exact sense SRS 3.5 / AGENTS.md prohibit, and it 
 from matching and notification.
 **Fix:** anchor the date to the label and the first clause; treat "until filled", "open until
 filled", "rolling" and similar phrases as UNKNOWN; add the reproduced case as a regression test.
+
+**Resolved 2026-10-27.** `phraseAfter` now cuts at a sentence boundary and
+`DEADLINE_EXTRACTION_VERSION` is `V2`. The cut is punctuation **followed by whitespace**, because a
+declared `DD.MM.YYYY` date is written with dots and no spaces — `Deadline: 30.10.2026` must survive
+whole, and `Deadline: until filled. Posted 30 Oct 2026` must not. The no-deadline phrases are
+matched against the **start** of the clause only: `Deadline: 30 Nov 2026 (or until filled)` is a real
+deadline and would be wrong to discard. The reproduced input is a regression test, along with the
+dotted-format and comma-date cases that the naive cut would have broken. No stored row needed
+repair: `jobhunter` had zero Jobs with `applicationDeadline` set, so the fabrication was latent in
+this corpus rather than already written into it.
 
 #### H6 — One malformed EffoySira timestamp fails and orphans the whole run — **new, verified**
 
@@ -492,6 +503,8 @@ marked theoretical or downgraded.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
    per-record failure.
 4. **Fix refresh merge (H4)** and **deadline anchoring (H5)** with regression tests.
+   **H5 done 2026-10-27** (clause-anchored extraction, `DEADLINE_EXTRACTION_V2`, reproduced case and
+   the dotted/comma-date cases pinned as tests). **H4 is open.**
 
 ### P1 — this week
 

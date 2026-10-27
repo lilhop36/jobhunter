@@ -18,8 +18,11 @@ import { parseDate } from './calendar';
  *  - Only English labels are recognised. A source that states deadlines in another language
  *    yields UNKNOWN rather than a silent miss being read as "no deadline"; add its labels here
  *    once a source that does so is approved.
+ *  - The date has to be in the clause the label introduces. V1 read the rest of the *line*, so
+ *    "Deadline: until filled. Posted 30 Oct 2026" returned the posting date as a deadline -
+ *    an invented fact that then marked a live posting EXPIRED.
  */
-export const DEADLINE_EXTRACTION_VERSION = 'DEADLINE_EXTRACTION_V1';
+export const DEADLINE_EXTRACTION_VERSION = 'DEADLINE_EXTRACTION_V2';
 
 /**
  * Labels that introduce a deadline, longest first so `application deadline` wins over
@@ -46,6 +49,42 @@ const DEADLINE_LABELS: readonly string[] = [
 /** How much text after a label is offered to the date parser. One line, one clause. */
 const MAX_PHRASE_LENGTH = 80;
 
+/**
+ * Where the clause a label introduces ends. Punctuation only counts when whitespace follows it,
+ * because a declared numeric date is written with dots and no spaces (`30.10.2026` under
+ * `DD.MM.YYYY`) and must not be cut to `30`.
+ */
+const CLAUSE_BOUNDARY = /[.;!?]\s|\s[-–—]\s/;
+
+/**
+ * Phrases that state there is no fixed deadline. Checked against the start of the clause, not
+ * anywhere in it: "30 Nov 2026 (or until filled)" is a real deadline, while "until filled,
+ * reviewed after 30 Oct 2026" carries a date that belongs to something else.
+ */
+const NO_DEADLINE_MARKERS: readonly string[] = [
+  'until filled',
+  'till filled',
+  'until the position is filled',
+  'until vacancies are filled',
+  'until sufficient applications',
+  'open until filled',
+  'rolling',
+  'on a rolling basis',
+  'ongoing',
+  'continuous',
+  'to be announced',
+  'to be confirmed',
+  'to be determined',
+  'not yet announced',
+  'tba',
+  'tbd',
+  'not specified',
+  'unspecified',
+  'no deadline',
+  'not applicable',
+  'n/a',
+];
+
 const LABEL_PATTERN = new RegExp(`(?:${DEADLINE_LABELS.join('|')})\\s*[:\\-–]?\\s*`, 'gi');
 
 export interface DeadlineParseInput {
@@ -61,9 +100,17 @@ const NO_DEADLINE: DeadlineParsed = {
   conversionMethod: null,
 };
 
-/** The text after a label, cut at the line end and bounded so one label reads one clause. */
+/** The clause a label introduces: up to the line end or the next sentence, whichever is first. */
 function phraseAfter(text: string, index: number, labelLength: number): string {
-  return lineFrom(text, index + labelLength).slice(0, MAX_PHRASE_LENGTH).trim();
+  const line = lineFrom(text, index + labelLength);
+  const boundary = line.search(CLAUSE_BOUNDARY);
+  const clause = boundary === -1 ? line : line.slice(0, boundary);
+  return clause.slice(0, MAX_PHRASE_LENGTH).trim();
+}
+
+function statesNoDeadline(clause: string): boolean {
+  const lowered = clause.toLowerCase();
+  return NO_DEADLINE_MARKERS.some((marker) => lowered.startsWith(marker));
 }
 
 function lineFrom(text: string, start: number): string {
@@ -84,6 +131,9 @@ export function parseDeadline(input: DeadlineParseInput): DeadlineParsed {
   while ((label = LABEL_PATTERN.exec(description)) !== null) {
     const phrase = phraseAfter(description, label.index, label[0].length);
     if (phrase.length === 0) continue;
+    // A clause that opens by saying there is no fixed deadline states UNKNOWN. Its trailing
+    // text may still hold a date about something else, which must not become a deadline.
+    if (statesNoDeadline(phrase)) continue;
 
     const parsed = parseDate({
       text: phrase,

@@ -26,7 +26,9 @@ describe('parseDeadline', () => {
       description: 'Application deadline 15 Nov 2026. Only shortlisted candidates are contacted.',
     });
     expect(parsed.deadlineAt).toEqual(UTC('2026-11-15'));
-    expect(parsed.evidence).toBe('Application deadline 15 Nov 2026. Only shortlisted candidates are contacted.');
+    // The evidence is the clause the label introduced, not the rest of the line: the sentence
+    // about shortlisted candidates is not part of the deadline statement.
+    expect(parsed.evidence).toBe('Application deadline 15 Nov 2026');
   });
 
   it('reads an ISO date after a closing-date label', () => {
@@ -109,12 +111,57 @@ describe('parseDeadline', () => {
     expect(parsed.deadlineAt).toBeNull();
   });
 
+  it('never reads a date that belongs to a sentence after the deadline clause', () => {
+    // The reproduced fabrication (audit H5): the label states there is no deadline, and the
+    // next sentence carries the posting date. V1 scanned the whole line and returned 30 Oct.
+    const parsed = parseDeadline({
+      description: 'Deadline: until filled. Posted 30 Oct 2026',
+    });
+    expect(parsed.deadlineAt).toBeNull();
+    expect(parsed.evidence).toBeNull();
+    expect(parsed.conversionMethod).toBeNull();
+  });
+
+  it('keeps a no-deadline statement UNKNOWN when an unrelated date follows in the same clause', () => {
+    for (const text of [
+      'Deadline: until filled, applications reviewed after 30 Oct 2026',
+      'Application deadline: rolling; the shortlisting round closes 12 Nov 2026',
+      'Deadline: to be announced. Register interest before 1 Dec 2026',
+    ]) {
+      const parsed = parseDeadline({ description: text });
+      expect(parsed.deadlineAt, text).toBeNull();
+    }
+  });
+
+  it('does not discard a real deadline that merely mentions "until filled" later', () => {
+    const parsed = parseDeadline({
+      description: 'Deadline: 30 Nov 2026 (or until filled)',
+    });
+    expect(parsed.deadlineAt).toEqual(UTC('2026-11-30'));
+  });
+
+  it('does not cut a declared dotted numeric date at its own separators', () => {
+    const parsed = parseDeadline({
+      description: 'Deadline: 30.10.2026',
+      sourceCalendarHint: CalendarType.GREGORIAN,
+      declaredDateFormat: 'DD.MM.YYYY',
+    });
+    expect(parsed.deadlineAt).toEqual(UTC('2026-10-30'));
+  });
+
+  it('reads a comma-form month-day-year date whole', () => {
+    const parsed = parseDeadline({
+      description: 'Last date for application: October 30, 2026 by email.',
+    });
+    expect(parsed.deadlineAt).toEqual(UTC('2026-10-30'));
+  });
+
   it('reports nothing for an empty description', () => {
     expect(parseDeadline({ description: null }).deadlineAt).toBeNull();
     expect(parseDeadline({ description: '   ' }).deadlineAt).toBeNull();
   });
 
   it('reports the version constant for provenance callers', () => {
-    expect(DEADLINE_EXTRACTION_VERSION).toBe('DEADLINE_EXTRACTION_V1');
+    expect(DEADLINE_EXTRACTION_VERSION).toBe('DEADLINE_EXTRACTION_V2');
   });
 });
