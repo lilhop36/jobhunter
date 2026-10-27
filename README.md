@@ -143,6 +143,9 @@ build: the UI is server-rendered HTML.
    [`backup-and-restore.md`](docs/engineering/backup-and-restore.md)) and re-apply.
 3. Restarting the worker is safe. On start it reaps expired leases and stale `RUNNING` source runs
    (`SOURCE_STALE_RUN_SECONDS`) before claiming new work, so a killed process cannot wedge a source.
+   A collection task that meets a run abandoned by the crash defers itself past the stale window
+   instead of spending an attempt, and a source whose run was reaped is re-queued immediately rather
+   than at its next scheduled interval.
 4. Stuck work is inspectable:
    ```sql
    SELECT id, type, status, attempts, lease_expires_at FROM work_tasks ORDER BY created_at DESC LIMIT 20;

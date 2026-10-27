@@ -5,10 +5,11 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Five items were fixed afterwards, on
-2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H4 (the refresh merge),
-H5 (deadline anchoring) and H6 (the orphaned run), each recorded on the finding itself. Every other
-finding stands as written, and the evidence below describes the tree as the audit found it.
+**Status of this document:** findings and recommendations. Six items were fixed afterwards, on
+2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its
+heartbeat half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run), each
+recorded on the finding itself. Every other finding stands as written, and the evidence below
+describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -151,6 +152,29 @@ true only for the run lock, not for collection cadence.
 window; re-enqueue sources whose runs were just reaped; add a source-run heartbeat so liveness is
 not inferred from age alone. Add a failure test that crashes after `openRun` and asserts a retry
 before the schedule interval.
+
+**Resolved 2026-10-27, except the heartbeat half (which is M2).** Two changes, both in the recovery
+path. A collection task that meets `SourceRunActiveError` no longer fails: the handler raises
+`DeferredWorkTaskError`, the worker calls the new `WorkTaskRepository.defer`, and the task returns to
+`PENDING` with its claim's attempt **returned** and a `runAfter` one stale window (plus a 30 s poll
+margin) away. The retry therefore lands exactly when the abandoned run becomes reapable, and
+`RunSourceCollection` reaps it on that attempt before opening its own run — a crash now costs one
+stale window instead of a dead letter. Repeating the deferral cannot exhaust the budget: the
+repository test claims and defers five times with `maxAttempts = 2` and still finds `PENDING,
+attempts = 0`. Second, `SourceScheduler.runOnce` enqueues a collection for every source whose run it
+just reaped, because a reaped run's `startedAt` is the source's last attempt and due-ness would
+otherwise hold the source until its next 3–6 h interval. The active-only dedupe key makes this
+idempotent when the crashed task already deferred itself, and disabled sources are skipped.
+
+Tests: the full chain is a regression test in `source-scheduler.spec.ts` ("recovers a source after a
+crash without waiting for its schedule interval") — a `RUNNING` run 10 minutes old, one worker claim
+asserting `PENDING` with `attempts 0`, then the window elapsed and a second claim ending with the
+old run `FAILED` and a new one `SUCCEEDED` with its job accepted. Defer semantics are also pinned at
+the repository (`work-task-queue.spec.ts`) and worker (`work-task-worker.spec.ts`) layers.
+
+**Not fixed here:** the run still has no heartbeat, so liveness is still inferred from `startedAt`
+alone. A run that legitimately exceeds the stale window can still be reaped while alive — M2. This
+change makes the queue survive that; it does not make the run live longer.
 
 #### H4 — Re-observation overwrites known canonical facts with UNKNOWN/null — **new, verified**
 
@@ -479,7 +503,7 @@ mixed-type comparison instead.
 
 | Area | State |
 | --- | --- |
-| FR-001..003 sources/scheduling | Implemented; crash recovery gap H3/M2 |
+| FR-001..003 sources/scheduling | Implemented; crash recovery fixed 2026-10-27 (H3), run heartbeat still absent (M2) |
 | FR-005..007 validation/quality | Strong deterministic gates; reduced-yield detection missing (H7) |
 | FR-008 dedupe | Within-source strong; cross-source absent (D8) |
 | FR-009/014 skills & confidence | Blocked by missing `JobSkill` (D4) |
@@ -528,7 +552,8 @@ marked theoretical or downgraded.
    `c093e97`; the second migration converts the floor to `timestamptz(3)` (M10). The remaining P0
    items below are still open.
 2. **Fix crash recovery (H3)** — do not burn work-task attempts on a fresh `SourceRunActiveError`,
-   and re-enqueue sources whose runs were reaped.
+   and re-enqueue sources whose runs were reaped. **Done 2026-10-27** for the queue; the run
+   heartbeat that would also close M2 is still open.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
    per-record failure. **Done 2026-10-27**, including the loop guard that was the real cause.
 4. **Fix refresh merge (H4)** and **deadline anchoring (H5)** with regression tests.

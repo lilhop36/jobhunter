@@ -36,6 +36,34 @@ export class PermanentWorkTaskError extends Error {
   }
 }
 
+/**
+ * Not a failure and not an attempt: the handler could not start because of state that clears
+ * on its own, so the worker returns the task to PENDING without consuming an attempt.
+ *
+ * The motivating case is a source still held by a run abandoned by a crashed worker (H3).
+ * That run is only reapable once it passes the stale window, which is far longer than the
+ * whole retry budget, so classifying the conflict as retryable would dead-letter the task
+ * that performs the recovery and idle the source until its next scheduled interval.
+ *
+ * `delaySeconds` is measured from the database clock, not the caller's, so a skewed host
+ * cannot make the task wake before the state it is waiting on has cleared.
+ */
+export class DeferredWorkTaskError extends Error {
+  constructor(
+    message: string,
+    readonly delaySeconds: number,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'DeferredWorkTaskError';
+    if (!Number.isFinite(delaySeconds) || delaySeconds <= 0) {
+      throw new RangeError(
+        `DeferredWorkTaskError requires a positive delaySeconds; received ${String(delaySeconds)}`,
+      );
+    }
+  }
+}
+
 /** A message longer than this is truncated; a log line is not an evidence store. */
 const MAX_ERROR_DESCRIPTION_LENGTH = 500;
 

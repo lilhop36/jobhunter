@@ -359,6 +359,76 @@ describe('failure handling and retries', () => {
   });
 });
 
+describe('deferral without consuming an attempt (H3)', () => {
+  it('returns a claimed task to PENDING, restores the attempt and schedules the retry', async () => {
+    await repo.enqueue({ type: 't', dedupeKey: 'defer' });
+    const claimed = (await repo.claim('w', 60))!;
+    expect(claimed.attempts).toBe(1);
+
+    const deferred = await repo.defer(claimed.id, claimed.leaseToken!, 900, 'source still held');
+
+    expect(deferred?.status).toBe('PENDING');
+    // The claim's increment is undone: a blocked attempt is not an attempt.
+    expect(deferred?.attempts).toBe(0);
+    expect(deferred?.leaseToken).toBeNull();
+    expect(deferred?.leaseExpiresAt).toBeNull();
+    expect(deferred?.lastError).toBe('source still held');
+    // Not due yet: the retry must wait for the window it is waiting on to clear.
+    expect(delaySeconds(deferred!.runAfter)).toBeGreaterThan(895);
+    expect(await repo.claim('w', 60)).toBeNull();
+  });
+
+  it('lets the task be claimed again once the deferral delay has passed', async () => {
+    await repo.enqueue({ type: 't', dedupeKey: 'defer-later' });
+    const claimed = (await repo.claim('w', 60))!;
+    await repo.defer(claimed.id, claimed.leaseToken!, 600, 'source still held');
+
+    await prisma.$executeRaw`
+      UPDATE "work_tasks" SET "runAfter" = (now() AT TIME ZONE 'UTC') - interval '1 second'
+      WHERE "id" = ${claimed.id}::uuid
+    `;
+
+    const reclaimed = await repo.claim('w', 60);
+    expect(reclaimed?.id).toBe(claimed.id);
+    // Still the first real attempt: the deferral did not count.
+    expect(reclaimed?.attempts).toBe(1);
+  });
+
+  it('never repeats the same blocked claim into the dead-letter state', async () => {
+    // The H3 scenario in miniature: with maxAttempts 2, five blocked claims used to end in
+    // DEAD_LETTER. Deferrals must leave the task claimable indefinitely.
+    await repo.enqueue({ type: 't', dedupeKey: 'defer-budget', maxAttempts: 2 });
+
+    for (let round = 0; round < 5; round += 1) {
+      await prisma.$executeRaw`
+        UPDATE "work_tasks" SET "runAfter" = (now() AT TIME ZONE 'UTC') - interval '1 second'
+        WHERE "dedupeKey" = 'defer-budget'
+      `;
+      const claimed = await repo.claim('w', 60);
+      expect(claimed).not.toBeNull();
+      await repo.defer(claimed!.id, claimed!.leaseToken!, 600, 'source still held');
+    }
+
+    const row = await prisma.workTask.findFirstOrThrow({ where: { dedupeKey: 'defer-budget' } });
+    expect(row.status).toBe('PENDING');
+    expect(row.attempts).toBe(0);
+  });
+
+  it('rejects a stale lease token and an unbounded delay', async () => {
+    await repo.enqueue({ type: 't', dedupeKey: 'defer-fence' });
+    const claimed = (await repo.claim('w', 60))!;
+
+    expect(await repo.defer(claimed.id, 'not-the-token', 60, 'x')).toBeNull();
+    await expect(repo.defer(claimed.id, claimed.leaseToken!, 0, 'x')).rejects.toThrow(RangeError);
+    await expect(repo.defer(claimed.id, claimed.leaseToken!, -1, 'x')).rejects.toThrow(RangeError);
+
+    // The failed deferrals must not have released the lease.
+    const still = await prisma.workTask.findUniqueOrThrow({ where: { id: claimed.id } });
+    expect(still.status).toBe('RUNNING');
+    expect(still.leaseToken).toBe(claimed.leaseToken);
+  });
+});
+
 /** Seconds between now and a future timestamp, using wall-clock as a sanity check. */
 function delaySeconds(runAfter: Date): number {
   return (runAfter.getTime() - Date.now()) / 1000;

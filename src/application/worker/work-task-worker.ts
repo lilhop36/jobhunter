@@ -1,7 +1,7 @@
 import { WorkTaskFailure, WorkTaskRecord } from '@domain/types';
 import { WorkTaskRepository } from '@ports/work-task-repository';
 import { consoleWorkerLogger, WorkerLogger } from '@ports/worker-logger';
-import { classifyWorkTaskError, describeError } from './work-task-handler';
+import { classifyWorkTaskError, DeferredWorkTaskError, describeError } from './work-task-handler';
 import { WorkTaskHandlerRegistry } from './work-task-handler-registry';
 
 export interface WorkTaskWorkerOptions {
@@ -243,6 +243,13 @@ export class WorkTaskWorker {
         });
         return;
       }
+      // A deferral is not a failure: the handler never got to do the work, so the attempt is
+      // returned rather than spent (H3). Checked before classification, which would otherwise
+      // treat it as an ordinary retryable error and count it against the budget.
+      if (error instanceof DeferredWorkTaskError) {
+        await this.reportDeferral(task, leaseToken, error);
+        return;
+      }
       await this.reportFailure(task, leaseToken, classifyWorkTaskError(error));
     } finally {
       clearInterval(timer);
@@ -283,6 +290,32 @@ export class WorkTaskWorker {
       return;
     }
     this.logger.info('task completed', { taskId: task.id, type: task.type });
+  }
+
+  private async reportDeferral(
+    task: WorkTaskRecord,
+    leaseToken: string,
+    error: DeferredWorkTaskError,
+  ): Promise<void> {
+    const deferred = await this.repository.defer(
+      task.id,
+      leaseToken,
+      error.delaySeconds,
+      describeError(error),
+    );
+    if (!deferred) {
+      this.logger.warn('deferral rejected: lease is no longer owned', { taskId: task.id });
+      return;
+    }
+    // Info, not warn: the source did not fail. It is waiting for a crashed run to become
+    // reapable, and the next attempt is already scheduled.
+    this.logger.info('task deferred without consuming an attempt', {
+      taskId: task.id,
+      type: task.type,
+      delaySeconds: error.delaySeconds,
+      attempts: deferred.attempts,
+      message: describeError(error),
+    });
   }
 
   private async reportFailure(

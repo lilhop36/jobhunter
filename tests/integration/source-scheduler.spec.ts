@@ -222,6 +222,64 @@ describe('SourceScheduler catch-up (SRS 7.6)', () => {
   });
 });
 
+describe('SourceScheduler recovery after a reaped run (H3)', () => {
+  /** A run a dead worker left RUNNING, old enough to be reclaimed by the next pass. */
+  async function abandonedRun(sourceId: string, ageMs: number): Promise<string> {
+    const run = await prisma.sourceRun.create({
+      data: {
+        sourceId,
+        status: SourceRunStatus.RUNNING,
+        startedAt: new Date(NOW.getTime() - ageMs),
+      },
+    });
+    return run.id;
+  }
+
+  it('re-enqueues a reaped source even though its interval has not elapsed', async () => {
+    // The crash happened 3h ago; the schedule is 6h. Reaping frees the source, but its
+    // `startedAt` is the last attempt, so due-ness alone would hold it another 3h. A crash
+    // near a scheduled run would then silently skip a whole cycle.
+    const sourceId = await createSource('crashed', { schedule: '6h' });
+    await abandonedRun(sourceId, 3 * HOUR);
+
+    const result = await makeScheduler().runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.reapedRuns).toBe(1);
+    expect(result.enqueued).toEqual([sourceId]);
+    const tasks = await activeTasks(sourceId);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe(WorkTaskStatus.PENDING);
+  });
+
+  it('does not enqueue a recovery for a disabled source', async () => {
+    const sourceId = await createSource('crashed-disabled', { schedule: '6h', enabled: false });
+    await abandonedRun(sourceId, 3 * HOUR);
+
+    const result = await makeScheduler().runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.reapedRuns).toBe(1);
+    expect(result.enqueued).toEqual([]);
+    expect(await activeTasks(sourceId)).toHaveLength(0);
+  });
+
+  it('does not duplicate a collection that is already waiting for the same source', async () => {
+    const sourceId = await createSource('crashed-deferred', { schedule: '6h' });
+    await abandonedRun(sourceId, 3 * HOUR);
+    // The crashed task deferred itself and is already queued for the stale-window boundary.
+    await taskRepo.enqueue({
+      type: SOURCE_COLLECTION_TASK_TYPE,
+      payload: { sourceId, trigger: SourceRunTrigger.SCHEDULE },
+      dedupeKey: sourceCollectionDedupeKey(sourceId),
+    });
+
+    const result = await makeScheduler().runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.reapedRuns).toBe(1);
+    expect(result.enqueued).toEqual([]);
+    expect(await activeTasks(sourceId)).toHaveLength(1);
+  });
+});
+
 describe('scheduled collection end to end', () => {
   it('drives scheduler -> queue -> worker -> collection to a recorded run', async () => {
     const sourceId = await createSource('end-to-end');
@@ -265,6 +323,86 @@ describe('scheduled collection end to end', () => {
     const tasks = await activeTasks(sourceId);
     expect(tasks).toHaveLength(1);
     expect(tasks[0].status).toBe(WorkTaskStatus.SUCCEEDED);
+  });
+
+  it('recovers a source after a crash without waiting for its schedule interval', async () => {
+    // The H3 failure in full: a worker dies mid-collection, leaving the run RUNNING and the
+    // task claiming. With five fast retries the task used to dead-letter within two minutes,
+    // while the run was not reapable for an hour - and the source was not due again for six.
+    const sourceId = await createSource('crash-recovery', { schedule: '6h' });
+    const crashed = await prisma.sourceRun.create({
+      data: {
+        sourceId,
+        status: SourceRunStatus.RUNNING,
+        startedAt: new Date(Date.now() - 10 * MINUTE),
+      },
+    });
+    const task = await taskRepo.enqueue({
+      type: SOURCE_COLLECTION_TASK_TYPE,
+      payload: { sourceId, trigger: SourceRunTrigger.SCHEDULE },
+      dedupeKey: sourceCollectionDedupeKey(sourceId),
+    });
+
+    const registry = new WorkTaskHandlerRegistry().register(
+      SOURCE_COLLECTION_TASK_TYPE,
+      createSourceCollectionHandler({
+        resolveAdapter: async (id) =>
+          new FakeSourceAdapter(makeFakeConfig({ sourceId: id }), [
+            makeRawJob({
+              sourceJobIdentifier: 'job-1',
+              sourceUrl: 'https://example.com/jobs/1',
+              rawTitle: 'Backend Engineer',
+              rawDescription: 'Build and maintain the collection pipeline. '.repeat(10),
+            }),
+          ]),
+        collection,
+        staleRunSeconds: STALE_SECONDS,
+        acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+        now: () => NOW,
+      }),
+    );
+    const worker = new WorkTaskWorker(
+      taskRepo,
+      registry,
+      { workerId: 'crash-test' },
+      silentWorkerLogger,
+    );
+
+    // First attempt: the source is still held. The task must be deferred, not failed, and
+    // must still be the same task - no attempt burned, no dead letter.
+    expect(await worker.runOnce()).toBe(true);
+    const deferred = await prisma.workTask.findUniqueOrThrow({ where: { id: task.id } });
+    expect(deferred.status).toBe(WorkTaskStatus.PENDING);
+    expect(deferred.attempts).toBe(0);
+    expect(deferred.lastError).toContain('not yet reapable');
+    expect((await prisma.sourceRun.findUniqueOrThrow({ where: { id: crashed.id } })).status).toBe(
+      SourceRunStatus.RUNNING,
+    );
+
+    // The stale window elapses: the abandoned run is now reclaimable, and the deferred task
+    // becomes due. Nothing in the scheduler or the interval is involved from here on.
+    await prisma.$executeRaw`
+      UPDATE "source_runs" SET "startedAt" = (now() AT TIME ZONE 'UTC') - interval '2 hours'
+      WHERE "id" = ${crashed.id}::uuid
+    `;
+    await prisma.$executeRaw`
+      UPDATE "work_tasks" SET "runAfter" = (now() AT TIME ZONE 'UTC') - interval '1 second'
+      WHERE "id" = ${task.id}::uuid
+    `;
+
+    expect(await worker.runOnce()).toBe(true);
+
+    const finished = await prisma.workTask.findUniqueOrThrow({ where: { id: task.id } });
+    expect(finished.status).toBe(WorkTaskStatus.SUCCEEDED);
+    const runs = await prisma.sourceRun.findMany({
+      where: { sourceId },
+      orderBy: { startedAt: 'asc' },
+    });
+    expect(runs.map((run) => run.status)).toEqual([
+      SourceRunStatus.FAILED, // the abandoned run, reaped by the retry
+      SourceRunStatus.SUCCEEDED,
+    ]);
+    expect(runs[1].jobsAccepted).toBe(1);
   });
 
   it('reports an empty listing from a source approved to produce results (AC-018)', async () => {

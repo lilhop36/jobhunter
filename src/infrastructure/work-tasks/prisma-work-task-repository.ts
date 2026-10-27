@@ -293,6 +293,36 @@ export class PrismaWorkTaskRepository implements WorkTaskRepository {
     return rows.length === 1 ? toRecord(rows[0]) : null;
   }
 
+  async defer(
+    taskId: string,
+    leaseToken: string,
+    delaySeconds: number,
+    reason: string,
+  ): Promise<WorkTaskRecord | null> {
+    assertPositiveSeconds(delaySeconds, 'delaySeconds');
+    // The attempt is returned, not consumed: `claim` incremented it, and a deferral is the
+    // statement that no work was attempted at all. Leaving the increment in place would
+    // dead-letter a task after five *blocked* claims, which is the H3 failure exactly.
+    const rows = await this.prisma.$queryRaw<WorkTaskRow[]>`
+      UPDATE "work_tasks"
+      SET "status" = 'PENDING'::"WorkTaskStatus",
+          "runAfter" = ${NOW_UTC} + make_interval(secs => ${delaySeconds}::double precision),
+          "attempts" = GREATEST("attempts" - 1, 0),
+          "lastError" = ${reason},
+          "lastErrorAt" = ${NOW_UTC},
+          "leaseToken" = NULL,
+          "leaseExpiresAt" = NULL,
+          "lockedAt" = NULL,
+          "lockedBy" = NULL,
+          "updatedAt" = ${NOW_UTC}
+      WHERE "id" = ${taskId}::uuid
+        AND "leaseToken" = ${leaseToken}
+        AND "status" = 'RUNNING'
+      RETURNING *
+    `;
+    return rows.length === 1 ? toRecord(rows[0]) : null;
+  }
+
   async reapExpiredLeases(): Promise<number> {
     const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
       UPDATE "work_tasks"

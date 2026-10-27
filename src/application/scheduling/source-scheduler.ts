@@ -117,7 +117,32 @@ export class SourceScheduler {
 
     const sources = await this.deps.sources.listSchedulable();
     const enqueued: string[] = [];
+    const enqueuedIds = new Set<string>();
     const invalidSchedules: string[] = [];
+
+    const enqueueCollection = async (sourceId: string): Promise<void> => {
+      const payload: SourceCollectionTaskPayload = { sourceId, trigger };
+      const result = await this.deps.tasks.enqueueOrConflict({
+        type: SOURCE_COLLECTION_TASK_TYPE,
+        payload,
+        dedupeKey: sourceCollectionDedupeKey(sourceId),
+      });
+      if (result.created && !enqueuedIds.has(sourceId)) {
+        enqueuedIds.add(sourceId);
+        enqueued.push(sourceId);
+      }
+    };
+
+    // A run reclaimed as stale has freed its source, but the run's `startedAt` is also the
+    // source's last attempt, so due-ness would otherwise hold it until its next 3h/6h
+    // interval - a crash near a scheduled run would silently skip a whole cycle (H3).
+    // Enqueue the recovery immediately. The active-only dedupe key makes this idempotent:
+    // if the crashed task was deferred and is already waiting, nothing new is created.
+    const schedulable = new Set(sources.map((source) => source.id));
+    for (const run of reaped) {
+      if (!schedulable.has(run.sourceId)) continue; // disabled or removed: nothing to collect
+      await enqueueCollection(run.sourceId);
+    }
 
     for (const source of sources) {
       if (source.schedule === null || source.schedule.trim() === '') continue;
@@ -136,13 +161,7 @@ export class SourceScheduler {
       const dueAt = source.lastAttemptAt === null ? 0 : source.lastAttemptAt.getTime() + intervalMs;
       if (dueAt > now.getTime()) continue;
 
-      const payload: SourceCollectionTaskPayload = { sourceId: source.id, trigger };
-      await this.deps.tasks.enqueue({
-        type: SOURCE_COLLECTION_TASK_TYPE,
-        payload,
-        dedupeKey: sourceCollectionDedupeKey(source.id),
-      });
-      enqueued.push(source.id);
+      await enqueueCollection(source.id);
     }
 
     return { enqueued, invalidSchedules, reapedRuns: reaped.length };

@@ -168,6 +168,10 @@ class StubTasks implements WorkTaskRepository {
     return this.unused();
   }
 
+  async defer(): Promise<never> {
+    return this.unused();
+  }
+
   async reapExpiredLeases(): Promise<never> {
     return this.unused();
   }

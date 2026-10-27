@@ -6,9 +6,10 @@ import {
   createSourceCollectionHandler,
   SOURCE_COLLECTION_TASK_TYPE,
 } from '@application/ingestion';
-import { PermanentWorkTaskError, describeError } from '@application/worker';
+import { PermanentWorkTaskError, DeferredWorkTaskError, describeError } from '@application/worker';
 import type { WorkerLogger } from '@ports/worker-logger';
 import type { JobSourceAdapter } from '@ports/source-adapter';
+import { SourceRunActiveError } from '@ports/source-run-repository';
 import { FakeSourceAdapter, makeFakeConfig } from '../support/fake-source-adapter';
 
 /**
@@ -205,6 +206,50 @@ describe('source collection handler — post-collection lifecycle sweep (FR-019)
     await expect(
       handler({ task: TASK, signal: new AbortController().signal }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('source collection handler — a held source is deferred, not failed (H3)', () => {
+  function handlerRunning(
+    run: () => Promise<never>,
+    staleRunSeconds = 900,
+  ): ReturnType<typeof createSourceCollectionHandler> {
+    return createSourceCollectionHandler({
+      resolveAdapter: async () => adapterWithExpectation(undefined),
+      collection: { run } as unknown as RunSourceCollection,
+      staleRunSeconds,
+      acquisitionTimeoutMs: 60_000,
+    });
+  }
+
+  it('asks for a deferral past the stale window instead of consuming attempts', async () => {
+    const handler = handlerRunning(async () => {
+      throw new SourceRunActiveError(SOURCE_ID);
+    });
+
+    const thrown = await handler({ task: TASK, signal: new AbortController().signal }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(thrown).toBeInstanceOf(DeferredWorkTaskError);
+    const deferred = thrown as DeferredWorkTaskError;
+    // The abandoned run becomes reapable at its start plus the stale window, which is at or
+    // before this attempt; the small grace covers the delay between due and claimed.
+    expect(deferred.delaySeconds).toBeGreaterThanOrEqual(900);
+    expect(deferred.delaySeconds).toBeLessThanOrEqual(960);
+    expect(deferred.message).toContain(SOURCE_ID);
+    // The original conflict is kept for diagnosis rather than replaced by a string.
+    expect(deferred.cause).toBeInstanceOf(SourceRunActiveError);
+  });
+
+  it('does not soften an unrelated acquisition failure into a deferral', async () => {
+    const handler = handlerRunning(async () => {
+      throw new Error('acquisition exploded');
+    });
+
+    await expect(
+      handler({ task: TASK, signal: new AbortController().signal }),
+    ).rejects.toThrow('acquisition exploded');
   });
 });
 

@@ -78,6 +78,23 @@ export interface WorkTaskRepository {
     failure: WorkTaskFailure,
   ): Promise<WorkTaskRecord | null>;
 
+  /**
+   * Return a claimed task to PENDING **without consuming the attempt**, to run no sooner
+   * than `delaySeconds` from the database clock. Used when the attempt could not start
+   * because of state that clears on its own — a source still held by a run that is not yet
+   * reapable — so the task that performs the recovery is not itself dead-lettered while
+   * waiting (H3). The elapsed claim is undone, because nothing about the work was learned.
+   *
+   * Returns null when the lease token is stale. Callers must pass a finite, positive delay:
+   * an unbounded deferral would hide a stuck source instead of recovering it.
+   */
+  defer(
+    taskId: string,
+    leaseToken: string,
+    delaySeconds: number,
+    reason: string,
+  ): Promise<WorkTaskRecord | null>;
+
   /** Return reaped-lease count. Expired RUNNING tasks go back to PENDING. */
   reapExpiredLeases(): Promise<number>;
 }

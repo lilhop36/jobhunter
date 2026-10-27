@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import {
+  DeferredWorkTaskError,
   PermanentWorkTaskError,
   RetryableWorkTaskError,
   WorkTaskHandlerRegistry,
@@ -175,6 +176,53 @@ describe('worker failure classification', () => {
     const row = await prisma.workTask.findUniqueOrThrow({ where: { id: task.id } });
     expect(row.status).toBe('PENDING');
     expect(row.lastError).toContain('socket hang up');
+  });
+
+  it('defers a blocked attempt without consuming it (H3)', async () => {
+    const handlers = new WorkTaskHandlerRegistry().register('blocked', async () => {
+      throw new DeferredWorkTaskError('source held by an abandoned run', 900);
+    });
+    const task = await repo.enqueue({ type: 'blocked', dedupeKey: 'blocked', maxAttempts: 2 });
+
+    await buildWorker(handlers).runOnce();
+
+    const row = await prisma.workTask.findUniqueOrThrow({ where: { id: task.id } });
+    expect(row.status).toBe('PENDING');
+    // The claim's increment is returned: nothing about the work was learned.
+    expect(row.attempts).toBe(0);
+    expect(row.leaseToken).toBeNull();
+    expect(row.lastError).toContain('abandoned run');
+    // Not claimable yet - it is waiting for the blocking state to clear.
+    expect(await repo.claim('w', 60)).toBeNull();
+  });
+
+  it('runs the same task to completion once the deferral has elapsed', async () => {
+    let calls = 0;
+    const handlers = new WorkTaskHandlerRegistry().register('recovering', async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new DeferredWorkTaskError('source held by an abandoned run', 600);
+      }
+    });
+    const task = await repo.enqueue({ type: 'recovering', dedupeKey: 'recovering', maxAttempts: 1 });
+
+    const worker = buildWorker(handlers);
+    await worker.runOnce();
+    expect(calls).toBe(1);
+
+    // Simulate the blocking window elapsing.
+    await prisma.$executeRaw`
+      UPDATE "work_tasks" SET "runAfter" = (now() AT TIME ZONE 'UTC') - interval '1 second'
+      WHERE "id" = ${task.id}::uuid
+    `;
+
+    await worker.runOnce();
+
+    const row = await prisma.workTask.findUniqueOrThrow({ where: { id: task.id } });
+    expect(calls).toBe(2);
+    expect(row.status).toBe('SUCCEEDED');
+    // maxAttempts is 1, and the deferral did not spend it.
+    expect(row.attempts).toBe(1);
   });
 
   it('leaves the terminal decision to the repository (retryable failure at maxAttempts dead-letters)', async () => {

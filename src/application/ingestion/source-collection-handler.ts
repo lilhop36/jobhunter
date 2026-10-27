@@ -1,12 +1,14 @@
 import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 import type { JobSourceAdapter } from '@ports/source-adapter';
+import { SourceRunActiveError } from '@ports/source-run-repository';
 import type { WorkerLogger } from '@ports/worker-logger';
 import {
+  DeferredWorkTaskError,
   PermanentWorkTaskError,
   describeError,
   type WorkTaskHandler,
 } from '@application/worker';
-import { RunSourceCollection } from './run-source-collection';
+import { RunSourceCollection, type RunSourceCollectionResult } from './run-source-collection';
 
 /**
  * Work task type that runs one source collection (SRS 7.7). The scheduler enqueues it and
@@ -31,6 +33,14 @@ export interface SourceCollectionTaskPayload {
 }
 
 const VALID_TRIGGERS = new Set<string>(Object.values(SourceRunTrigger));
+
+/**
+ * Extra wait beyond the stale window before a deferred collection is retried. The window is
+ * measured from the abandoned run's `startedAt`, which is at or before the deferred attempt,
+ * so the run is reapable when the delay elapses; the margin only covers the poll interval
+ * between the task becoming due and a worker claiming it.
+ */
+const STALE_WINDOW_GRACE_SECONDS = 30;
 
 /**
  * Validate an untrusted task payload. A malformed payload is a permanent failure: retrying it
@@ -91,18 +101,35 @@ export function createSourceCollectionHandler(
     if (adapter === null) {
       throw new PermanentWorkTaskError(`no adapter is configured for source ${sourceId}`);
     }
-    const result = await options.collection.run({
-      adapter,
-      now: now(),
-      trigger,
-      staleRunSeconds: options.staleRunSeconds,
-      acquisitionTimeoutMs: options.acquisitionTimeoutMs,
-      // The source's own approved declaration (Appendix E), not a pipeline default: a source
-      // approved as RESULTS_EXPECTED must report an empty listing (AC-018) instead of
-      // recording a clean run. Absent means UNKNOWN, which never raises the signal.
-      resultExpectation: adapter.config.resultExpectation,
-      signal,
-    });
+    let result: RunSourceCollectionResult;
+    try {
+      result = await options.collection.run({
+        adapter,
+        now: now(),
+        trigger,
+        staleRunSeconds: options.staleRunSeconds,
+        acquisitionTimeoutMs: options.acquisitionTimeoutMs,
+        // The source's own approved declaration (Appendix E), not a pipeline default: a source
+        // approved as RESULTS_EXPECTED must report an empty listing (AC-018) instead of
+        // recording a clean run. Absent means UNKNOWN, which never raises the signal.
+        resultExpectation: adapter.config.resultExpectation,
+        signal,
+      });
+    } catch (error) {
+      if (!(error instanceof SourceRunActiveError)) throw error;
+      // Another run holds this source. That is not a failure of this task: the run may be a
+      // live collection that will finish on its own, or one abandoned by a crashed worker
+      // that the next attempt reaps. But it is only reapable after the stale window, and the
+      // whole retry budget is spent in about two minutes, so failing here would dead-letter
+      // the task and idle the source until its next 3h/6h schedule (H3). Wait for the
+      // window instead, without consuming an attempt.
+      throw new DeferredWorkTaskError(
+        `source ${sourceId} is held by a run that is not yet reapable; ` +
+          `retrying after the ${options.staleRunSeconds}s stale window`,
+        options.staleRunSeconds + STALE_WINDOW_GRACE_SECONDS,
+        { cause: error },
+      );
+    }
 
     // FR-019: reconcile lifecycles against this run's coverage. Only a SUCCEEDED run that
     // made a coverage claim may retire anything; every other run says nothing about what it
