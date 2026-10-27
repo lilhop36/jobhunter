@@ -61,10 +61,18 @@ function startProcess(entry: string, env: NodeJS.ProcessEnv = {}): StartedProces
   return { proc, exited, output: () => (log.length === 0 ? '(the process printed nothing)' : log.join('\n')) };
 }
 
-/** Configuration with the named variables removed, so "missing" is genuinely missing. */
-function withoutEnv(...names: string[]): NodeJS.ProcessEnv {
+/**
+ * Configuration with the named variables present but blank.
+ *
+ * A deleted key is not "absent" to these entry points: importing `@prisma/client` loads the
+ * developer's `.env`, and dotenv does not overwrite a key that is already set. Deleting the
+ * key would therefore let `.env` supply a valid bound and the process would start instead of
+ * failing. An empty value blocks that fill-in and is exactly what `parseWorkerConfig` treats
+ * as missing, so the assertion still exercises the production path.
+ */
+function blankEnv(...names: string[]): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const name of names) delete env[name];
+  for (const name of names) env[name] = '';
   return env;
 }
 
@@ -122,7 +130,7 @@ describe('process startup refuses invalid configuration', () => {
   it('fails the worker when a required safety bound is absent', async () => {
     const started = startProcess(
       WORKER_ENTRY,
-      withoutEnv('SOURCE_STALE_RUN_SECONDS', 'SOURCE_ACQUISITION_TIMEOUT_MS'),
+      blankEnv('SOURCE_STALE_RUN_SECONDS', 'SOURCE_ACQUISITION_TIMEOUT_MS'),
     );
     const exit = await started.exited;
 
