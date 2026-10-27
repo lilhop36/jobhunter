@@ -54,8 +54,8 @@ Node's `--env-file`, so `.env` must exist. Tests load it themselves (`tests/supp
 | `API_HOST` / `API_PORT` | API | no (defaults) | `127.0.0.1` / `3001` |
 | `TELEGRAM_BOT_USERNAME` | API | no | Renders the `t.me` deep link |
 | `TELEGRAM_BOT_TOKEN` | worker, `telegram:resolve` | no at start | Without it the worker runs but does not dispatch |
-| `SOURCE_STALE_RUN_SECONDS` | worker | **yes** | Bound for reaping an abandoned source run |
-| `SOURCE_ACQUISITION_TIMEOUT_MS` | worker | **yes** | Bound for a hanging acquisition; must be shorter than the stale window |
+| `SOURCE_STALE_RUN_SECONDS` | worker | **yes** | Bound for reaping an abandoned source run; `900` is the value observed working |
+| `SOURCE_ACQUISITION_TIMEOUT_MS` | worker | **yes** | Bound for a hanging acquisition; must be shorter than the stale window **and** longer than the slowest real run (`300000`; EffoySira measures 50-70 s, so a smaller bound fails every run) |
 | `WORKER_LEASE_SECONDS`, `WORKER_HEARTBEAT_MS`, `WORKER_POLL_INTERVAL_MS`, `WORKER_REAPER_INTERVAL_MS`, `WORKER_ID` | worker | no | Defaults in `.env.example`; heartbeat must be shorter than the lease |
 | `SOURCE_SCHEDULER_INTERVAL_MS`, `NOTIFICATION_DISPATCH_INTERVAL_MS` | worker | no | Default 30 s |
 | `LOG_LEVEL` | API | no | Fastify level, default `info` |
