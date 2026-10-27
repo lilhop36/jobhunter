@@ -5,10 +5,10 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Four items were fixed afterwards, on
-2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H4 (the refresh merge) and
-H5 (deadline anchoring), each recorded on the finding itself. Every other finding stands as
-written, and the evidence below describes the tree as the audit found it.
+**Status of this document:** findings and recommendations. Five items were fixed afterwards, on
+2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H4 (the refresh merge),
+H5 (deadline anchoring) and H6 (the orphaned run), each recorded on the finding itself. Every other
+finding stands as written, and the evidence below describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -227,6 +227,17 @@ acquisition. It also mislabels publication time as collection time in the eviden
 **Fix:** always set `collectedAt: now`; validate the parsed publication date before constructing a
 `Date`; wrap per-record persistence failures so a bad record is counted and the run is finalized
 `FAILED` or `PARTIAL` with evidence retained.
+
+**Resolved 2026-10-27.** `collectedAt` is now always the observation time, which is what the field
+means and what the other two adapters already recorded; the publication date continues to travel as
+`rawPublishedDateText` for the shared normalizer, where a bad value correctly yields UNKNOWN instead
+of an `Invalid Date`. The run was orphaned by the *loop*, not by this adapter, so both per-record
+writes are now guarded: a record whose raw evidence cannot be stored is logged, noted and skipped,
+and a record that parsed but could not be promoted is logged with its raw evidence retained. Either
+case finalizes the run `PARTIAL` with the offending index and reason in `errorSummary`, and it can
+never report `SUCCEEDED`, because records were lost. Two regression tests drive the real PostgreSQL
+pipeline through repository decorators that reject one selected record each, and assert no `RUNNING`
+SourceRun is left behind. A malformed `article:published_time` is itself now a tested case.
 
 #### H7 — SRS §7.8 reduced-yield detection is absent; the drift register says MATCH — **new, verified**
 
@@ -519,7 +530,7 @@ marked theoretical or downgraded.
 2. **Fix crash recovery (H3)** — do not burn work-task attempts on a fresh `SourceRunActiveError`,
    and re-enqueue sources whose runs were reaped.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
-   per-record failure.
+   per-record failure. **Done 2026-10-27**, including the loop guard that was the real cause.
 4. **Fix refresh merge (H4)** and **deadline anchoring (H5)** with regression tests.
    **Done 2026-10-27** — H5 is clause-anchored extraction (`DEADLINE_EXTRACTION_V2`, the reproduced
    input plus the dotted and comma-date cases pinned); H4 is a field-by-field merge with a partial

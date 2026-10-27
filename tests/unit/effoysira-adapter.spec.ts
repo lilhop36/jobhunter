@@ -115,11 +115,41 @@ describe('EffoySira adapter — collect (fixture HTML, no network)', () => {
     expect(first.rawLocation).toBe('Addis Ababa');
     expect(first.rawSalaryText).toBe('15,000 birr');
     expect(first.rawPublishedDateText).toBe('2026-10-17T09:57:17+00:00');
-    expect(first.collectedAt).toEqual(new Date('2026-10-17T09:57:17+00:00'));
+    // `collectedAt` is when this process read the page, never the publication time: the two
+    // are different facts and the publication date already travels as text above.
+    expect(first.collectedAt).toEqual(NOW);
     // Company is not a structured field on this source: stays null, never guessed.
     expect(first.rawCompany).toBeNull();
     expect(first.sourceJobIdentifier).toBeNull();
     expect(first.rawPayload).toBeNull();
+  });
+
+  it('keeps collecting when a post page carries a malformed publication timestamp', async () => {
+    // `article:published_time` is copied verbatim from hostile page content. An earlier
+    // version built `collectedAt` from it, so a malformed tag produced an Invalid Date that
+    // threw inside the raw-evidence write and left the whole run RUNNING (audit H6).
+    const routes = {
+      'https://effoysira.com/category/job/': listingPage([POST_1, POST_2]),
+      [POST_1]: postPage({ published: 'not-a-date' }),
+      [POST_2]: postPage({ published: '2026-10-16T08:00:00+00:00' }),
+    };
+    const adapter = createEffoySiraAdapter(config(), {
+      fetchImpl: fetchRouter(routes),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+
+    expect(result.records).toHaveLength(2);
+    for (const record of result.records) {
+      expect(record.collectedAt).toBeInstanceOf(Date);
+      expect(Number.isNaN(record.collectedAt?.getTime() as number)).toBe(false);
+    }
+    // The bad tag is still absence of coverage knowledge: the source text is retained for the
+    // normalizer, and no window is claimed from a run that could not date one of its entries.
+    expect(result.records[0]?.rawPublishedDateText).toBe('not-a-date');
+    expect(result.oldestListingPublishedAt).toBeNull();
+    expect(result.catalogueExhausted).toBe(false);
   });
 
   it('reads past a nested div inside the content block (balanced-div extraction)', async () => {

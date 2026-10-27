@@ -14,6 +14,8 @@ import {
   type RawJobEvidence,
 } from '@domain/types';
 import { SourceRunActiveError } from '@ports/source-run-repository';
+import type { JobRepository, UpsertJobInput } from '@ports/job-repository';
+import type { ObserveRawJobInput, RawJobRepository } from '@ports/raw-job-repository';
 import type {
   CollectionContext,
   CollectionResult,
@@ -139,9 +141,66 @@ class FlakyNormalizeAdapter implements JobSourceAdapter {
   }
 }
 
-/** Aborts the run's signal once acquisition has returned - i.e. shutdown mid-run. */
-class AbortAfterCollectAdapter implements JobSourceAdapter {
+/**
+ * Wraps the raw-evidence repository, rejecting `observe` for selected records. This is the
+ * shape of the audit H6 fault: an unwritable value (an `Invalid Date`, a rejected constraint)
+ * thrown from inside the per-record loop, where nothing used to catch it.
+ */
+class FlakyRawJobs implements RawJobRepository {
   constructor(
+    private readonly inner: RawJobRepository,
+    private readonly shouldFail: (evidence: RawJobEvidence) => boolean,
+  ) {}
+
+  observe(input: ObserveRawJobInput) {
+    if (this.shouldFail(input.evidence)) return Promise.reject(new Error('invalid date'));
+    return this.inner.observe(input);
+  }
+
+  findById(id: string) {
+    return this.inner.findById(id);
+  }
+
+  listForSourceRecord(sourceId: string, sourceJobIdentifier: string) {
+    return this.inner.listForSourceRecord(sourceId, sourceJobIdentifier);
+  }
+}
+
+/** The same fault on the promotion write instead of the evidence write. */
+class FlakyJobs implements JobRepository {
+  constructor(
+    private readonly inner: JobRepository,
+    private readonly shouldFail: (input: UpsertJobInput) => boolean,
+  ) {}
+
+  upsert(input: UpsertJobInput) {
+    if (this.shouldFail(input)) return Promise.reject(new Error('value out of range'));
+    return this.inner.upsert(input);
+  }
+
+  findById(id: string) {
+    return this.inner.findById(id);
+  }
+
+  countForSource(sourceId: string) {
+    return this.inner.countForSource(sourceId);
+  }
+
+  listLifecycleCandidates(sourceId: string) {
+    return this.inner.listLifecycleCandidates(sourceId);
+  }
+
+  listDeadlineCandidates() {
+    return this.inner.listDeadlineCandidates();
+  }
+
+  applyLifecycleStatuses(updates: Parameters<JobRepository['applyLifecycleStatuses']>[0]) {
+    return this.inner.applyLifecycleStatuses(updates);
+  }
+}
+
+/** Aborts the run's signal once acquisition has returned - i.e. shutdown mid-run. */
+class AbortAfterCollectAdapter implements JobSourceAdapter {  constructor(
     private readonly inner: JobSourceAdapter,
     private readonly controller: AbortController,
   ) {}
@@ -393,8 +452,67 @@ describe('RunSourceCollection', () => {
     expect(await jobs.countForSource(sourceId)).toBe(1);
   });
 
-  it('counts identity-less records as undeduplicable and never promotes them', async () => {
+  it('finalizes the run when a record cannot be stored as raw evidence', async () => {
+    // Audit H6: an exception raised inside the per-record loop used to escape it, so the
+    // SourceRun stayed RUNNING for the whole stale-run window and every other record of the
+    // acquisition was lost with it.
     const sourceId = await createSource();
+    const good = makeRawJob({ sourceJobIdentifier: 'f-1', rawTitle: 'Backend Engineer' });
+    const bad = makeRawJob({ sourceJobIdentifier: 'f-2', rawTitle: 'Broken Capture' });
+    const tasks = new PrismaWorkTaskRepository(prisma);
+    const runWithFlakyStore = new RunSourceCollection({
+      sourceRuns,
+      rawJobs: new FlakyRawJobs(rawJobs, (evidence) => evidence.sourceJobIdentifier === 'f-2'),
+      jobs,
+      tasks,
+      logger: silentWorkerLogger,
+    });
+
+    const result = await runWithFlakyStore.run({
+      adapter: makeAdapter(sourceId, [good, bad]),
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+    });
+
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.run?.errorSummary).toContain('record 1: raw evidence could not be stored');
+    expect(result.funnel).toMatchObject({ collected: 2, parsed: 1, unique: 1 });
+    const stranded = await prisma.sourceRun.findFirst({
+      where: { sourceId, status: SourceRunStatus.RUNNING },
+    });
+    expect(stranded).toBeNull();
+    expect(await countEvidence(sourceId)).toBe(1);
+    expect(await jobs.countForSource(sourceId)).toBe(1);
+  });
+
+  it('finalizes the run when a parsed record cannot be promoted', async () => {
+    const sourceId = await createSource();
+    const good = makeRawJob({ sourceJobIdentifier: 'g-1', rawTitle: 'Backend Engineer' });
+    const bad = makeRawJob({ sourceJobIdentifier: 'g-2', rawTitle: 'Unpromotable' });
+    const runWithFlakyJobs = new RunSourceCollection({
+      sourceRuns,
+      rawJobs,
+      jobs: new FlakyJobs(jobs, (input) => input.identityKey.includes('g-2')),
+      tasks: new PrismaWorkTaskRepository(prisma),
+      logger: silentWorkerLogger,
+    });
+
+    const result = await runWithFlakyJobs.run({
+      adapter: makeAdapter(sourceId, [good, bad]),
+      now: NOW,
+      staleRunSeconds: STALE_SECONDS,
+      acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+    });
+
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.run?.errorSummary).toContain('record 1: job could not be stored');
+    // Both captures exist: the failure was promotion, and the evidence must survive for a retry.
+    expect(await countEvidence(sourceId)).toBe(2);
+    expect(await jobs.countForSource(sourceId)).toBe(1);
+  });
+
+  it('counts identity-less records as undeduplicable and never promotes them', async () => {    const sourceId = await createSource();
     const rows = [
       // A title alone is not a discriminator.
       makeRawJob({ rawTitle: 'Engineer' }),

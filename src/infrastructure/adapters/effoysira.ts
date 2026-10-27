@@ -295,7 +295,12 @@ export function createEffoySiraAdapter(
         // The full HTML is deliberately not retained: template noise (ads, scripts) changes
         // constantly and would defeat content dedupe. The extracted text is the evidence.
         rawPayload: null,
-        collectedAt: publishedTime === null ? now : new Date(publishedTime),
+        // Always the observation time. `article:published_time` is page content and reaches this
+        // code verbatim, so `new Date(publishedTime)` was an `Invalid Date` whenever the tag was
+        // malformed - which then threw inside the raw-evidence write, mid-loop, leaving the whole
+        // run `RUNNING`. The publication date is carried as text above and parsed by the shared
+        // normalizer, which is where UNKNOWN is the correct answer for a bad value.
+        collectedAt: now,
       });
 
       await delay(delayMs);

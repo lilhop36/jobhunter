@@ -17,8 +17,8 @@ import {
   matchScoringDedupeKey,
   type MatchScoringTaskPayload,
 } from '@application/matching';
-import type { JobRepository } from '@ports/job-repository';
-import type { RawJobRepository } from '@ports/raw-job-repository';
+import type { JobRepository, UpsertJobResult } from '@ports/job-repository';
+import type { ObserveRawJobResult, RawJobRepository } from '@ports/raw-job-repository';
 import type { CollectionResult, JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
 import type { WorkTaskRepository } from '@ports/work-task-repository';
@@ -369,6 +369,9 @@ export class RunSourceCollection {
     const records = collection.records;
     funnel.collected = records.length;
     let abortedAt: number | null = null;
+    // Records this run could not write at all. Unlike a parse failure, their evidence did not
+    // reach `raw_jobs`, so they cannot be counted as retained and must not read as healthy.
+    let storageFailures = 0;
 
     for (let index = 0; index < records.length; index += 1) {
       if (externalSignal?.aborted) {
@@ -379,20 +382,38 @@ export class RunSourceCollection {
 
       // SRS 7.7 step 4: raw evidence is persisted *before* any downstream promotion, so
       // a failure later in the pipeline can never lose what the source published.
-      const observed = await this.deps.rawJobs.observe({
-        sourceId,
-        sourceRunId: run.id,
-        evidence: record,
-        contentHash: rawContentHash({
-          sourceUrl: record.sourceUrl,
-          rawTitle: record.rawTitle,
-          rawCompany: record.rawCompany,
-          rawLocation: record.rawLocation,
-          rawDescription: record.rawDescription,
-          rawPublishedDateText: record.rawPublishedDateText,
-          rawSalaryText: record.rawSalaryText,
-        }),
-      });
+      let observed: ObserveRawJobResult;
+      try {
+        observed = await this.deps.rawJobs.observe({
+          sourceId,
+          sourceRunId: run.id,
+          evidence: record,
+          contentHash: rawContentHash({
+            sourceUrl: record.sourceUrl,
+            rawTitle: record.rawTitle,
+            rawCompany: record.rawCompany,
+            rawLocation: record.rawLocation,
+            rawDescription: record.rawDescription,
+            rawPublishedDateText: record.rawPublishedDateText,
+            rawSalaryText: record.rawSalaryText,
+          }),
+        });
+      } catch (error) {
+        // One unwritable record must not orphan the run. An un-caught throw here left the
+        // SourceRun `RUNNING` forever (audit H6), so the record is reported and skipped and
+        // every other capture in this acquisition still lands.
+        storageFailures += 1;
+        if (notes.length < MAX_RETAINED_FAILURE_NOTES) {
+          notes.push(`record ${index}: raw evidence could not be stored (${describeError(error)})`);
+        }
+        this.deps.logger.warn('record could not be stored; the run continues without it', {
+          sourceId,
+          runId: run.id,
+          index,
+          reason: describeError(error),
+        });
+        continue;
+      }
 
       let job: NormalizedJob;
       try {
@@ -443,12 +464,29 @@ export class RunSourceCollection {
       if (identity.basis === 'fallback') funnel.fallbackIdentities += 1;
 
       // SRS 7.7 step 9 (persist Job), scoped to this source.
-      const upserted = await this.deps.jobs.upsert({
-        sourceId,
-        rawJobId: observed.rawJob.id,
-        identityKey: identity.key,
-        job,
-      });
+      let upserted: UpsertJobResult;
+      try {
+        upserted = await this.deps.jobs.upsert({
+          sourceId,
+          rawJobId: observed.rawJob.id,
+          identityKey: identity.key,
+          job,
+        });
+      } catch (error) {
+        // Same rule as the raw write: a record this source published is not worth an orphaned
+        // run. Its raw evidence is retained, so a later pass can still promote it.
+        storageFailures += 1;
+        if (notes.length < MAX_RETAINED_FAILURE_NOTES) {
+          notes.push(`record ${index}: job could not be stored (${describeError(error)})`);
+        }
+        this.deps.logger.warn('record parsed but could not be promoted; raw evidence retained', {
+          sourceId,
+          runId: run.id,
+          rawJobId: observed.rawJob.id,
+          reason: describeError(error),
+        });
+        continue;
+      }
       if (upserted.isNew) funnel.unique += 1;
       else funnel.duplicates += 1;
     }
@@ -465,6 +503,10 @@ export class RunSourceCollection {
     } else if (funnel.parseFailures > 0) {
       // Partial: the run completed but some records could not be read. Their raw
       // evidence is preserved, so this is a data-quality signal, not a failure.
+      status = SourceRunStatus.PARTIAL;
+    } else if (storageFailures > 0) {
+      // Partial: the acquisition was readable but some of it could not be written. Never
+      // SUCCEEDED - that would report a health verdict on a run that lost records.
       status = SourceRunStatus.PARTIAL;
     } else {
       status = SourceRunStatus.SUCCEEDED;
