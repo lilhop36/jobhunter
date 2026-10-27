@@ -5,9 +5,10 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Two items were fixed afterwards, on
-2026-10-27: P0 item 1 (the drifted schema) and M10 (the timestamp type), recorded in §7. Every
-other finding stands as written, and the evidence below describes the tree as the audit found it.
+**Status of this document:** findings and recommendations. Four items were fixed afterwards, on
+2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H4 (the refresh merge) and
+H5 (deadline anchoring), each recorded on the finding itself. Every other finding stands as
+written, and the evidence below describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -37,8 +38,9 @@ The system is **not safe to operate as-is**, for four independent reasons:
    source after reaping.
 4. **Two data-integrity rules are violated in the direction AGENTS.md forbids:** a partial capture
    can overwrite known facts with UNKNOWN, and the deadline parser can invent a deadline from an
-   unrelated date elsewhere on the same line. *(The deadline half was fixed 2026-10-27 — see H5;
-   the overwrite half, H4, is open.)*
+   unrelated date elsewhere on the same line. *(Both were fixed 2026-10-27 — see H4 and H5; H4
+   leaves one field, `applicationDeadline`, clearing on refresh, because the repository pins that
+   as intentional and it is an owner decision rather than a bug.)*
 
 None of these is architectural. They are bounded bugs and one deployment step, but they must be
 fixed before the pipeline is trusted for real alerts.
@@ -166,6 +168,22 @@ become un-notifiable, then re-appear, with no evidence of why. This contradicts 
 "missing evidence is not negative evidence".
 **Fix:** merge field-by-field: overwrite only when the incoming value is present evidence; never
 clear a populated canonical field on a refresh. Cover with a regression test for a partial capture.
+
+**Resolved 2026-10-27, except for one field that needs the owner's decision.** Every other column
+now keeps the stored fact when the new capture carries nothing — NULL scalars via `COALESCE`, and
+the enum columns via a guard on their own `UNKNOWN` member, because `UNKNOWN` means "nothing was
+read", not "the source now says it is unknown". `descriptionQuality` travels with `description`
+rather than reclassifying a description the row kept, and `provenance` merges by key
+(`stored || incoming`) so a fact this merge preserved keeps the origin it was recorded with. The
+newest capture is still untouched in `raw_jobs`, so nothing about the observation is lost.
+
+`applicationDeadline` was left clearing on refresh: `tests/integration/job-repository.spec.ts:285`
+pins "a recapture that no longer states a deadline clears the column" as deliberate, on the ground
+that a source which stopped stating one has changed its statement. That reading is what produces
+the status churn described above, and it is the same absence-vs-negative-evidence question the
+AGENTS.md rule answers the other way. It is a product decision, not a bug fix, so the merge is
+asymmetric and the code says so. Deciding it means either retiring that test's premise (and the
+`EXPIRED`-to-`ACTIVE` churn with it) or accepting that a partial parse can expire-proof a posting.
 
 #### H5 — The deadline parser can fabricate a deadline from an unrelated date — **new, reproduced**
 
@@ -503,8 +521,9 @@ marked theoretical or downgraded.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
    per-record failure.
 4. **Fix refresh merge (H4)** and **deadline anchoring (H5)** with regression tests.
-   **H5 done 2026-10-27** (clause-anchored extraction, `DEADLINE_EXTRACTION_V2`, reproduced case and
-   the dotted/comma-date cases pinned as tests). **H4 is open.**
+   **Done 2026-10-27** — H5 is clause-anchored extraction (`DEADLINE_EXTRACTION_V2`, the reproduced
+   input plus the dotted and comma-date cases pinned); H4 is a field-by-field merge with a partial
+   recapture regression test, with `applicationDeadline` deliberately left to the owner's call.
 
 ### P1 — this week
 

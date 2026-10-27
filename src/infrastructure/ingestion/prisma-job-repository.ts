@@ -21,35 +21,65 @@ const JOB_COLUMNS = Prisma.raw(`
   "contentFingerprint", "publishedAt", "createdAt", "updatedAt"
 `);
 
-/** Fields refreshed whenever a source record is observed again with changed content. */
+/**
+ * Fields refreshed whenever a source record is observed again with changed content.
+ *
+ * A refresh merges; it does not replace. An incoming value that carries no evidence — a NULL, or
+ * the enum's own UNKNOWN member — leaves the stored fact alone, because a page that parsed
+ * partially is absence of evidence, not evidence that the fact disappeared (AGENTS.md, "missing
+ * evidence is not negative evidence"). The whole capture is still retained in `raw_jobs`, so the
+ * newer observation is never lost, only the canonical projection of it.
+ */
+
+/** A nullable scalar: the stored value survives a capture that did not read this field. */
+function keepWhenAbsent(column: string): string {
+  return `"${column}" = COALESCE(EXCLUDED."${column}", "jobs"."${column}")`;
+}
+
+/** An enum whose UNKNOWN member means "nothing was read", which is not a new statement. */
+function keepWhenUnstated(column: string): string {
+  return (
+    `"${column}" = CASE WHEN EXCLUDED."${column}"::text = 'UNKNOWN' ` +
+    `THEN "jobs"."${column}" ELSE EXCLUDED."${column}" END`
+  );
+}
+
 const JOB_REFRESH_COLUMNS = Prisma.raw(`
   "rawJobId" = EXCLUDED."rawJobId",
-  "canonicalUrl" = EXCLUDED."canonicalUrl",
-  "title" = EXCLUDED."title",
-  "company" = EXCLUDED."company",
-  "description" = EXCLUDED."description",
-  "descriptionQuality" = EXCLUDED."descriptionQuality",
-  "locationText" = EXCLUDED."locationText",
-  "locationCategory" = EXCLUDED."locationCategory",
-  "remoteStatus" = EXCLUDED."remoteStatus",
-  "publishedCalendar" = EXCLUDED."publishedCalendar",
-  "originalPublishedDateText" = EXCLUDED."originalPublishedDateText",
-  "publishedAt" = EXCLUDED."publishedAt",
-  "dateConfidence" = EXCLUDED."dateConfidence",
+  ${keepWhenAbsent('canonicalUrl')},
+  ${keepWhenAbsent('title')},
+  ${keepWhenAbsent('company')},
+  ${keepWhenAbsent('description')},
+  -- A verdict about a description this capture never read describes nothing, so quality travels
+  -- with the description rather than reclassifying a description the row keeps.
+  "descriptionQuality" = CASE WHEN EXCLUDED."description" IS NULL
+    THEN "jobs"."descriptionQuality" ELSE EXCLUDED."descriptionQuality" END,
+  ${keepWhenAbsent('locationText')},
+  ${keepWhenUnstated('locationCategory')},
+  ${keepWhenUnstated('remoteStatus')},
+  ${keepWhenUnstated('publishedCalendar')},
+  ${keepWhenAbsent('originalPublishedDateText')},
+  ${keepWhenAbsent('publishedAt')},
+  ${keepWhenAbsent('dateConfidence')},
+  -- The deadline is the one field that still follows the newest capture and may clear. A source
+  -- that stops stating a deadline is treated as a changed statement, not absence; that reading is
+  -- pinned by tests/integration/job-repository.spec.ts and is a live owner decision (audit H4).
   "applicationDeadline" = EXCLUDED."applicationDeadline",
-  "salaryType" = EXCLUDED."salaryType",
-  "salaryMin" = EXCLUDED."salaryMin",
-  "salaryMax" = EXCLUDED."salaryMax",
-  "salaryCurrency" = EXCLUDED."salaryCurrency",
-  "salaryPeriod" = EXCLUDED."salaryPeriod",
-  "salaryEvidence" = EXCLUDED."salaryEvidence",
-  "salaryConfidence" = EXCLUDED."salaryConfidence",
-  "employmentType" = EXCLUDED."employmentType",
-  "applicationMethod" = EXCLUDED."applicationMethod",
-  "applyUrl" = EXCLUDED."applyUrl",
-  "applyEmail" = EXCLUDED."applyEmail",
-  "contentFingerprint" = EXCLUDED."contentFingerprint",
-  "provenance" = EXCLUDED."provenance"
+  ${keepWhenUnstated('salaryType')},
+  ${keepWhenAbsent('salaryMin')},
+  ${keepWhenAbsent('salaryMax')},
+  ${keepWhenAbsent('salaryCurrency')},
+  ${keepWhenUnstated('salaryPeriod')},
+  ${keepWhenAbsent('salaryEvidence')},
+  ${keepWhenAbsent('salaryConfidence')},
+  ${keepWhenUnstated('employmentType')},
+  ${keepWhenUnstated('applicationMethod')},
+  ${keepWhenAbsent('applyUrl')},
+  ${keepWhenAbsent('applyEmail')},
+  ${keepWhenAbsent('contentFingerprint')},
+  -- The newer map wins for the fields it names and leaves the origin of every field it omitted,
+  -- which is exactly the set this merge kept from the older capture.
+  "provenance" = COALESCE("jobs"."provenance", '{}'::jsonb) || COALESCE(EXCLUDED."provenance", '{}'::jsonb)
 `);
 
 interface JobRow {

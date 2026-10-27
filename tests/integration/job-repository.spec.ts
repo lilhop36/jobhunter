@@ -293,6 +293,58 @@ describe('job upsert', () => {
     expect(refreshed.applicationDeadline).toBeNull();
   });
 
+  it('keeps every canonical fact that a partial recapture did not read (audit H4)', async () => {
+    const sourceId = await createSource('job-partial-refresh');
+    const full = await normalize({
+      rawDescription:
+        'Build things with senior engineers. Apply by email to hiring@acme.example.',
+      rawSalaryText: 'ETB 123,456 per month',
+    });
+
+    const { job: created } = await repo.upsert({
+      sourceId,
+      identityKey: 'sid:job-1',
+      job: full,
+    });
+    const readRow = async () => {
+      const rows = await prisma.$queryRawUnsafe<Record<string, unknown>[]>(
+        `SELECT "title", "company", "description", "descriptionQuality"::text AS "descriptionQuality",
+                "locationText", "locationCategory"::text AS "locationCategory",
+                "remoteStatus"::text AS "remoteStatus", "salaryType"::text AS "salaryType",
+                "salaryMin"::text AS "salaryMin", "salaryCurrency", "salaryPeriod"::text AS "salaryPeriod",
+                "salaryEvidence", "employmentType"::text AS "employmentType",
+                "applicationMethod"::text AS "applicationMethod", "applyEmail", "canonicalUrl",
+                "provenance"
+           FROM "jobs" WHERE "id" = $1::uuid`,
+        created.id,
+      );
+      return rows[0];
+    };
+
+    const before = await readRow();
+    // The capture has to have carried something for the merge to be worth testing at all.
+    expect(before.title).toBe('Senior Engineer');
+    expect(before.salaryType).not.toBe('UNKNOWN');
+    expect(before.applicationMethod).not.toBe('UNKNOWN');
+
+    // A recapture of the same posting whose page parsed nothing: every field absent.
+    const partial = await normalize({
+      sourceUrl: null,
+      rawTitle: null,
+      rawCompany: null,
+      rawLocation: null,
+      rawDescription: null,
+      rawSalaryText: null,
+    });
+    expect(partial.title).toBeNull();
+    expect(partial.salary.type).toBe(SalaryType.UNKNOWN);
+
+    await repo.upsert({ sourceId, identityKey: 'sid:job-1', job: partial });
+
+    const after = await readRow();
+    expect(after).toEqual(before);
+  });
+
   it('reads deadline candidates only for the statuses the deadline policy owns', async () => {
     const sourceId = await createSource('job-deadline-candidates');
     const owned = await repo.upsert({
