@@ -1,7 +1,7 @@
 # SRS ↔ Implementation Drift Report
 
 **Date:** 2026-10-23
-**Last updated:** 2026-10-27 — D20 corrected to PARTIAL (the §7.8 reduced-yield rule is not implemented), migration count refreshed to 15, ENG-022 resolution recorded (D32). Earlier: 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill.
+**Last updated:** 2026-10-28 — D20 yield drift implemented for a source that runs (`classifyYieldDrift`: median of the last three clean runs, `DEGRADED` below half of it, plus a warning), with the unscheduled-source staleness half still open, so D20 stays PARTIAL. Earlier: 2026-10-27 — D20 corrected to PARTIAL (the §7.8 reduced-yield rule was not implemented), migration count refreshed to 15, ENG-022 resolution recorded (D32). 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill.
 **Baseline commit:** `31db910` (working tree clean except untracked `.freebuff/`)
 **Authoritative specification:** `docs/SRS/JobHunter-v1.1-SRS.md`
 **Method:** read-only inspection of the SRS, schema, migrations, routes, domain/application/infrastructure code, tests and docs. No SRS, schema or code was changed to produce this report. Nothing was executed against a real source or Telegram.
@@ -115,7 +115,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
 | D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **PARTIAL** | `scripts/backup.mjs` (validated custom-format dump) and `scripts/restore-drill.mjs` (restores into a disposable database, compares table sets and exact row counts, drops it in a `finally` block) exist and passed on 2026-10-25: 17/17 tables, 484/484 rows. Restore, scheduling and retention are documented in `docs/engineering/backup-and-restore.md`. No `BackupRun` model (intentional, §7); no schedule or off-machine copy is installed yet — those are deployment steps. | deployment step | medium |
-| D20 | FR-020 / §7.8 source metrics and drift detection | **PARTIAL** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health — the metrics list is met. §7.8 "Drift detection" (`docs/SRS/JobHunter-v1.1-SRS.md:1264`) also requires an operator-visible warning for a source whose **extraction yield is sharply reduced**, not only zero: `isUnexpectedZeroResult` (`src/domain/types/source-run.ts:94-99`) fires on `collected === 0` and nothing compares a run against the source's recent yield, so an 18→1 collapse reports HEALTHY. Also absent: nothing warns when a source stops being collected at all — `lastSuccessfulRunAt` is stored and rendered (`apps/api/routes/web.ts:747`, `apps/api/routes/sources.ts:155`) but never compared with the source's schedule interval, and `classifySourceHealth` (`src/domain/health/source-health-policy.ts:70-98`) reads only run status and the zero flag, so a source whose scheduler never fires keeps its last verdict. Funnel view (collected→…→notified) is not a page. AI metrics N/A with D17. | accidental (the yield rule was never implemented; this row previously claimed MATCH) | high |
+| D20 | FR-020 / §7.8 source metrics and drift detection | **PARTIAL** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health — the metrics list is met. §7.8 "Drift detection" (`docs/SRS/JobHunter-v1.1-SRS.md:1264`) now has one of its two cases: `classifyYieldDrift` (`src/domain/health/source-yield-drift.ts`, 2026-10-28) compares a clean run's parsed yield with the median of the source's last three SUCCEEDED catalogue-exhausted runs and makes the source `DEGRADED` (plus a `warn` log) when it falls below half a baseline of at least five; zero is still handled by `isUnexpectedZeroResult`. Capped, partial and failed runs are not judged. Still absent: nothing warns when a source stops being collected at all — `lastSuccessfulRunAt` is stored and rendered (`apps/api/routes/web.ts:747`, `apps/api/routes/sources.ts:155`) but never compared with the source's schedule interval, so a source whose scheduler never fires keeps its last verdict. Funnel view (collected→…→notified) is not a page, and `jobsRejected` stays `0` by ADR-0001 §4 (no collection-time rejection rule exists). AI metrics N/A with D17. | accidental (yield rule never implemented until 2026-10-28; row previously claimed MATCH) | medium |
 | D21 | AC-020 14-day precision | **MISSING** | No measurement tooling or log; feedback storage exists, so this is process, not code. | not started | high |
 
 ### 4.7 Architecture and engineering rules
@@ -200,7 +200,7 @@ Ordered by cost, not importance; each is independently reviewable.
 | D17/D18 AI | Leave deferred. The milestone is M4; nothing else depends on it. |
 | D19 backup | **Done 2026-10-25** — scripts plus a recorded restore drill (17 tables / 484 rows). Remaining deployment steps: install a schedule and an off-machine copy, then run the drill against it. No `BackupRun` model is needed for a single-operator MVP. |
 | D21 precision | Spreadsheet, not code. |
-| D20 yield drift (§7.8) | One domain rule beside `isUnexpectedZeroResult` that compares a run's `jobsDiscovered` with the source's recent successful runs and raises `DEGRADED`, plus the same treatment for `lastSuccessfulRunAt` ageing past the source's interval. Both need a threshold the owner picks; the code change is small, the decision is not. The row claimed MATCH until 2026-10-27, which overstated §7.8; the status is now corrected, the rule is still unimplemented. |
+| D20 yield drift (§7.8) | **Done 2026-10-28 for a source that runs** — `classifyYieldDrift` raises `DEGRADED` and logs a warning when a clean run parses less than half the median of the last three clean runs (baseline of at least five records). The thresholds are documented engineering defaults (`0.5`, `5`, `3`), not SRS values, and are the owner's to tune. Still open: `lastSuccessfulRunAt` ageing past the source's interval, which needs the same kind of threshold and a place to evaluate it even when the scheduler is not firing. The row claimed MATCH until 2026-10-27, which overstated §7.8. |
 | D1 API auth | Decide the trust boundary first (see §8); the code change follows the decision. |
 
 ---
@@ -221,6 +221,9 @@ Ordered by cost, not importance; each is independently reviewable.
 - No claim is made that the drift register is exhaustive; it covers every requirement with a concrete implementation counterpart.
 - The 2026-10-27 refresh: D32 and the migration count were checked against `prisma migrate status`
   on `jobhunter` (15 applied, schema up to date) and live 200 responses from `/dashboard`,
-  `/api/jobs`, `/api/matches` and `/api/sources`. The D20 correction is read from code
-  (`isUnexpectedZeroResult` fires only on `collected === 0`; `classifySourceHealth` reads only run
-  status and that flag) — no yield-collapse alert was reproduced, because none exists to reproduce.
+  `/api/jobs`, `/api/matches` and `/api/sources`.
+- The 2026-10-28 refresh: D20's yield half was verified by executing the rule, not by reading it —
+  `tests/unit/yield-drift-policy.spec.ts`, `tests/unit/source-health-policy.spec.ts` and the
+  `reduced-yield drift` cases in `tests/integration/source-health.spec.ts` run against the real
+  database and assert both the `DEGRADED` verdict and the warning line. The thresholds (half of a
+  median of three, minimum five records) are engineering defaults and are not in the SRS.

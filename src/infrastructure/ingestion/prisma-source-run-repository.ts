@@ -10,6 +10,7 @@ import {
   SourceRunActiveError,
   SourceRunOutcome,
   SourceRunRepository,
+  SourceRunYieldSample,
   StartSourceRunInput,
 } from '@ports/source-run-repository';
 
@@ -129,6 +130,12 @@ function assertPositiveSeconds(value: number, name: string): void {
   }
 }
 
+function assertPositiveInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive integer; received ${String(value)}`);
+  }
+}
+
 /**
  * PostgreSQL collection-run repository.
  *
@@ -245,6 +252,35 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
       RETURNING ${SOURCE_RUN_COLUMNS}
     `;
     return rows.map(toRecord);
+  }
+
+  async recentCleanYields(sourceId: string, limit: number): Promise<SourceRunYieldSample[]> {
+    assertPositiveInteger(limit, 'limit');
+    const rows = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        startedAt: Date | string;
+        jobsDiscovered: number;
+        parseFailures: number;
+      }>
+    >`
+      SELECT "id", "startedAt", "jobsDiscovered", "parseFailures"
+      FROM "source_runs"
+      WHERE "sourceId" = ${sourceId}::uuid
+        AND "status" = 'SUCCEEDED'::"SourceRunStatus"
+        AND "catalogueExhausted" = true
+      ORDER BY "startedAt" DESC
+      LIMIT ${limit}
+    `;
+    // `parsed` is derived, not stored (ADR-0001): the funnel identity is
+    // `collected = parsed + parseFailures`. `GREATEST` guards a counter set that could only
+    // come from a bug, so one bad row cannot produce a negative yield.
+    return rows.map((row) => ({
+      runId: row.id,
+      startedAt: toDate(row.startedAt),
+      jobsDiscovered: row.jobsDiscovered,
+      parsed: Math.max(0, row.jobsDiscovered - row.parseFailures),
+    }));
   }
 
   async findById(runId: string): Promise<SourceRunRecord | null> {

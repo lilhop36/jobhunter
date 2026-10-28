@@ -68,6 +68,20 @@ export class SourceRunActiveError extends Error {
 }
 
 /**
+ * One run's yield as the reduced-yield rule sees it (SRS 7.8, FR-020). Derived from the
+ * counters the run already persisted: `parsed = jobsDiscovered - parseFailures`, the same
+ * funnel arithmetic ADR-0001 fixes.
+ */
+export interface SourceRunYieldSample {
+  runId: string;
+  startedAt: Date;
+  /** Listing entries the run read. */
+  jobsDiscovered: number;
+  /** Records that normalized successfully (`jobsDiscovered - parseFailures`). */
+  parsed: number;
+}
+
+/**
  * Persistence port for collection runs.
  *
  * Fencing contract: `finalize` must only apply to a run that is still active. A
@@ -106,6 +120,17 @@ export interface SourceRunRepository {
    * catch-up collides with a run that is already dead.
    */
   reapStaleRuns(maxDurationSeconds: number): Promise<SourceRunRecord[]>;
+
+  /**
+   * Yield of the most recent runs usable as a reduced-yield baseline (SRS 7.8, FR-020),
+   * newest first, at most `limit` of them.
+   *
+   * Only `SUCCEEDED` runs that read their listing to the end qualify. A capped, partial or
+   * failed run is not evidence of what the source normally yields, and letting one define
+   * the baseline would turn a bad day into the new normal one run later. An empty result
+   * means no baseline has been established - which is not the same as a baseline of zero.
+   */
+  recentCleanYields(sourceId: string, limit: number): Promise<SourceRunYieldSample[]>;
 
   findById(runId: string): Promise<SourceRunRecord | null>;
 }

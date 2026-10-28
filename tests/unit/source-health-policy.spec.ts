@@ -3,21 +3,33 @@ import {
   SOURCE_HEALTH_POLICY_VERSION,
   classifySourceHealth,
 } from '@domain/health/source-health-policy';
+import type { YieldDriftVerdict } from '@domain/health/source-yield-drift';
 
 function classify(
   runStatus: SourceRunStatus,
-  overrides: { unexpectedZeroResults?: boolean; attributableToSource?: boolean } = {},
+  overrides: {
+    unexpectedZeroResults?: boolean;
+    attributableToSource?: boolean;
+    yieldDrift?: YieldDriftVerdict | null;
+  } = {},
 ) {
   return classifySourceHealth({
     runStatus,
     unexpectedZeroResults: overrides.unexpectedZeroResults ?? false,
     attributableToSource: overrides.attributableToSource ?? true,
+    yieldDrift: overrides.yieldDrift ?? null,
   });
 }
 
+const COLLAPSED: YieldDriftVerdict = {
+  drifted: true,
+  reason: 'extraction yield collapsed: 1 of 1 listed records parsed, against a recent baseline of 18',
+  baselineParsed: 18,
+};
+
 describe('classifySourceHealth', () => {
   it('names its policy version', () => {
-    expect(SOURCE_HEALTH_POLICY_VERSION).toBe('FR-020_SOURCE_HEALTH_V1');
+    expect(SOURCE_HEALTH_POLICY_VERSION).toBe('FR-020_SOURCE_HEALTH_V2');
   });
 
   it('marks a clean run healthy and counts it as the last success', () => {
@@ -49,6 +61,36 @@ describe('classifySourceHealth', () => {
       'zero results',
     );
     expect(classify(SourceRunStatus.PARTIAL)?.reason).not.toContain('zero results');
+  });
+
+  it('degrades a clean run whose yield collapsed, without calling it an error', () => {
+    // SRS 7.8: the run worked, the source stopped delivering. `HEALTHY` here is the silence
+    // the audit found; `lastErrorAt` would be a claim that something errored.
+    const verdict = classify(SourceRunStatus.SUCCEEDED, { yieldDrift: COLLAPSED });
+    expect(verdict).toEqual({
+      status: HealthStatus.DEGRADED,
+      countsAsSuccess: true,
+      reason: COLLAPSED.reason,
+    });
+  });
+
+  it('leaves a clean run healthy when the yield comparison found no drift', () => {
+    expect(
+      classify(SourceRunStatus.SUCCEEDED, {
+        yieldDrift: { drifted: false, reason: null, baselineParsed: 18 },
+      }),
+    ).toMatchObject({ status: HealthStatus.HEALTHY });
+  });
+
+  it('does not let a yield collapse disguise a worse run status', () => {
+    // Drift is evidence about a *completed* run. A failed run is FAILING whatever its yield.
+    expect(classify(SourceRunStatus.FAILED, { yieldDrift: COLLAPSED })).toMatchObject({
+      status: HealthStatus.FAILING,
+    });
+    expect(classify(SourceRunStatus.PARTIAL, { yieldDrift: COLLAPSED })).toMatchObject({
+      status: HealthStatus.DEGRADED,
+      countsAsSuccess: false,
+    });
   });
 
   it('concludes nothing from a run that is still in flight', () => {

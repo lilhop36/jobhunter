@@ -5,11 +5,12 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Six items were fixed afterwards, on
-2026-10-27: P0 item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its
-heartbeat half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run), each
-recorded on the finding itself. Every other finding stands as written, and the evidence below
-describes the tree as the audit found it.
+**Status of this document:** findings and recommendations. Seven items were fixed afterwards: P0
+item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its heartbeat
+half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27, and
+H7 (reduced-yield detection, except the unscheduled-source half) on 2026-10-28. Each is recorded on
+the finding itself. Every other finding stands as written, and the evidence below describes the tree
+as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -281,6 +282,38 @@ decay for days while the dashboard says healthy.
 ratio) and emit `DEGRADED` plus a log/operator warning when yield falls outside a documented
 threshold. Correct D20 to PARTIAL. Add tests with a synthetic 80% yield drop.
 
+**Resolved 2026-10-28 for a scheduled source that runs, except the unscheduled-source half.** The
+rule is `classifyYieldDrift` (`src/domain/health/source-yield-drift.ts`): the run's parsed yield is
+compared with the **median of its last three clean runs** (SUCCEEDED and catalogue-exhausted), and a
+yield strictly below **half** of that median, with a baseline of at least **five** records, returns a
+drift verdict that `classifySourceHealth` turns into `DEGRADED`. A success whose yield collapsed
+still counts as a success - `lastErrorAt` would claim an error that did not happen - so the run stays
+`SUCCEEDED` and only the source's verdict changes, which is what the dashboard renders
+(`apps/api/routes/web.ts:746`). A `warn` line with the listed/parsed/baseline numbers is written only
+after the run is really finalized, so a reaped outcome cannot raise a phantom alarm.
+
+Two decisions worth recording. The baseline is **read from the runs' own counters**
+(`SourceRunRepository.recentCleanYields`) rather than copied into a per-source table: the per-run
+counters already are the persisted baseline, and a copy would be one more thing to keep in sync. And
+runs that were capped, partial or aborted are never used or judged by volume - an incomplete look is
+not evidence about the source. `parsed` is `jobsDiscovered - parseFailures`, the funnel identity
+ADR-0001 already fixes.
+
+`jobsRejected` remains `0` deliberately: ADR-0001 §4 decides it, because the SRS defines no
+collection-time rejection rule and `parsed = unique + duplicate + rejected + undeduplicable` closes
+with zero. Filling it would require inventing a rejection rule, which is not this finding's fix.
+
+Tests: unit thresholds and the 80% drop (`yield-drift-policy.spec.ts`), health mapping
+(`source-health-policy.spec.ts`), the repository selection (`source-run-yield-baseline.spec.ts`), and
+the end-to-end verdict and log line through the real collection use case
+(`source-health.spec.ts`, "reduced-yield drift"), including the capped and partial exemptions.
+
+**Not fixed here:** a source that stops being collected at all still keeps its last verdict forever.
+Detecting that needs a staleness threshold against the source's schedule and a decision about where
+it is evaluated - the scheduler sees every enabled source but acts only on the due ones, so a check
+there would also make a *silently unscheduled* source visible. The drift register records that the
+threshold is an owner decision. This change makes a source that *does* run unable to decay silently.
+
 #### H8 — Known high-impact requirement gaps still open
 
 These are already recorded and accepted/deferred, but they remain material to whether the system
@@ -504,17 +537,17 @@ mixed-type comparison instead.
 | Area | State |
 | --- | --- |
 | FR-001..003 sources/scheduling | Implemented; crash recovery fixed 2026-10-27 (H3), run heartbeat still absent (M2) |
-| FR-005..007 validation/quality | Strong deterministic gates; reduced-yield detection missing (H7) |
+| FR-005..007 validation/quality | Strong deterministic gates; reduced-yield detection added 2026-10-28 (H7) |
 | FR-008 dedupe | Within-source strong; cross-source absent (D8) |
 | FR-009/014 skills & confidence | Blocked by missing `JobSkill` (D4) |
 | FR-012..016 matching | Implemented and explainable; skills weight permanently unknown |
 | FR-017..018 notifications/feedback | Durable delivery; feedback API exists; AC-017 UI/buttons absent (D13) |
 | FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but ordering assumption and races remain (M1/M2/M6) |
-| FR-020 health | Latest-run policy sound for zero results; reduced-yield missing (H7) |
+| FR-020 health | Yield-drift detection added 2026-10-28; unscheduled-source staleness still open (H7) |
 | FR-021 backup | Scripts + drill verified; no schedule/off-machine/encryption (M7) |
 | SRS 8.1/8.2 auth/ownership | Not met (H2) |
 | SRS 6.5 accessibility | Mostly met; unlabeled textareas/error association (M9) |
-| SRS 7.8 observability | Partial; source health page exists, yield drift and funnel metrics missing (H7/L8) |
+| SRS 7.8 observability | Yield drift added 2026-10-28; funnel page and matched/notified metrics still missing (L8) |
 | AC-017 / AC-020 | Not met (D13/D21) |
 | AC-018 | Logic exists; operator view currently unreachable because of H1 |
 | AC-019 | Passes as "an archive restores with matching counts"; does not prove schedule, encryption, off-machine copy or schema currency (M7) |
@@ -565,7 +598,9 @@ marked theoretical or downgraded.
 
 5. **Authorization/Host/Origin (H2)**: session-derived identity, API token, ownership checks,
    Telegram-link session requirement, loopback fail-closed.
-6. **Yield-drift detection (H7)** and correct D20.
+6. **Yield-drift detection (H7)** and correct D20. **Done 2026-10-28** for a
+   source that runs (median baseline, `DEGRADED`, warning); the unscheduled-source
+   staleness signal is still open, and D20 stays PARTIAL for it.
 7. **Lifecycle CAS + restore-on-observation (M1)** and **source-run heartbeat (M2)**.
 8. **Outbox recovery/revalidation and shutdown order (M3)**.
 9. **Backup schedule + migration-aware drill (M7)**.

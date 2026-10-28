@@ -1,4 +1,5 @@
 import { HealthStatus, SourceRunStatus } from '@domain/enums';
+import type { YieldDriftVerdict } from './source-yield-drift';
 
 /**
  * Deterministic source health derived from one completed collection (FR-020, SRS 4.9 /
@@ -14,7 +15,9 @@ import { HealthStatus, SourceRunStatus } from '@domain/enums';
  * deliberately threshold-free - there is no failure count or window to misconfigure, and
  * a flapping source is visible as flapping rather than smoothed into a number.
  *
- *   - `SUCCEEDED`            -> `HEALTHY`, and the run becomes `lastSuccessfulRunAt`.
+ *   - `SUCCEEDED`            -> `HEALTHY`, and the run becomes `lastSuccessfulRunAt` -
+ *     unless its yield collapsed against the source's recent baseline (SRS 7.8 drift
+ *     detection, `classifyYieldDrift`), in which case it is `DEGRADED`.
  *   - `PARTIAL`              -> `DEGRADED`. The run completed but did not deliver cleanly:
  *     unreadable records (`parseFailures`), or the SRS 3.5 / AC-018 anomaly of zero results
  *     where results were expected.
@@ -23,7 +26,9 @@ import { HealthStatus, SourceRunStatus } from '@domain/enums';
  *     so health is left exactly as it was rather than overwritten with a guess.
  *
  * Only `SUCCEEDED` counts as a success. A partial run must not age `lastSuccessfulRunAt` -
- * the columns exist precisely to tell the two apart.
+ * the columns exist precisely to tell the two apart. A success whose yield collapsed still
+ * counts as a success: the run worked, the source's output shrank, and `lastErrorAt` would
+ * claim an error that did not happen. Its `DEGRADED` verdict is what makes the drop visible.
  *
  * ## Whose fault was it
  *
@@ -40,7 +45,7 @@ import { HealthStatus, SourceRunStatus } from '@domain/enums';
  * finish time is the only timestamp that can be correct, and the store already knows it. The
  * policy therefore reads no clock and stays a pure function of one run's outcome.
  */
-export const SOURCE_HEALTH_POLICY_VERSION = 'FR-020_SOURCE_HEALTH_V1';
+export const SOURCE_HEALTH_POLICY_VERSION = 'FR-020_SOURCE_HEALTH_V2';
 
 export interface SourceHealthObservation {
   /** Terminal status of the run that just finished. */
@@ -52,6 +57,12 @@ export interface SourceHealthObservation {
    * the worker caused (its own shutdown), which must leave health exactly as it was.
    */
   attributableToSource: boolean;
+  /**
+   * Reduced-yield evidence from `classifyYieldDrift` (SRS 7.8). Null or absent means the run
+   * made no yield claim - a first run, or one that did not read its listing to the end - and
+   * must not be read as "no drift".
+   */
+  yieldDrift?: YieldDriftVerdict | null;
 }
 
 export interface SourceHealthVerdict {
@@ -77,6 +88,18 @@ export function classifySourceHealth(
 
   switch (runStatus) {
     case SourceRunStatus.SUCCEEDED:
+      // A run that completed but extracted far less than the source usually does is the
+      // SRS 7.8 drift case: the run is a success, the source is not delivering. Reporting
+      // HEALTHY here is what let a selector change decay silently for days.
+      if (observation.yieldDrift?.drifted) {
+        return {
+          status: HealthStatus.DEGRADED,
+          countsAsSuccess: true,
+          reason:
+            observation.yieldDrift.reason ??
+            'the most recent collection extracted far less than the source usually does',
+        };
+      }
       return {
         status: HealthStatus.HEALTHY,
         countsAsSuccess: true,

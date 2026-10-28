@@ -1,9 +1,13 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { RunSourceCollection } from '@application/ingestion';
 import { HealthStatus, SourceRunStatus } from '@domain/enums';
-import { SourceResultExpectation, type RawJobEvidence } from '@domain/types';
+import {
+  SourceResultExpectation,
+  type NormalizedJob,
+  type RawJobEvidence,
+} from '@domain/types';
 import type { CollectionContext, CollectionResult } from '@ports/source-adapter';
-import { silentWorkerLogger } from '@ports/worker-logger';
+import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { PrismaRawJobRepository } from '@infrastructure/ingestion/prisma-raw-job-repository';
 import { PrismaSourceRunRepository } from '@infrastructure/ingestion/prisma-source-run-repository';
@@ -95,6 +99,69 @@ async function run(
 
 function adapterFor(sourceId: string, rows: RawJobEvidence[]): FakeSourceAdapter {
   return new FakeSourceAdapter(makeFakeConfig({ sourceId }), rows);
+}
+
+/** Distinct, promotable records, so a test can control exactly how much the run parses. */
+function rows(count: number): RawJobEvidence[] {
+  return Array.from({ length: count }, (_, index) =>
+    makeRawJob({ sourceJobIdentifier: `yield-${index}`, rawTitle: `Engineer ${index}` }),
+  );
+}
+
+interface LogEntry {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  meta?: unknown;
+}
+
+function capturingLogger(sink: LogEntry[]): WorkerLogger {
+  return {
+    info: (message, meta) => sink.push({ level: 'info', message, meta }),
+    warn: (message, meta) => sink.push({ level: 'warn', message, meta }),
+    error: (message, meta) => sink.push({ level: 'error', message, meta }),
+  };
+}
+
+/** The same wiring as `collection`, with a logger whose lines the test can read. */
+async function runWith(logger: WorkerLogger, adapter: FakeSourceAdapter) {
+  return new RunSourceCollection({
+    sourceRuns: new PrismaSourceRunRepository(prisma),
+    rawJobs: new PrismaRawJobRepository(prisma),
+    jobs: new PrismaJobRepository(prisma),
+    tasks: new PrismaWorkTaskRepository(prisma),
+    logger,
+  }).run({
+    adapter,
+    now: NOW,
+    staleRunSeconds: STALE_SECONDS,
+    acquisitionTimeoutMs: ACQUISITION_TIMEOUT_MS,
+  });
+}
+
+/** Prior clean runs, oldest first, as the reduced-yield baseline would read them. */
+async function seedCleanRuns(sourceId: string, yields: number[]): Promise<void> {
+  const base = new Date('2026-04-01T00:00:00.000Z');
+  for (const [index, discovered] of yields.entries()) {
+    const at = new Date(base.getTime() + index * 60 * 60_000);
+    await prisma.sourceRun.create({
+      data: {
+        sourceId,
+        status: SourceRunStatus.SUCCEEDED,
+        startedAt: at,
+        finishedAt: at,
+        jobsDiscovered: discovered,
+        catalogueExhausted: true,
+      },
+    });
+  }
+}
+
+/** The fake, but with one record whose selectors broke mid-run. */
+class PartlyUnreadableAdapter extends FakeSourceAdapter {
+  override async normalize(raw: RawJobEvidence): Promise<NormalizedJob> {
+    if (raw.sourceJobIdentifier === 'broken') throw new Error('selectors moved');
+    return super.normalize(raw);
+  }
 }
 
 beforeAll(() => {
@@ -248,5 +315,86 @@ describe('source health across a sequence of runs', () => {
     expect(after.healthStatus).toEqual(healthy.healthStatus);
     expect(after.lastSuccessfulRunAt).toEqual(healthy.lastSuccessfulRunAt);
     expect(after.lastErrorAt).toBeNull();
+  });
+});
+
+describe('reduced-yield drift (SRS 7.8)', () => {
+  const DRIFT_WARNING = 'source yield collapsed against its recent baseline';
+
+  it('degrades a clean run that yields less than half the recent baseline, and warns', async () => {
+    // 20 -> 4 is the shape a broken selector produces: the page still renders, the run
+    // still "succeeds", and before this rule the dashboard still said HEALTHY.
+    const sourceId = await createSource();
+    await seedCleanRuns(sourceId, [20, 20, 18]);
+    const logs: LogEntry[] = [];
+
+    const result = await runWith(capturingLogger(logs), adapterFor(sourceId, rows(4)));
+
+    expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
+    const source = await healthOf(sourceId);
+    expect(source.healthStatus).toBe(HealthStatus.DEGRADED);
+    // The run worked. The drop is not an error, and it must not age the success timestamp.
+    expect(source.lastErrorAt).toBeNull();
+    expect(source.lastSuccessfulRunAt).not.toBeNull();
+
+    const warning = logs.find((entry) => entry.message === DRIFT_WARNING);
+    expect(warning?.level).toBe('warn');
+    expect(warning?.meta).toMatchObject({ listed: 4, parsed: 4, baselineParsed: 20 });
+  });
+
+  it('stays healthy when the yield is within the normal range', async () => {
+    const sourceId = await createSource();
+    await seedCleanRuns(sourceId, [20, 20, 18]);
+    const logs: LogEntry[] = [];
+
+    const result = await runWith(capturingLogger(logs), adapterFor(sourceId, rows(12)));
+
+    expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
+    expect((await healthOf(sourceId)).healthStatus).toBe(HealthStatus.HEALTHY);
+    expect(logs.some((entry) => entry.message === DRIFT_WARNING)).toBe(false);
+  });
+
+  it('does not judge a run that did not read its listing to the end', async () => {
+    // A capped run legitimately sees less. Comparing it would turn an incomplete look into
+    // evidence about the source, which is the transformation the pipeline forbids.
+    const sourceId = await createSource();
+    await seedCleanRuns(sourceId, [20, 20, 20]);
+    const logs: LogEntry[] = [];
+    const capped = new FakeSourceAdapter(makeFakeConfig({ sourceId }), rows(2), false);
+
+    const result = await runWith(capturingLogger(logs), capped);
+
+    expect(result.status).toBe(SourceRunStatus.SUCCEEDED);
+    expect(result.run?.catalogueExhausted).toBe(false);
+    expect((await healthOf(sourceId)).healthStatus).toBe(HealthStatus.HEALTHY);
+    expect(logs.some((entry) => entry.message === DRIFT_WARNING)).toBe(false);
+  });
+
+  it('does not judge a partial run by yield, and does not raise the drift warning', async () => {
+    const sourceId = await createSource();
+    await seedCleanRuns(sourceId, [20, 20, 20]);
+    const logs: LogEntry[] = [];
+    const broken = new PartlyUnreadableAdapter(makeFakeConfig({ sourceId }), [
+      ...rows(2),
+      makeRawJob({ sourceJobIdentifier: 'broken', rawTitle: 'Engineer broken' }),
+    ]);
+
+    const result = await runWith(capturingLogger(logs), broken);
+
+    // PARTIAL already degrades the source; a second, yield-based verdict would be noise.
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect((await healthOf(sourceId)).healthStatus).toBe(HealthStatus.DEGRADED);
+    expect(logs.some((entry) => entry.message === DRIFT_WARNING)).toBe(false);
+  });
+
+  it('takes the median of recent runs, so one bad day does not become the norm', async () => {
+    // Chronological: 20, 20, then a bad day at 2. The baseline is the median (20), not the
+    // latest value (2), otherwise the next collapse would look normal.
+    const sourceId = await createSource();
+    await seedCleanRuns(sourceId, [20, 20, 2]);
+
+    await runWith(silentWorkerLogger, adapterFor(sourceId, rows(8)));
+
+    expect((await healthOf(sourceId)).healthStatus).toBe(HealthStatus.DEGRADED);
   });
 });

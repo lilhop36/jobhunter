@@ -23,6 +23,7 @@ import type { CollectionResult, JobSourceAdapter } from '@ports/source-adapter';
 import type {
   SourceRunOutcome,
   SourceRunRepository,
+  SourceRunYieldSample,
 } from '@ports/source-run-repository';
 import type { EnqueueWorkTaskInput, WorkTaskRepository } from '@ports/work-task-repository';
 import { silentWorkerLogger } from '@ports/worker-logger';
@@ -73,6 +74,11 @@ class StubSourceRuns implements SourceRunRepository {
   }
 
   async reapStaleRuns(): Promise<SourceRunRecord[]> {
+    return [];
+  }
+
+  /** No history: this suite pins description-quality authority, not yield drift. */
+  async recentCleanYields(): Promise<SourceRunYieldSample[]> {
     return [];
   }
 

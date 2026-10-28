@@ -1,6 +1,12 @@
 import { SourceRunStatus, SourceRunTrigger } from '@domain/enums';
 import { SOURCE_HEALTH_POLICY_VERSION, classifySourceHealth } from '@domain/health/source-health-policy';
 import {
+  YIELD_BASELINE_RUN_LIMIT,
+  classifyYieldDrift,
+  noYieldDrift,
+  type YieldDriftVerdict,
+} from '@domain/health/source-yield-drift';
+import {
   applyDescriptionQuality,
   rawContentHash,
   resolveSourceRecordIdentity,
@@ -20,7 +26,11 @@ import {
 import type { JobRepository, UpsertJobResult } from '@ports/job-repository';
 import type { ObserveRawJobResult, RawJobRepository } from '@ports/raw-job-repository';
 import type { CollectionResult, JobSourceAdapter } from '@ports/source-adapter';
-import type { SourceRunOutcome, SourceRunRepository } from '@ports/source-run-repository';
+import type {
+  SourceRunOutcome,
+  SourceRunRepository,
+  SourceRunYieldSample,
+} from '@ports/source-run-repository';
 import type { WorkTaskRepository } from '@ports/work-task-repository';
 import type { WorkerLogger } from '@ports/worker-logger';
 /**
@@ -76,6 +86,13 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * status, and the last success or error time. This lives here rather than in the caller so
  * no future caller of this use case can collect a source without recording its health, and
  * it is handed to `finalize` so the run and the source move in one transaction.
+ *
+ * Reduced-yield detection (SRS 7.8) is part of that verdict: a run that completed cleanly is
+ * compared against the source's recent clean runs, and a collapse to below half their yield
+ * makes the source `DEGRADED` even though the run is `SUCCEEDED`. The baseline is read, never
+ * stored separately - it is the counters of recent runs, so it cannot drift from them - and a
+ * failed baseline read is logged and treated as "no comparison", never as a failure of a run
+ * that already did its work.
  *
  * Two outcomes record nothing, because neither is evidence about the source: a run whose
  * outcome was discarded (reaped as stale - evidence about the worker lease), and a run the
@@ -547,6 +564,13 @@ export class RunSourceCollection {
     // stale) leaves a harmless extra scoring pass rather than a missing one.
     const enrichmentScheduled = await this.enqueueMatching(run);
 
+    const yieldDrift = await this.assessYield(
+      run,
+      funnel,
+      outcome.status,
+      outcome.catalogueExhausted,
+    );
+
     const recorded: SourceRunOutcome = {
       status: outcome.status,
       jobsDiscovered: funnel.collected,
@@ -572,6 +596,7 @@ export class RunSourceCollection {
       runStatus: outcome.status,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
       attributableToSource: outcome.attributableToSource,
+      yieldDrift,
     });
 
     const finalized = await this.deps.sourceRuns.finalize(run.id, recorded, health);
@@ -595,6 +620,19 @@ export class RunSourceCollection {
         status: health.status,
         reason: health.reason,
       });
+      // SRS 7.8: the operator-visible warning for a yield collapse is this line plus the
+      // source's DEGRADED status, which the dashboard renders. Logged only after the run was
+      // really finalized, so a discarded (reaped) outcome cannot raise a phantom alarm.
+      if (yieldDrift.drifted) {
+        this.deps.logger.warn('source yield collapsed against its recent baseline', {
+          sourceId: run.sourceId,
+          runId: run.id,
+          listed: funnel.collected,
+          parsed: funnel.parsed,
+          baselineParsed: yieldDrift.baselineParsed,
+          reason: yieldDrift.reason,
+        });
+      }
     }
 
     return {
@@ -603,6 +641,49 @@ export class RunSourceCollection {
       status: outcome.status,
       unexpectedZeroResults: outcome.unexpectedZeroResults,
     };
+  }
+
+  /**
+   * Compare this run's extraction yield with the source's recent clean runs (SRS 7.8).
+   *
+   * Only a `SUCCEEDED` run that read its listing to the end is compared. A capped, partial or
+   * failed run legitimately yields less; judging it would turn an incomplete look into
+   * evidence about the source, which is the transformation AGENTS.md forbids.
+   *
+   * A baseline that cannot be read is not a reason to fail a run that has already done all
+   * its work - it leaves the run `RUNNING` forever, which is exactly the H6 failure. The
+   * comparison is skipped and logged; the run still finalizes on its own outcome.
+   */
+  private async assessYield(
+    run: SourceRunRecord,
+    funnel: CollectionFunnel,
+    status: TerminalRunStatus,
+    catalogueExhausted: boolean,
+  ): Promise<YieldDriftVerdict> {
+    if (status !== SourceRunStatus.SUCCEEDED || !catalogueExhausted) return noYieldDrift();
+
+    let baseline: SourceRunYieldSample[];
+    try {
+      baseline = await this.deps.sourceRuns.recentCleanYields(
+        run.sourceId,
+        YIELD_BASELINE_RUN_LIMIT,
+      );
+    } catch (error) {
+      this.deps.logger.warn('could not read the yield baseline; drift not assessed', {
+        sourceId: run.sourceId,
+        runId: run.id,
+        error: describeError(error),
+      });
+      return noYieldDrift();
+    }
+
+    return classifyYieldDrift({
+      current: { listed: funnel.collected, parsed: funnel.parsed },
+      baseline: baseline.map((sample) => ({
+        listed: sample.jobsDiscovered,
+        parsed: sample.parsed,
+      })),
+    });
   }
 
   /**
