@@ -5,12 +5,13 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Seven items were fixed afterwards: P0
+**Status of this document:** findings and recommendations. Eight items were fixed afterwards: P0
 item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its heartbeat
-half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27, and
-H7 (reduced-yield detection, except the unscheduled-source half) on 2026-10-28. Each is recorded on
-the finding itself. Every other finding stands as written, and the evidence below describes the tree
-as the audit found it.
+half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27,
+H7 (reduced-yield detection, except the unscheduled-source half) on 2026-10-28, and M7 (the
+schema-aware drill, verified copy, retention and schedule commands) on 2026-10-30 — M7 stays PARTIAL
+until an encrypted off-machine copy is recorded. Each is recorded on the finding itself. Every other
+finding stands as written, and the evidence below describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
 data/ingestion/lifecycle, requirements/operations/tests). Every finding below marked
@@ -420,21 +421,43 @@ return typed status and count non-2xx as HTTP failures.
   cannot be re-verified after the page changes; `collectedAt` is publication time, not observation
   time (`:298`).
 
-#### M7 — Backup and disaster recovery are scripts, not an operating capability — **known (D19), verified**
+#### M7 — Backup and disaster recovery are scripts, not an operating capability — **known (D19), partially resolved 2026-10-30**
 
 The scripts work and the drill passed, but no schedule, off-machine copy, encryption or retention
 policy is installed (`docs/engineering/backup-and-restore.md:8-11,146-155,200-207`). The drill
-verifies table sets and row counts only (`scripts/restore-drill.mjs:133-203`); it does not verify
+verified table sets and row counts only (`scripts/restore-drill.mjs:133-203`); it did not verify
 `_prisma_migrations`, constraints/indexes, or that the restored schema supports the current code.
-A backup taken from the currently drifted `jobhunter` database would restore with matching counts
-and still be unusable — exactly the H1 failure. This is not hypothetical: the recorded 17-table /
-484-row drills were taken from the 13-migration database, so they certify a schema that lacks the
-column the current code requires. Existing-archive mode warns rather than fails on differences.
-The drift report's AC-019 **PASS** therefore overstates the assurance: it proves the archive
-restores, not that backups are scheduled, encrypted, off-machine, or schema-current.
-**Fix:** install a schedule and encrypted off-machine destination; make the drill compare
-`_prisma_migrations` (or required columns) and run one application query against the restored
-database; treat AC-019 as PARTIAL until then.
+A backup taken from a database that is behind the code restores with matching counts and is still
+unusable — exactly the H1 failure. This was not hypothetical: the recorded 17-table / 484-row drills
+were taken from the 13-migration database, so they certified a schema that lacked the column the
+current code required. Existing-archive mode also warned rather than failed on differences.
+
+**Resolved 2026-10-30 for everything the repository can do on its own.**
+
+The drill now checks schema currency, not just shape. It compares Prisma's migration ledger between
+source and restore **by name and checksum**, requires the restored ledger to cover the migrations in
+this checkout, and runs the scheduler's own query (`PrismaJobSourceRepository.listSchedulable`)
+against the restored database. Fresh mode fails on any of those; existing-archive mode reports them
+as notes, because recovering onto an older archive legitimately continues with
+`npx prisma migrate deploy`. The 2026-10-25 archive, which the old drill passed as a clean match,
+now reports the two migrations it predates — and forcing it through fresh mode exits 1 with those
+names. That is the finding's failure mode, caught by the check that replaced it.
+
+Backups can now have a second copy: `BACKUP_COPY_DIR` writes one and proves it before the run claims
+success — byte-identical SHA-256, non-empty, readable by `pg_restore --list`, destination outside
+the repository and not the archive's own directory, plus an explicit warning when the copy shares a
+volume with the archive. `npm run backup:prune` implements the documented 14-daily/8-weekly window,
+dry run unless `--apply`. `npm run backup:schedule` prints the daily task and registers it only with
+`--apply`. Retention and scheduling stay operator-run: deleting backups and installing OS tasks are
+not things a script should do unprompted.
+
+**Still open, and why AC-019 remains PARTIAL.** This host has one volume (`C:`, at capacity), so
+there is nowhere on it to put a copy that survives losing it; no encrypted off-machine archive
+exists, and no schedule is installed. The scripts do not encrypt — there is no key management here
+to verify a decryption against, and an untested cipher is not security. `backups/backup.log` has no
+watcher, so a run of failed backups would be quiet. The drill also compares ledger names and
+checksums rather than the DDL, so index or constraint drift no migration introduced would pass.
+Recording an encrypted off-machine copy and drilling it closes the finding.
 
 #### M8 — Release gate, supervision and dependency hygiene — **new, verified**
 
@@ -544,13 +567,13 @@ mixed-type comparison instead.
 | FR-017..018 notifications/feedback | Durable delivery; feedback API exists; AC-017 UI/buttons absent (D13) |
 | FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but ordering assumption and races remain (M1/M2/M6) |
 | FR-020 health | Yield-drift detection added 2026-10-28; unscheduled-source staleness still open (H7) |
-| FR-021 backup | Scripts + drill verified; no schedule/off-machine/encryption (M7) |
+| FR-021 backup | Scripts + schema-aware drill; copy/retention/schedule commands exist but no encrypted off-machine copy or installed task (M7) |
 | SRS 8.1/8.2 auth/ownership | Not met (H2) |
 | SRS 6.5 accessibility | Mostly met; unlabeled textareas/error association (M9) |
 | SRS 7.8 observability | Yield drift added 2026-10-28; funnel page and matched/notified metrics still missing (L8) |
 | AC-017 / AC-020 | Not met (D13/D21) |
 | AC-018 | Logic exists; operator view currently unreachable because of H1 |
-| AC-019 | Passes as "an archive restores with matching counts"; does not prove schedule, encryption, off-machine copy or schema currency (M7) |
+| AC-019 | Schema currency now proven by the drill (ledger + scheduler query, 2026-10-30); still does not prove schedule, encryption or an off-machine copy (M7) — **PARTIAL** |
 
 ---
 
@@ -603,7 +626,10 @@ marked theoretical or downgraded.
    staleness signal is still open, and D20 stays PARTIAL for it.
 7. **Lifecycle CAS + restore-on-observation (M1)** and **source-run heartbeat (M2)**.
 8. **Outbox recovery/revalidation and shutdown order (M3)**.
-9. **Backup schedule + migration-aware drill (M7)**.
+9. **Backup schedule + migration-aware drill (M7)**. **Done 2026-10-30 for the drill and the
+   commands** — the drill compares the migration ledger and answers the scheduler's query,
+   `BACKUP_COPY_DIR` writes a verified copy, `backup:prune` and `backup:schedule` exist. Installing
+   the task and recording an encrypted off-machine copy are the operator's remaining halves.
 
 ### P2 — hardening and hygiene
 

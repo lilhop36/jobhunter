@@ -61,6 +61,7 @@ Node's `--env-file`, so `.env` must exist. Tests load it themselves (`tests/supp
 | `LOG_LEVEL` | API | no | Fastify level, default `info` |
 | `AI_PROVIDER` | nothing yet | — | Reserved: documented but currently unread (drift report D17) |
 | `BACKUP_DIR` | `npm run backup` | no | Output directory; defaults to git-ignored `backups/`. Point it at another disk |
+| `BACKUP_COPY_DIR` | `npm run backup` | no | Second destination for the archive; must be outside the repository and differ from `BACKUP_DIR`. The copy is byte-verified and re-read with `pg_restore --list` before the run claims success. Warns when it shares a volume with the archive |
 | `PG_BIN` | backup scripts | no | PostgreSQL bin directory; auto-detected on Windows, otherwise from `PATH` |
 
 Secrets belong in `.env` only. It is git-ignored; `.env.example` holds placeholders.
@@ -94,9 +95,13 @@ The JSON API has **no authentication**; it binds to loopback by default and must
 - Some invariants are hand-written SQL (partial unique indexes, the `SKIP LOCKED` claim query).
   They live in `prisma/migrations/**/migration.sql` and are covered by
   `tests/integration/partial-indexes.spec.ts`.
-- Backups: `npm run backup` writes a compressed, validated `pg_dump` archive. The `backup:drill`
-  command restores a fresh backup into a disposable database and compares table sets and row
-  counts. Scheduling, retention, and off-machine storage are operator steps. See
+- Backups: `npm run backup` writes a compressed, validated `pg_dump` archive and, with
+  `BACKUP_COPY_DIR`, a byte-verified copy elsewhere. `npm run backup:drill` restores into a
+  disposable database and compares table sets, row counts **and** the Prisma migration ledger, then
+  runs the scheduler's own query against the restore — matching counts alone would certify an archive
+  the current code cannot use. `npm run backup:prune` applies the 14-daily/8-weekly window (dry run
+  unless `--apply`) and `npm run backup:schedule` prints the daily task (`--apply` registers it).
+  Installing the task and putting an encrypted copy on another machine remain operator steps. See
   [`docs/engineering/backup-and-restore.md`](docs/engineering/backup-and-restore.md).
 
 ## Tests

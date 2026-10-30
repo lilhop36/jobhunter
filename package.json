@@ -24,6 +24,8 @@
     "telegram:resolve": "node --env-file=.env --import tsx scripts/telegram-resolve.ts",
     "backup": "node --env-file=.env scripts/backup.mjs",
     "backup:drill": "node --env-file=.env scripts/restore-drill.mjs",
+    "backup:prune": "node --env-file=.env scripts/prune-backups.mjs",
+    "backup:schedule": "node scripts/install-backup-schedule.mjs",
     "test:ci": "vitest --run"
   },
   "devDependencies": {

@@ -187,6 +187,60 @@ export function listPublicTables(database, target = database.database) {
   return output ? output.split('\n').filter(Boolean) : [];
 }
 
+/**
+ * Prisma's applied-migration ledger, or `null` when the database is not Prisma-managed.
+ *
+ * Only finished, not-rolled-back rows count: a failed or rolled-back attempt did not leave its
+ * DDL in place. `null` and `[]` are different answers - "no ledger at all" is not "no migrations
+ * applied yet" - and the restore drill treats them differently.
+ */
+export function readAppliedMigrations(database, target = database.database) {
+  const hasLedger = psqlQuery(
+    database,
+    "SELECT to_regclass('public._prisma_migrations') IS NOT NULL;",
+    target,
+  );
+  if (hasLedger !== 't') return null;
+
+  const output = psqlQuery(
+    database,
+    `SELECT migration_name, coalesce(checksum, '') FROM _prisma_migrations
+      WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
+      ORDER BY started_at;`,
+    target,
+  );
+  return output
+    ? output
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const [name, checksum = ''] = line.split('\t');
+          return { name, checksum };
+        })
+    : [];
+}
+
+/**
+ * The scheduler's own read (PrismaJobSourceRepository.listSchedulable) against a restored
+ * database. It joins source_runs to job_sources and reads their current columns, so an archive
+ * whose schema cannot support the application fails here instead of failing in production.
+ */
+export const SCHEDULABLE_SOURCES_PROBE = `SELECT count(*) FROM (
+      SELECT s."id", s."name", s."schedule",
+             (SELECT max(r."startedAt") FROM "source_runs" r WHERE r."sourceId" = s."id") AS "lastAttemptAt"
+      FROM "job_sources" s
+      WHERE s."enabled" = true
+    ) AS schedulable;`;
+
+export function countSchedulableSources(database, target = database.database) {
+  const value = psqlQuery(database, SCHEDULABLE_SOURCES_PROBE, target);
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error(`The scheduler probe returned an unexpected value: ${JSON.stringify(value)}.`);
+  }
+  return count;
+}
+
 /** Exact per-table counts, in one round trip, for a snapshot comparison. */
 export function countRows(database, tables, target = database.database) {
   if (tables.length === 0) return new Map();

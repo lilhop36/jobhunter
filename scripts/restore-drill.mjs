@@ -7,23 +7,27 @@
  *
  * The archive is restored into a uniquely named disposable database on the same server,
  * compared with the source, and dropped again in a `finally` block. A fresh-backup run is
- * strict: the table set and every row count must match the source, which requires the API
- * and worker to be idle. An existing archive is a point-in-time snapshot, so differences
- * from the current database are reported rather than treated as corruption.
+ * strict: the table set, the Prisma migration ledger (names and checksums) and every row
+ * count must match the source, and the source must be migrated to this checkout. An existing
+ * archive is a point-in-time snapshot, so differences from the current database are reported
+ * rather than treated as corruption. Both modes run the scheduler's own query against the
+ * restored database, which proves the restored schema can serve the application.
  *
  * The configured role needs CREATEDB for the drill (it only reads the source database).
  * See docs/engineering/backup-and-restore.md.
  */
 import { randomBytes } from 'node:crypto';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createBackup } from './backup.mjs';
 import {
   connectionArgs,
   countRows,
+  countSchedulableSources,
   listPublicTables,
   parseDatabaseUrl,
+  readAppliedMigrations,
   resolvePgBinary,
   runPg,
 } from './lib/pg.mjs';
@@ -72,6 +76,53 @@ function restoreArchive(database, name, archive) {
   );
 }
 
+/**
+ * The migrations this checkout expects, in Prisma's own order. Migration directories are named
+ * `<UTC timestamp>_<description>`, so the directory name is the applied `migration_name`.
+ */
+export function readRepositoryMigrations(repoRoot = process.cwd()) {
+  const dir = resolve(repoRoot, 'prisma', 'migrations');
+  if (!existsSync(dir)) {
+    throw new Error(`Prisma migrations not found at ${dir}; run the drill from the repository root.`);
+  }
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^\d{14}_/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+/**
+ * Compare two ledger readings by name and checksum. A checksum difference means the migration
+ * was edited after it applied: the restored schema is not the schema this code was written for.
+ */
+export function compareMigrationLedgers(source, restored) {
+  const restoredByName = new Map(restored.map((migration) => [migration.name, migration]));
+  const sourceNames = new Set(source.map((migration) => migration.name));
+  return {
+    missing: source.filter((migration) => !restoredByName.has(migration.name)).map((m) => m.name),
+    altered: source
+      .filter(
+        (migration) =>
+          restoredByName.has(migration.name) &&
+          restoredByName.get(migration.name).checksum !== migration.checksum,
+      )
+      .map((m) => m.name),
+    unexpected: restored.filter((migration) => !sourceNames.has(migration.name)).map((m) => m.name),
+  };
+}
+
+function describeLedgerDifferences(differences) {
+  return [
+    differences.missing.length > 0 ? `  missing in the restored database: ${differences.missing.join(', ')}` : '',
+    differences.altered.length > 0 ? `  checksum differs: ${differences.altered.join(', ')}` : '',
+    differences.unexpected.length > 0
+      ? `  applied in the restored database but not the source: ${differences.unexpected.join(', ')}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function compareCounts(sourceCounts, restoredCounts, tables) {
   const differences = [];
   for (const table of tables) {
@@ -88,7 +139,13 @@ function describeDifferences(differences, limit = 10) {
   return shown.join('\n');
 }
 
-export function runRestoreDrill({ database = parseDatabaseUrl(), archivePath, fresh = false, logger = console } = {}) {
+export function runRestoreDrill({
+  database = parseDatabaseUrl(),
+  archivePath,
+  fresh = false,
+  logger = console,
+  repoRoot = process.cwd(),
+} = {}) {
   if (!archivePath) throw new Error('A backup archive path is required.');
   const archive = resolve(archivePath);
   if (!existsSync(archive)) throw new Error(`Backup archive not found: ${archive}`);
@@ -111,6 +168,8 @@ export function runRestoreDrill({ database = parseDatabaseUrl(), archivePath, fr
   let restoredTables = [];
   let sourceCounts = new Map();
   let restoredCounts = new Map();
+  let migrations = { applied: 0, pending: [], differsFromSource: false, differences: null };
+  let schedulableSources = null;
 
   try {
     logger.log(`[drill] creating ${name}`);
@@ -146,6 +205,86 @@ export function runRestoreDrill({ database = parseDatabaseUrl(), archivePath, fr
         `[drill] note: the archive's table set differs from the current database` +
           `${missing.length > 0 ? ` (missing: ${missing.join(', ')})` : ''}` +
           `${extra.length > 0 ? ` (unexpected: ${extra.join(', ')})` : ''}`,
+      );
+    }
+
+    // Row counts alone would certify an archive whose schema cannot serve the application.
+    // The ledger is the durable record of what was applied, so compare it by name and checksum,
+    // then require the restored schema to cover this checkout's migrations.
+    const repositoryMigrations = readRepositoryMigrations(repoRoot);
+    const sourceLedger = readAppliedMigrations(database);
+    if (sourceLedger === null) {
+      throw new Error(
+        `The source database "${database.database}" has no Prisma migration ledger; it is not a JobHunter database.`,
+      );
+    }
+    const restoredLedger = readAppliedMigrations(database, name);
+    if (restoredLedger === null) {
+      throw new Error('The restored database has no Prisma migration ledger; the application cannot run on it.');
+    }
+
+    const ledgerDifferences = compareMigrationLedgers(sourceLedger, restoredLedger);
+    const ledgerDiffers =
+      ledgerDifferences.missing.length +
+        ledgerDifferences.altered.length +
+        ledgerDifferences.unexpected.length >
+      0;
+    if (fresh && ledgerDiffers) {
+      throw new Error(
+        ['The restored migration ledger does not match the source database.', describeLedgerDifferences(ledgerDifferences)].join(
+          '\n',
+        ),
+      );
+    }
+    if (!fresh && ledgerDiffers) {
+      logger.warn(
+        `[drill] note: the archive's migration ledger differs from today's database\n${describeLedgerDifferences(ledgerDifferences)}`,
+      );
+    }
+
+    const restoredMigrationNames = new Set(restoredLedger.map((migration) => migration.name));
+    const pendingMigrations = repositoryMigrations.filter((migration) => !restoredMigrationNames.has(migration));
+    if (fresh && pendingMigrations.length > 0) {
+      throw new Error(
+        [
+          'The source database is behind this checkout, so its archive cannot support the current code.',
+          `  pending: ${pendingMigrations.join(', ')}`,
+          'Run `npx prisma migrate deploy` (after taking a backup) and re-run the drill.',
+        ].join('\n'),
+      );
+    }
+    if (!fresh && pendingMigrations.length > 0) {
+      logger.warn(
+        `[drill] note: the restored schema is ${pendingMigrations.length} migration(s) behind this checkout; ` +
+          `apply \`npx prisma migrate deploy\` after recovery: ${pendingMigrations.join(', ')}`,
+      );
+    }
+    const outsideCheckout = [...restoredMigrationNames].filter((migration) => !repositoryMigrations.includes(migration));
+    if (outsideCheckout.length > 0) {
+      logger.warn(
+        `[drill] note: the archive has migrations this checkout does not know (the code is behind the ` +
+          `database): ${outsideCheckout.join(', ')}`,
+      );
+    }
+
+    migrations = {
+      applied: restoredLedger.length,
+      pending: pendingMigrations,
+      differsFromSource: ledgerDiffers,
+      differences: ledgerDifferences,
+    };
+
+    // The scheduler's own read, not a generic `SELECT 1`: it joins source_runs to job_sources,
+    // so a restored schema that is missing either table fails here rather than in production.
+    try {
+      schedulableSources = countSchedulableSources(database, name);
+      logger.log(`[drill] application probe: ${schedulableSources} schedulable source(s) queried from the restore`);
+    } catch (error) {
+      if (fresh) {
+        throw new Error(`The restored database cannot answer the application's scheduler query:\n${error.message}`);
+      }
+      logger.warn(
+        `[drill] note: the restored database cannot answer the scheduler query; apply migrations after recovery:\n${error.message}`,
       );
     }
 
@@ -199,6 +338,8 @@ export function runRestoreDrill({ database = parseDatabaseUrl(), archivePath, fr
     sourceRows: [...sourceCounts.values()].reduce((total, count) => total + count, 0),
     restoredRows: [...restoredCounts.values()].reduce((total, count) => total + count, 0),
     countDifferences: compareCounts(sourceCounts, restoredCounts, sourceTables),
+    migrations,
+    schedulableSources,
   };
 }
 
@@ -218,7 +359,8 @@ if (isDirectRun) {
     if (requestedArchive) {
       archivePath = requestedArchive;
     } else {
-      const backup = createBackup({ database });
+      // A drill's fresh backup is discarded with the disposable database; do not also copy it.
+      const backup = await createBackup({ database, copyDir: null });
       console.log(`[drill] fresh backup: ${relative(process.cwd(), backup.file)}`);
       archivePath = backup.file;
       fresh = true;
@@ -231,8 +373,14 @@ if (isDirectRun) {
     );
     console.log(
       fresh
-        ? `[drill] table set and row counts matched the source (${result.sourceRows} rows)`
+        ? `[drill] table set, migration ledger and row counts matched the source (${result.sourceRows} rows)`
         : '[drill] archive is a point-in-time snapshot; row counts were not required to match today',
+    );
+    console.log(
+      `[drill] ${result.migrations.applied} migration(s) applied in the restore` +
+        (result.migrations.pending.length > 0
+          ? `; ${result.migrations.pending.length} pending against this checkout`
+          : '; the restored schema is current with this checkout'),
     );
     console.log('[drill] the disposable restore database was dropped');
   } catch (error) {

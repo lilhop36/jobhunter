@@ -1,7 +1,7 @@
 # SRS ↔ Implementation Drift Report
 
 **Date:** 2026-10-23
-**Last updated:** 2026-10-28 — D20 yield drift implemented for a source that runs (`classifyYieldDrift`: median of the last three clean runs, `DEGRADED` below half of it, plus a warning), with the unscheduled-source staleness half still open, so D20 stays PARTIAL. Earlier: 2026-10-27 — D20 corrected to PARTIAL (the §7.8 reduced-yield rule was not implemented), migration count refreshed to 15, ENG-022 resolution recorded (D32). 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill.
+**Last updated:** 2026-10-30 — D19/AC-019 corrected to PARTIAL: the restore drill now proves schema currency (migration ledger by name and checksum, plus the scheduler's own query against the restored database) and the repository gained a verified copy destination, retention pruning and a schedule installer, but no encrypted off-machine copy or installed task exists yet. Earlier: 2026-10-28 — D20 yield drift implemented for a source that runs (`classifyYieldDrift`: median of the last three clean runs, `DEGRADED` below half of it, plus a warning), with the unscheduled-source staleness half still open, so D20 stays PARTIAL. 2026-10-27 — D20 corrected to PARTIAL (the §7.8 reduced-yield rule was not implemented), migration count refreshed to 15, ENG-022 resolution recorded (D32). 2026-10-25 — D9 evidence from ADR-0010 (2026-10-24), D19/AC-019 backup scripts and recorded restore drill.
 **Baseline commit:** `31db910` (working tree clean except untracked `.freebuff/`)
 **Authoritative specification:** `docs/SRS/JobHunter-v1.1-SRS.md`
 **Method:** read-only inspection of the SRS, schema, migrations, routes, domain/application/infrastructure code, tests and docs. No SRS, schema or code was changed to produce this report. Nothing was executed against a real source or Telegram.
@@ -114,7 +114,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
-| D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **PARTIAL** | `scripts/backup.mjs` (validated custom-format dump) and `scripts/restore-drill.mjs` (restores into a disposable database, compares table sets and exact row counts, drops it in a `finally` block) exist and passed on 2026-10-25: 17/17 tables, 484/484 rows. Restore, scheduling and retention are documented in `docs/engineering/backup-and-restore.md`. No `BackupRun` model (intentional, §7); no schedule or off-machine copy is installed yet — those are deployment steps. | deployment step | medium |
+| D19 | FR-021 "run scheduled database backups"; AC-019 "backup can be restored"; §5.1 `BackupRun` | **PARTIAL** | `scripts/backup.mjs` (validated custom-format dump; with `BACKUP_COPY_DIR` also a byte-verified, `pg_restore`-readable second copy outside the repository), `scripts/restore-drill.mjs` (disposable database; since 2026-10-30 also compares Prisma's migration ledger by name and checksum, requires it to cover this checkout's migrations, and runs `listSchedulable` against the restore), `scripts/prune-backups.mjs` (14 daily / 8 weekly, dry run unless `--apply`) and `scripts/install-backup-schedule.mjs` (prints the daily task; `--apply` registers it). The schema-aware drill passed 2026-10-30: 17/17 tables, 565/565 rows, 15 migrations, scheduler query answered; forcing the 13-migration archive through strict mode correctly fails on the two migrations it predates. Documented in `docs/engineering/backup-and-restore.md`. No `BackupRun` model (intentional, §7). **Still deployment steps:** the task is not installed and no encrypted off-machine copy exists — this host has one volume, at capacity — so AC-019 cannot be met by scripts alone. | deployment step | medium |
 | D20 | FR-020 / §7.8 source metrics and drift detection | **PARTIAL** | Run counts, accepted/rejected, parse/HTTP failures, duration, `unexpectedZeroResults`, health status, dashboard source health — the metrics list is met. §7.8 "Drift detection" (`docs/SRS/JobHunter-v1.1-SRS.md:1264`) now has one of its two cases: `classifyYieldDrift` (`src/domain/health/source-yield-drift.ts`, 2026-10-28) compares a clean run's parsed yield with the median of the source's last three SUCCEEDED catalogue-exhausted runs and makes the source `DEGRADED` (plus a `warn` log) when it falls below half a baseline of at least five; zero is still handled by `isUnexpectedZeroResult`. Capped, partial and failed runs are not judged. Still absent: nothing warns when a source stops being collected at all — `lastSuccessfulRunAt` is stored and rendered (`apps/api/routes/web.ts:747`, `apps/api/routes/sources.ts:155`) but never compared with the source's schedule interval, so a source whose scheduler never fires keeps its last verdict. Funnel view (collected→…→notified) is not a page, and `jobsRejected` stays `0` by ADR-0001 §4 (no collection-time rejection rule exists). AI metrics N/A with D17. | accidental (yield rule never implemented until 2026-10-28; row previously claimed MATCH) | medium |
 | D21 | AC-020 14-day precision | **MISSING** | No measurement tooling or log; feedback storage exists, so this is process, not code. | not started | high |
 
@@ -163,7 +163,7 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 | AC-016 no duplicate events | **PASS** | unique event key |
 | AC-017 classify delivered alerts | **PARTIAL** | API + storage only; no button, no web form (D13) |
 | AC-018 zero-result visibility | **PASS** | `unexpectedZeroResults` + dashboard |
-| AC-019 backup restorable | **PASS (verified 2026-10-25)** | D19; fresh and existing-archive drills restored 17 tables / 484 rows and dropped the disposable database |
+| AC-019 backup restorable | **PARTIAL (was PASS)** | D19. The drill proves restore **and** schema currency: 2026-10-30 fresh run matched 17/17 tables, 565/565 rows, the migration ledger (names + checksums) and answered the scheduler's query. "Backup can be restored" is demonstrated; FR-021's *scheduled*, off-machine, encrypted copy is not, and this host has nowhere to put one — so the criterion cannot yet be met end to end |
 | AC-020 14-day precision | **FAIL (not started)** | D21 |
 
 ---
@@ -198,7 +198,7 @@ Ordered by cost, not importance; each is independently reviewable.
 | D13 feedback actions | Ship `reply_markup` buttons **only if** callback handling is added; otherwise state plainly that feedback is web/API-only and stop calling AC-017 met. |
 | D8 cross-source dedupe | Write the ADR that decides whether cross-source merging is in scope; do not change the key before that decision. |
 | D17/D18 AI | Leave deferred. The milestone is M4; nothing else depends on it. |
-| D19 backup | **Done 2026-10-25** — scripts plus a recorded restore drill (17 tables / 484 rows). Remaining deployment steps: install a schedule and an off-machine copy, then run the drill against it. No `BackupRun` model is needed for a single-operator MVP. |
+| D19 backup | **Scripts are as strong as they can be without a second machine** — 2026-10-25 added the dump and drill; 2026-10-30 made the drill schema-aware (migration ledger + the scheduler's query), added a byte-verified `BACKUP_COPY_DIR` copy, `backup:prune` retention and `backup:schedule`. What is left is not code: register the task (`npm run backup:schedule -- --apply`), point `BACKUP_COPY_DIR` at an encrypted destination on another host or volume, and drill that copy. No `BackupRun` model is needed for a single-operator MVP. |
 | D21 precision | Spreadsheet, not code. |
 | D20 yield drift (§7.8) | **Done 2026-10-28 for a source that runs** — `classifyYieldDrift` raises `DEGRADED` and logs a warning when a clean run parses less than half the median of the last three clean runs (baseline of at least five records). The thresholds are documented engineering defaults (`0.5`, `5`, `3`), not SRS values, and are the owner's to tune. Still open: `lastSuccessfulRunAt` ageing past the source's interval, which needs the same kind of threshold and a place to evaluate it even when the scheduler is not firing. The row claimed MATCH until 2026-10-27, which overstated §7.8. |
 | D1 API auth | Decide the trust boundary first (see §8); the code change follows the decision. |
@@ -216,7 +216,11 @@ Ordered by cost, not importance; each is independently reviewable.
 
 ## 9. Limits of this report
 
-- Not executed in this pass: live source collection, live Telegram delivery. A restore drill **was** executed on 2026-10-25 (D19). Statuses for AC-001/AC-002/AC-015 rely on earlier recorded runs plus the current code and tests; AC-019 is backed by the 2026-10-25 drill record in `docs/engineering/backup-and-restore.md`.
+- Not executed in this pass: live source collection, live Telegram delivery. Restore drills **were**
+  executed — on 2026-10-25 (D19) and again on 2026-10-30 against the schema-aware drill. Statuses for
+  AC-001/AC-002/AC-015 rely on earlier recorded runs plus the current code and tests; AC-019 is
+  backed by the drill records in `docs/engineering/backup-and-restore.md`, and is PARTIAL because no
+  off-machine encrypted copy has been drilled.
 - The SRS is internally inconsistent in two places: Document Control status (`Draft`) vs header (`Implementation Baseline`), and §8.1 "seeded user shall be authenticated" vs §3.4 defining endpoints with no authentication. Both are recorded here rather than resolved.
 - No claim is made that the drift register is exhaustive; it covers every requirement with a concrete implementation counterpart.
 - The 2026-10-27 refresh: D32 and the migration count were checked against `prisma migrate status`
