@@ -22,6 +22,19 @@ export interface SchedulableSource {
    * interval instead of on every scheduler tick.
    */
   lastAttemptAt: Date | null;
+  /**
+   * The source's last *successful* collection, carried so the scheduler can tell whether the
+   * source has gone quiet (SRS 7.8; `classifySourceSilence`). Due-ness is not the same question:
+   * a source can be perfectly on schedule and still have delivered nothing for two intervals,
+   * because the runs in between failed, were reaped, or were never claimed.
+   */
+  lastSuccessfulRunAt: Date | null;
+  /**
+   * Current health, so a source already reporting something worse is not re-labelled for being
+   * quiet. Silence is the weakest signal the pipeline has — it says nothing about *why* nothing
+   * arrived — and `FAILING` from a real run is the truer statement when both are true.
+   */
+  healthStatus: HealthStatus;
 }
 
 /**
@@ -127,4 +140,19 @@ export interface JobSourceRepository {
    * `(startedAt DESC, id DESC)`.
    */
   listRuns(sourceId: string, options: ListRunsOptions): Promise<PaginatedRuns>;
+
+  /**
+   * Record that a source has gone quiet: `HEALTHY` becomes `DEGRADED` (SRS 7.8, FR-020).
+   *
+   * Silence is the absence of an observation, so this deliberately writes nothing else — neither
+   * `lastErrorAt` (no error happened; dating one would be inventing evidence) nor
+   * `lastSuccessfulRunAt` (the age is the finding, not the thing to reset).
+   *
+   * `silentBefore` is the instant the caller's verdict was measured against: the update re-reads
+   * the row and applies it, because the scheduler's read and this write are not one transaction.
+   * A collection that succeeded in between has already made the source not silent, and that run's
+   * `HEALTHY` must survive. Returns true only when a row actually changed, which is also what
+   * keeps the warning from repeating on every 30-second pass.
+   */
+  markSourceSilent(sourceId: string, silentBefore: Date): Promise<boolean>;
 }

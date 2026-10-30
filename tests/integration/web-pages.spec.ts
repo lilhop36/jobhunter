@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import {
   EmploymentType,
+  HealthStatus,
   LocationCategory,
   RelocationPreference,
   RemotePreference,
@@ -252,6 +253,44 @@ describe('GET /dashboard', () => {
     expect(response.body).toContain('Skills');
     // The unknown factor is named, not silently dropped: it is why the confidence is not higher.
     expect(response.body).toContain('Factors without evidence');
+  });
+
+  it('shows which source has stopped delivering, not only which one last failed', async () => {
+    // SRS 7.8: a source that quietly stops producing never finalizes a run, so `Health` alone keeps
+    // saying HEALTHY for a source that has been dead for days. `Delivery` is read against the
+    // source's own schedule, in the page, and so it speaks even when the collector is not running.
+    const silentAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const freshAt = new Date(Date.now() - 5 * 60 * 1000);
+    for (const [name, lastSuccess] of [
+      ['gone-quiet', silentAt],
+      ['just-ran', freshAt],
+    ] as const) {
+      await prisma.jobSource.create({
+        data: {
+          name,
+          adapterType: 'FAKE',
+          adapterVersion: '1.0.0',
+          schedule: '30m',
+          healthStatus: HealthStatus.HEALTHY,
+          lastSuccessfulRunAt: lastSuccess,
+        },
+      });
+    }
+
+    const response = await get('/dashboard');
+    expect(response.statusCode).toBe(200);
+
+    const rowOf = (name: string): string => {
+      const rows = response.body.split('<tr>').filter((row) => row.includes(`<td>${name}</td>`));
+      expect(rows).toHaveLength(1);
+      return rows[0];
+    };
+    expect(rowOf('gone-quiet')).toContain('>silent<');
+    expect(rowOf('gone-quiet')).toContain('no successful collection for 3.0 h');
+    expect(rowOf('just-ran')).toContain('>delivering<');
+    // Both rows still claim HEALTHY: the page shows the ageing next to the observation, it does
+    // not rewrite it.
+    expect(rowOf('gone-quiet')).toContain('>HEALTHY<');
   });
 });
 

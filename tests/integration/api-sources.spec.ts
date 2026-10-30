@@ -262,6 +262,102 @@ describe('API /api/sources endpoints', () => {
 
       expect(response.statusCode).toBe(400);
     });
+
+    describe('silence (SRS 7.8: abnormal source behaviour without a run)', () => {
+      /** A `HEALTHY` source on a declared schedule whose last success is `ageMs` old. */
+      async function createQuietSource(
+        name: string,
+        options: { schedule: string | null; ageMs: number | null },
+      ): Promise<string> {
+        const source = await prisma.jobSource.create({
+          data: {
+            name,
+            adapterType: 'FAKE',
+            adapterVersion: '1.0.0',
+            schedule: options.schedule,
+            healthStatus: HealthStatus.HEALTHY,
+            lastSuccessfulRunAt: options.ageMs === null ? null : new Date(Date.now() - options.ageMs),
+          },
+          select: { id: true },
+        });
+        return source.id;
+      }
+
+      interface SourceRow {
+        name: string;
+        silence: Record<string, unknown>;
+      }
+
+      async function sourcesByName(): Promise<Record<string, SourceRow>> {
+        const response = await authorized(app, principal, { method: 'GET', url: '/api/sources' });
+        expect(response.statusCode).toBe(200);
+        const body = JSON.parse(response.body) as { sources: SourceRow[] };
+        return Object.fromEntries(body.sources.map((source) => [source.name, source]));
+      }
+
+      const HOUR = 60 * 60 * 1000;
+      const MINUTE = 60 * 1000;
+
+      it('calls a source silent once two of its own intervals have passed', async () => {
+        // Health still says HEALTHY here: the stored verdict is only ever as current as the last
+        // run, and this is the read surface saying so without waiting for a worker to write.
+        await createQuietSource('gone-quiet', { schedule: '30m', ageMs: 3 * HOUR });
+        await createQuietSource('just-ran', { schedule: '30m', ageMs: 5 * MINUTE });
+
+        const sources = await sourcesByName();
+        expect(sources['gone-quiet']?.silence).toMatchObject({ silent: true, measured: true });
+        expect(sources['gone-quiet']?.silence.intervalMs).toBe(30 * MINUTE);
+        expect(sources['gone-quiet']?.silence.reason).toContain('no successful collection for 3.0 h');
+        expect(sources['just-ran']?.silence).toMatchObject({
+          silent: false,
+          measured: true,
+          reason: null,
+        });
+      });
+
+      it('measures the age against the clock of the response, not a stored timestamp', async () => {
+        await createQuietSource('two-hours-ago', { schedule: '1h', ageMs: 2 * HOUR });
+
+        const ageMs = (await sourcesByName())['two-hours-ago']?.silence.ageMs as number;
+        // The row was written seconds before the request, so the reported age is the real age.
+        expect(ageMs).toBeGreaterThanOrEqual(2 * HOUR);
+        expect(ageMs).toBeLessThan(2 * HOUR + MINUTE);
+      });
+
+      it('makes no silence claim about a source it cannot measure', async () => {
+        const notMeasured = { silent: false, measured: false, reason: null, ageMs: null, intervalMs: null };
+        await createQuietSource('never-succeeded', { schedule: '30m', ageMs: null });
+        await createQuietSource('manually-collected', { schedule: null, ageMs: 10 * HOUR });
+        await createQuietSource('broken-schedule', { schedule: '0 */6 * * *', ageMs: 10 * HOUR });
+
+        const sources = await sourcesByName();
+        expect(sources['never-succeeded']?.silence).toEqual(notMeasured);
+        expect(sources['manually-collected']?.silence).toEqual(notMeasured);
+        // An unparseable schedule is the scheduler's own reported error; inventing an interval
+        // here would be inventing a fact the source never declared.
+        expect(sources['broken-schedule']?.silence).toEqual(notMeasured);
+      });
+
+      it('does not publish the scheduler write fence', async () => {
+        await createQuietSource('gone-quiet', { schedule: '30m', ageMs: 3 * HOUR });
+
+        const silence = (await sourcesByName())['gone-quiet']?.silence;
+        expect(silence).not.toHaveProperty('silentBefore');
+      });
+
+      it('carries the same verdict on the detail route', async () => {
+        const sourceId = await createQuietSource('detail-quiet', { schedule: '1h', ageMs: 5 * HOUR });
+
+        const response = await authorized(app, principal, {
+          method: 'GET',
+          url: `/api/sources/${sourceId}`,
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = JSON.parse(response.body) as { silence: Record<string, unknown> };
+        expect(body.silence).toMatchObject({ silent: true, measured: true, intervalMs: HOUR });
+      });
+    });
   });
 
   describe('GET /api/sources/:id', () => {

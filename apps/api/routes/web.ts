@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { MATCHER_VERSION } from '@domain/matching';
+import { classifySourceSilence } from '@domain/health/source-silence';
 import { NOTIFICATION_ELIGIBILITY_VERSION, NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
 import type { MatchFactorScores } from '@domain/types';
 import { LOGIN_CODE_TTL_MS, type NonceRegistry } from '@application/auth/credentials';
@@ -129,7 +130,7 @@ ${notifications.notifications.length === 0
 <h2>Source health</h2>
 ${sources.sources.length === 0
   ? html`<p class="muted">No source is enabled.</p>`
-  : sourceTable(sources.sources)}`;
+  : sourceTable(sources.sources, new Date())}`;
 
     return sendPage(
       reply,
@@ -684,7 +685,17 @@ ${notifications.map(
 </table>`;
 }
 
-function sourceTable(sources: readonly SourceDetail[]): Html {
+/**
+ * The source health table (SRS 3.1, FR-020).
+ *
+ * The Health column is the *stored* observation — what the last finalized run concluded — and a
+ * source that has been collected lately says nothing about one that has not been collected at all.
+ * So each row is measured against its own schedule here too (`classifySourceSilence`): a source
+ * whose last success is older than two of its intervals is called silent in words, whatever the
+ * stored status claims. This is the read surface's own derivation, not a rewrite: the worker's
+ * scheduler pass is what turns the same finding into a `DEGRADED` status.
+ */
+function sourceTable(sources: readonly SourceDetail[], now: Date): Html {
   return html`<table>
 <thead>
 <tr>
@@ -693,18 +704,30 @@ function sourceTable(sources: readonly SourceDetail[]): Html {
 <th scope="col">Last success</th>
 <th scope="col">Latest run</th>
 <th scope="col">Zero results</th>
+<th scope="col">Delivery</th>
 </tr>
 </thead>
 <tbody>
-${sources.map(
-  (source) => html`<tr>
+${sources.map((source) => {
+    const silence = classifySourceSilence({
+      lastSuccessfulRunAt: source.lastSuccessfulRunAt,
+      schedule: source.schedule,
+      now,
+    });
+    const delivery = !silence.measured
+      ? 'not measurable'
+      : silence.silent
+        ? 'silent'
+        : 'delivering';
+    return html`<tr>
 <td>${source.name}</td>
 <td>${source.healthStatus}</td>
 <td>${source.lastSuccessfulRunAt === null ? unknownMark() : isoDate(source.lastSuccessfulRunAt)}</td>
 <td>${source.latestRun === null ? unknownMark() : source.latestRun.status}</td>
 <td>${source.latestRun !== null && source.latestRun.unexpectedZeroResults ? 'yes' : 'no'}</td>
-</tr>`,
-)}
+<td title="${silence.reason ?? 'within its declared schedule'}">${delivery}</td>
+</tr>`;
+  })}
 </tbody>
 </table>`;
 }

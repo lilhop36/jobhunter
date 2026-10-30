@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { classifySourceSilence, type SourceSilenceVerdict } from '@domain/health/source-silence';
 import { SOURCE_COLLECTION_TASK_TYPE, sourceCollectionDedupeKey } from '@application/ingestion';
 import type {
   JobSourceRepository,
@@ -53,8 +54,11 @@ export async function registerSourceRoutes(
       limit: query.limit ?? DEFAULT_LIMIT,
     });
 
+    // One clock per response: two sources on the same page must not be measured against two
+    // different `now`s, and silence is a comparison, not a timestamp read.
+    const now = new Date();
     return {
-      sources: page.sources.map(serializeSource),
+      sources: page.sources.map((source) => serializeSource(source, now)),
       pagination: { nextCursor: page.nextCursor && encodeCursor(page.nextCursor) },
     };
   });
@@ -63,7 +67,7 @@ export async function registerSourceRoutes(
     const { id } = request.params as { id: string };
     const source = await deps.sources.findById(id);
     if (source === null) throw ApiError.notFound(`Source ${id} was not found`);
-    return serializeSource(source);
+    return serializeSource(source, new Date());
   });
 
   app.get(
@@ -147,7 +151,7 @@ export async function registerSourceRoutes(
   );
 }
 
-function serializeSource(source: SourceDetail) {
+function serializeSource(source: SourceDetail, now: Date) {
   return {
     id: source.id,
     name: source.name,
@@ -159,6 +163,36 @@ function serializeSource(source: SourceDetail) {
     lastSuccessfulRunAt: asIso(source.lastSuccessfulRunAt),
     lastErrorAt: asIso(source.lastErrorAt),
     latestRun: source.latestRun === null ? null : serializeRun(source.latestRun),
+    // Health is an observation taken when a run finalized, so it is only ever as current as the
+    // last run. If the worker stopped, the observation stopped with it, and a `HEALTHY` whose last
+    // success is two intervals old would be read as "it is fine now". This is the same
+    // `classifySourceSilence` rule the scheduler applies before it writes anything: published here
+    // as a derived advisory, because the API process has to be able to say it even when the
+    // process that collects is not running. It never rewrites `healthStatus`.
+    silence: projectSilence(
+      classifySourceSilence({
+        lastSuccessfulRunAt: source.lastSuccessfulRunAt,
+        schedule: source.schedule,
+        now,
+      }),
+    ),
+  };
+}
+
+/**
+ * The reader-facing half of a silence verdict.
+ *
+ * `silentBefore` is left out on purpose: it is the bound the scheduler re-checks inside its own
+ * fenced UPDATE, not something a reader can act on, and publishing it would invite a client to
+ * compare timestamps with its own clock — the one thing this rule exists to prevent.
+ */
+function projectSilence(verdict: SourceSilenceVerdict) {
+  return {
+    silent: verdict.silent,
+    measured: verdict.measured,
+    reason: verdict.reason,
+    ageMs: verdict.ageMs,
+    intervalMs: verdict.intervalMs,
   };
 }
 

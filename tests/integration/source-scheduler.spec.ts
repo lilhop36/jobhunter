@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { SourceResultExpectation } from '@domain/types';
-import { SourceRunStatus, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
+import { HealthStatus, SourceRunStatus, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
 import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
 import { SourceScheduler } from '@application/scheduling';
 import {
@@ -444,5 +444,139 @@ describe('scheduled collection end to end', () => {
     });
     const source = await prisma.jobSource.findUnique({ where: { id: sourceId } });
     expect(source?.healthStatus).toBe('DEGRADED');
+  });
+});
+
+/**
+ * Silence detection (SRS 7.8; audit H7's open half).
+ *
+ * Health is written when a run finalizes, so before this rule a source that simply stopped being
+ * collected kept its last `HEALTHY` forever and the dashboard showed a green row for a dead
+ * source. These tests are the reason the scheduler pass exists as well as the run path: the pass
+ * runs every 30 seconds whether or not anything is due, so "nothing arrived for two of your own
+ * intervals" is noticed by something.
+ */
+describe('SourceScheduler silence detection', () => {
+  /** A source that was healthy and last delivered `ageMs` before NOW. */
+  async function seedHealthySourceAgo(
+    name: string,
+    ageMs: number,
+    healthStatus: HealthStatus = HealthStatus.HEALTHY,
+  ): Promise<string> {
+    const sourceId = await createSource(name, { schedule: '1h' });
+    await prisma.jobSource.update({
+      where: { id: sourceId },
+      data: {
+        healthStatus,
+        lastSuccessfulRunAt: new Date(NOW.getTime() - ageMs),
+      },
+    });
+    return sourceId;
+  }
+
+  async function healthOf(sourceId: string) {
+    return prisma.jobSource.findUnique({
+      where: { id: sourceId },
+      select: { healthStatus: true, lastSuccessfulRunAt: true, lastErrorAt: true },
+    });
+  }
+
+  it('degrades a healthy source that has delivered nothing for two of its own intervals', async () => {
+    const sourceId = await seedHealthySourceAgo('gone-quiet', 3 * HOUR);
+    const { logger, entries } = recordingLogger();
+
+    const result = await makeScheduler(logger).runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.silentSourceIds).toEqual([sourceId]);
+    const health = await healthOf(sourceId);
+    expect(health).toMatchObject({ healthStatus: 'DEGRADED' });
+    // The age is the finding. Resetting it would erase the evidence, and dating an error would
+    // record one that never happened — a run did not fail here; no run happened.
+    expect(health?.lastErrorAt).toBeNull();
+    expect(health?.lastSuccessfulRunAt?.getTime()).toBe(NOW.getTime() - 3 * HOUR);
+
+    const warning = entries.find((entry) => entry.message === 'source has gone silent');
+    expect(warning).toBeDefined();
+    expect((warning?.meta as { name: string }).name).toBe('gone-quiet');
+    expect(String((warning?.meta as { reason: string }).reason)).toMatch(
+      /no successful collection for 3\.0 h/,
+    );
+  });
+
+  it('says it once: a source already reported silent is not re-stamped or re-logged', async () => {
+    const sourceId = await seedHealthySourceAgo('quiet', 3 * HOUR);
+    const { logger, entries } = recordingLogger();
+    const scheduler = makeScheduler(logger);
+
+    await scheduler.runOnce(NOW, SourceRunTrigger.SCHEDULE);
+    const second = await scheduler.runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(second.silentSourceIds).toEqual([]);
+    expect(entries.filter((entry) => entry.message === 'source has gone silent')).toHaveLength(1);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'DEGRADED' });
+  });
+
+  it('leaves a source that already reports something worse than silence', async () => {
+    // A `FAILING` source is silent too, but the failed run says *why*, and silence says nothing
+    // about why. Overwriting the truer reason with the vaguer one would lose information.
+    const sourceId = await seedHealthySourceAgo('actually-broken', 5 * HOUR, HealthStatus.FAILING);
+    const { logger, entries } = recordingLogger();
+
+    const result = await makeScheduler(logger).runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.silentSourceIds).toEqual([]);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'FAILING' });
+    expect(entries.filter((entry) => entry.message === 'source has gone silent')).toHaveLength(0);
+  });
+
+  it('leaves a source that is merely between its own runs', async () => {
+    const sourceId = await seedHealthySourceAgo('normal', 90 * MINUTE);
+    const { logger, entries } = recordingLogger();
+
+    const result = await makeScheduler(logger).runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.silentSourceIds).toEqual([]);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'HEALTHY' });
+    expect(entries).toHaveLength(0);
+  });
+
+  it('gives no verdict to a source that has never succeeded', async () => {
+    // Unknown, not silent: a source that has not yet done anything is not late for it.
+    const sourceId = await createSource('brand-new', { schedule: '1h' });
+    await prisma.jobSource.update({
+      where: { id: sourceId },
+      data: { healthStatus: HealthStatus.HEALTHY },
+    });
+
+    const result = await makeScheduler().runOnce(NOW, SourceRunTrigger.SCHEDULE);
+
+    expect(result.silentSourceIds).toEqual([]);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'HEALTHY' });
+  });
+
+  it('stamps a source whose last success really is older than the bound, and only once', async () => {
+    // The positive control for the fence below: a comparison that always refused would pass it.
+    const sourceId = await seedHealthySourceAgo('still-quiet', 3 * HOUR);
+    const silentBefore = new Date(NOW.getTime() - 2 * HOUR);
+
+    expect(await sourceRepo.markSourceSilent(sourceId, silentBefore)).toBe(true);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'DEGRADED' });
+    // Same bound again: the row no longer says HEALTHY, so there is nothing left to say.
+    expect(await sourceRepo.markSourceSilent(sourceId, silentBefore)).toBe(false);
+  });
+
+  it('refuses to stamp a source whose collection succeeded between the reading and the write', async () => {
+    // The race the fence exists for: the scheduler decided on a row it had already read, and a run
+    // finalized in the meantime. The newer, truer `HEALTHY` must survive.
+    const sourceId = await seedHealthySourceAgo('just-recovered', 3 * HOUR);
+    await prisma.jobSource.update({
+      where: { id: sourceId },
+      data: { lastSuccessfulRunAt: new Date(NOW.getTime() - MINUTE) },
+    });
+
+    const marked = await sourceRepo.markSourceSilent(sourceId, new Date(NOW.getTime() - 2 * HOUR));
+
+    expect(marked).toBe(false);
+    expect(await healthOf(sourceId)).toMatchObject({ healthStatus: 'HEALTHY' });
   });
 });

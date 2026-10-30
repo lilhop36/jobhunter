@@ -1,5 +1,6 @@
 import { JobSource, PrismaClient, SourceRun } from '@prisma/client';
 import { HealthStatus, SourceRunStatus, SourceRunTrigger } from '@domain/enums';
+import { asTimestamp, nowUtc } from './db-clock';
 import {
   JobSourceRepository,
   ListRunsOptions,
@@ -74,9 +75,11 @@ export class PrismaJobSourceRepository implements JobSourceRepository {
         name: string;
         schedule: string | null;
         lastAttemptAt: Date | string | null;
+        lastSuccessfulRunAt: Date | string | null;
+        healthStatus: string;
       }[]
     >`
-      SELECT s."id", s."name", s."schedule",
+      SELECT s."id", s."name", s."schedule", s."healthStatus", s."lastSuccessfulRunAt",
              (SELECT max(r."startedAt") FROM "source_runs" r WHERE r."sourceId" = s."id") AS "lastAttemptAt"
       FROM "job_sources" s
       WHERE s."enabled" = true
@@ -88,6 +91,9 @@ export class PrismaJobSourceRepository implements JobSourceRepository {
       name: row.name,
       schedule: row.schedule,
       lastAttemptAt: row.lastAttemptAt === null ? null : new Date(row.lastAttemptAt),
+      lastSuccessfulRunAt:
+        row.lastSuccessfulRunAt === null ? null : new Date(row.lastSuccessfulRunAt),
+      healthStatus: row.healthStatus as HealthStatus,
     }));
   }
 
@@ -151,5 +157,30 @@ export class PrismaJobSourceRepository implements JobSourceRepository {
       runs: page.map(toRunSummary),
       nextCursor: rows.length > limit ? { startedAt: last.startedAt, id: last.id } : null,
     };
+  }
+
+  /**
+   * Downgrade a silent source, fenced on the evidence the verdict was measured against.
+   *
+   * The scheduler's read and this write are separate statements, so between them a collection can
+   * have succeeded — and that run's `HEALTHY` is the newer, truer observation. Re-applying the age
+   * bound and the `HEALTHY` precondition inside the `WHERE` makes the write refuse itself in that
+   * case instead of overwriting it, which is the same shape as every other fenced update in this
+   * repository.
+   *
+   * Nothing else is touched: dating `lastErrorAt` would record an error that did not happen, and
+   * refreshing `lastSuccessfulRunAt` would erase the very age that made the source reportable.
+   */
+  async markSourceSilent(sourceId: string, silentBefore: Date): Promise<boolean> {
+    const updated = await this.prisma.$executeRaw`
+      UPDATE "job_sources"
+      SET "healthStatus" = 'DEGRADED'::"HealthStatus",
+          "updatedAt" = ${nowUtc()}
+      WHERE "id" = ${sourceId}::uuid
+        AND "healthStatus" = 'HEALTHY'::"HealthStatus"
+        AND "lastSuccessfulRunAt" IS NOT NULL
+        AND "lastSuccessfulRunAt" < ${asTimestamp(silentBefore)}::timestamp(3)
+    `;
+    return updated === 1;
   }
 }

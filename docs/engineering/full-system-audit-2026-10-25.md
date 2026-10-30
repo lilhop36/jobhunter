@@ -5,11 +5,12 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Eight items were fixed afterwards: P0
+**Status of this document:** findings and recommendations. Nine items were fixed afterwards: P0
 item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its heartbeat
 half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27,
-H7 (reduced-yield detection, except the unscheduled-source half) on 2026-10-28, and M7 (the
-schema-aware drill, verified copy, retention and schedule commands) on 2026-10-30 — M7 stays PARTIAL
+H7 (reduced-yield detection) on 2026-10-28, and H2 (the authorization boundary), M7 (the schema-aware
+drill, verified copy, retention and schedule commands) and H7's source-silence half on 2026-10-30 — H7's
+funnel-metric half stays open, H2's TLS half needs an operator certificate, and M7 stays PARTIAL
 until an encrypted off-machine copy is recorded. Each is recorded on the finding itself. Every other
 finding stands as written, and the evidence below describes the tree as the audit found it.
 
@@ -329,11 +330,46 @@ Tests: unit thresholds and the 80% drop (`yield-drift-policy.spec.ts`), health m
 the end-to-end verdict and log line through the real collection use case
 (`source-health.spec.ts`, "reduced-yield drift"), including the capped and partial exemptions.
 
-**Not fixed here:** a source that stops being collected at all still keeps its last verdict forever.
-Detecting that needs a staleness threshold against the source's schedule and a decision about where
-it is evaluated - the scheduler sees every enabled source but acts only on the due ones, so a check
-there would also make a *silently unscheduled* source visible. The drift register records that the
-threshold is an owner decision. This change makes a source that *does* run unable to decay silently.
+**The staleness half is resolved 2026-10-30.** The rule is `classifySourceSilence`
+(`src/domain/health/source-silence.ts`): a source is silent once **two whole declared intervals**
+have passed with no *successful* collection. It measures `lastSuccessfulRunAt`, not `lastAttemptAt` -
+an attempt that failed is already reported by the run that failed, and silence means nothing arrived -
+against the source's own `schedule` (`parseScheduleInterval`), never a global window, so a `15m`
+source and a `1d` source do not go quiet at the same age. The multiplier is an engineering default,
+not an SRS number, and is the owner's to tune; one missed interval is normal jitter, and alarming on
+it would train the operator to ignore the alarm.
+
+Three states produce **no verdict**, and none of them may be read as healthy: the source has never
+succeeded (no age to measure); it has no schedule (nothing is due, so nothing is overdue - it is
+manually collected); its schedule is present but unparseable (the scheduler already reports that as
+its own error, and inventing an interval would be inventing a fact). That last pair is the honest
+limit of this fix: a source whose `schedule` was *emptied* is reported as not measurable rather than
+silent, because an operator edit is not the source misbehaving, and the dashboard says "not
+measurable" instead of guessing.
+
+The decision is evaluated in two places on purpose. The scheduler pass
+(`src/application/scheduling/source-scheduler.ts`) writes `DEGRADED` and emits one `warn` line - the
+durable signal - and only ever stamps a source that still says `HEALTHY`, because a `FAILING` source's
+failed run states the truer reason. `lastErrorAt` is deliberately not dated: no run failed, no run
+happened. The write is fenced - `markSourceSilent` re-applies the age bound and the `HEALTHY`
+precondition inside its `WHERE`, since the pass's read and its write are not one transaction and a
+collection that succeeded in between owns the row again. The read surfaces (`/api/sources`,
+`/api/sources/:id`, and the dashboard's "Delivery" column) derive the same verdict per response, which
+is the half that keeps speaking when the collecting process is not running at all: the failure being
+detected is "the worker died and nobody noticed", so a rule that lives only inside the worker cannot
+be its only reporter. The published `silence` object omits `silentBefore` - the bound is the store's
+write fence, not a reader's fact.
+
+Tests: the rule, its boundary and the three unmeasured states (`tests/unit/source-silence.spec.ts`);
+the pass, say-once, `FAILING` left alone, the fenced refusal *and* its positive control
+(`tests/integration/source-scheduler.spec.ts`); the published payload including the absence of
+`silentBefore` (`tests/integration/api-sources.spec.ts`); the dashboard column
+(`tests/integration/web-pages.spec.ts`). Binding the bound as a `Date` instead of ISO text made that
+fence three hours too permissive on this session's zone - recorded in
+`src/infrastructure/ingestion/db-clock.ts`.
+
+Funnel metrics are still the open part of this finding: `jobsRejected` stays `0` by ADR-0001 §4 (above),
+and collected→matched→notified is not measured as a funnel view.
 
 #### H8 — Known high-impact requirement gaps still open
 
@@ -586,11 +622,11 @@ mixed-type comparison instead.
 | FR-012..016 matching | Implemented and explainable; skills weight permanently unknown |
 | FR-017..018 notifications/feedback | Durable delivery; feedback API exists; AC-017 UI/buttons absent (D13) |
 | FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but ordering assumption and races remain (M1/M2/M6) |
-| FR-020 health | Yield-drift detection added 2026-10-28; unscheduled-source staleness still open (H7) |
+| FR-020 health | Yield drift 2026-10-28 and source silence 2026-10-30 (H7): both §7.8 abnormal-behaviour cases now warn the operator; funnel metrics still open |
 | FR-021 backup | Scripts + schema-aware drill; copy/retention/schedule commands exist but no encrypted off-machine copy or installed task (M7) |
 | SRS 8.1/8.2 auth/ownership | Met 2026-10-30 (H2, ADR-0011); TLS for an externally bound API still absent |
 | SRS 6.5 accessibility | Mostly met; unlabeled textareas/error association (M9) |
-| SRS 7.8 observability | Yield drift added 2026-10-28; funnel page and matched/notified metrics still missing (L8) |
+| SRS 7.8 observability | Yield drift 2026-10-28 and source silence 2026-10-30; funnel page and matched/notified metrics still missing (L8) |
 | AC-017 / AC-020 | Not met (D13/D21) |
 | AC-018 | Logic exists; operator view currently unreachable because of H1 |
 | AC-019 | Schema currency now proven by the drill (ledger + scheduler query, 2026-10-30); still does not prove schedule, encryption or an off-machine copy (M7) — **PARTIAL** |
@@ -644,8 +680,11 @@ marked theoretical or downgraded.
    web sign-in is a one-time local code rather than a `?userId=` link. TLS for an opted-in external
    bind is the remaining half, and installing a certificate is the operator's step.
 6. **Yield-drift detection (H7)** and correct D20. **Done 2026-10-28** for a
-   source that runs (median baseline, `DEGRADED`, warning); the unscheduled-source
-   staleness signal is still open, and D20 stays PARTIAL for it.
+   source that runs (median baseline, `DEGRADED`, warning) and **done 2026-10-30** for one that
+   stopped running (`classifySourceSilence`: two declared intervals without a success, written by the
+   scheduler and derived on every read surface). Both §7.8 drift-detection cases now warn the
+   operator; D20 stays PARTIAL for the rest of §7.8 — the pipeline funnel view and the notification
+   metrics roll-up (L8).
 7. **Lifecycle CAS + restore-on-observation (M1)** and **source-run heartbeat (M2)**.
 8. **Outbox recovery/revalidation and shutdown order (M3)**.
 9. **Backup schedule + migration-aware drill (M7)**. **Done 2026-10-30 for the drill and the

@@ -1,5 +1,9 @@
-import { SourceRunTrigger } from '@domain/enums';
+import { HealthStatus, SourceRunTrigger } from '@domain/enums';
 import { parseScheduleInterval } from '@domain/scheduling/schedule-interval';
+import {
+  SOURCE_SILENCE_POLICY_VERSION,
+  classifySourceSilence,
+} from '@domain/health/source-silence';
 import type { JobSourceRepository } from '@ports/job-source-repository';
 import type { SourceRunRepository } from '@ports/source-run-repository';
 import type { WorkTaskRepository } from '@ports/work-task-repository';
@@ -34,6 +38,11 @@ export interface SchedulerPassResult {
   invalidSchedules: string[];
   /** Abandoned runs recovered before enqueuing (SRS 7.6). */
   reapedRuns: number;
+  /**
+   * Sources newly reported as silent this pass (SRS 7.8): healthy on paper, but nothing has
+   * arrived from them for longer than their own schedule allows.
+   */
+  silentSourceIds: string[];
 }
 
 export interface SourceSchedulerDeps {
@@ -164,7 +173,42 @@ export class SourceScheduler {
       await enqueueCollection(source.id);
     }
 
-    return { enqueued, invalidSchedules, reapedRuns: reaped.length };
+    // Silence, the failure this pass is the only place that can see (SRS 7.8). Health is written
+    // when a run finalizes, so a source that stops being collected — never enqueued, always
+    // dead-lettered, an adapter that will not resolve — keeps the `HEALTHY` of its last run
+    // indefinitely, and the dashboard shows a green row for a dead source. Comparing the age of
+    // the last *success* against the source's own interval, on a pass that runs whether or not
+    // anything is due, is what turns "nothing happened" into something the operator is told. A
+    // source enqueued by the loop above is still judged: being queued is not having delivered, and
+    // the run that succeeds will restore `HEALTHY` through the health policy.
+    const silentSourceIds: string[] = [];
+    for (const source of sources) {
+      if (source.healthStatus !== HealthStatus.HEALTHY) continue; // something worse is already known
+      const verdict = classifySourceSilence({
+        lastSuccessfulRunAt: source.lastSuccessfulRunAt,
+        schedule: source.schedule,
+        now,
+      });
+      if (!verdict.silent || verdict.silentBefore === null) continue;
+
+      // The store re-checks the bound it was given, so a collection that succeeded between the
+      // read above and this write owns the row again and is not stamped for a silence it ended.
+      const marked = await this.deps.sources.markSourceSilent(source.id, verdict.silentBefore);
+      // Nothing was written, which means one of two things — the source is already silent, or it
+      // stopped being silent. Neither is a new fact, and neither is worth a second warning line.
+      if (!marked) continue;
+
+      silentSourceIds.push(source.id);
+      this.logger.warn('source has gone silent', {
+        sourceId: source.id,
+        name: source.name,
+        reason: verdict.reason,
+        policy: SOURCE_SILENCE_POLICY_VERSION,
+        lastSuccessfulRunAt: source.lastSuccessfulRunAt?.toISOString() ?? null,
+      });
+    }
+
+    return { enqueued, invalidSchedules, reapedRuns: reaped.length, silentSourceIds };
   }
 
   /** Run the startup catch-up pass, then a periodic pass until `stop()`. */
