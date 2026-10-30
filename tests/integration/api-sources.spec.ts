@@ -8,15 +8,21 @@ import {
   applyTestMigrations,
   createTestPrismaClient,
   truncateAll,
-  requireTestDatabaseUrl,
 } from '../support/db';
+import { authorized, testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
-import { parseApiConfig } from '../../apps/api/config';
 
 const prisma = createTestPrismaClient();
 let app: FastifyInstance;
 let appPrisma: PrismaClient;
 let workTaskRepo: PrismaWorkTaskRepository;
+
+/**
+ * Source state belongs to the deployment rather than to a candidate, so these routes need a
+ * caller without one owning the data. This principal is nobody in the database on purpose: what
+ * makes a request legal here is a credential the deployment signed, not a row behind it.
+ */
+const principal = '00000000-0000-0000-0000-000000000001';
 
 beforeAll(() => {
   process.env.NODE_ENV = 'test';
@@ -28,11 +34,7 @@ beforeEach(async () => {
   workTaskRepo = new PrismaWorkTaskRepository(prisma);
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -110,7 +112,7 @@ describe('API /api/sources endpoints', () => {
 
   describe('GET /api/sources', () => {
     it('returns empty list when no sources exist', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources',
       });
@@ -137,7 +139,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources',
       });
@@ -157,7 +159,7 @@ describe('API /api/sources endpoints', () => {
       await createSourceWithRuns({ name: 'enabled-source', enabled: true });
       await createSourceWithRuns({ name: 'disabled-source', enabled: false });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources',
       });
@@ -171,7 +173,7 @@ describe('API /api/sources endpoints', () => {
       await createSourceWithRuns({ name: 'enabled-source', enabled: true });
       await createSourceWithRuns({ name: 'disabled-source', enabled: false });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?includeDisabled=true',
       });
@@ -185,7 +187,7 @@ describe('API /api/sources endpoints', () => {
       await createSourceWithRuns({ name: 'failing', healthStatus: HealthStatus.FAILING });
       await createSourceWithRuns({ name: 'degraded', healthStatus: HealthStatus.DEGRADED });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?healthStatus=HEALTHY',
       });
@@ -201,7 +203,7 @@ describe('API /api/sources endpoints', () => {
       }
 
       // First page
-      const page1 = await app.inject({
+      const page1 = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?limit=2',
       });
@@ -210,7 +212,7 @@ describe('API /api/sources endpoints', () => {
       expect(body1.pagination.nextCursor).not.toBeNull();
 
       // Second page
-      const page2 = await app.inject({
+      const page2 = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources?limit=2&cursor=${body1.pagination.nextCursor}`,
       });
@@ -219,7 +221,7 @@ describe('API /api/sources endpoints', () => {
       expect(body2.pagination.nextCursor).not.toBeNull();
 
       // Third page
-      const page3 = await app.inject({
+      const page3 = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources?limit=2&cursor=${body2.pagination.nextCursor}`,
       });
@@ -233,7 +235,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('rejects invalid cursor with 400', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?cursor=invalid-base64!!',
       });
@@ -244,7 +246,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('rejects invalid healthStatus with 400', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?healthStatus=INVALID',
       });
@@ -253,7 +255,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('rejects limit > 100 with 400', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources?limit=101',
       });
@@ -274,7 +276,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}`,
       });
@@ -291,7 +293,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('returns 404 for unknown source', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources/00000000-0000-0000-0000-000000000000',
       });
@@ -302,7 +304,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('returns 400 for invalid UUID', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources/not-a-uuid',
       });
@@ -324,7 +326,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs`,
       });
@@ -353,7 +355,7 @@ describe('API /api/sources endpoints', () => {
       });
 
       // First page
-      const page1 = await app.inject({
+      const page1 = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?limit=2`,
       });
@@ -362,7 +364,7 @@ describe('API /api/sources endpoints', () => {
       expect(body1.pagination.nextCursor).not.toBeNull();
 
       // Second page
-      const page2 = await app.inject({
+      const page2 = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?limit=2&cursor=${body1.pagination.nextCursor}`,
       });
@@ -371,7 +373,7 @@ describe('API /api/sources endpoints', () => {
       expect(body2.pagination.nextCursor).not.toBeNull();
 
       // Third page
-      const page3 = await app.inject({
+      const page3 = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?limit=2&cursor=${body2.pagination.nextCursor}`,
       });
@@ -390,7 +392,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?status=FAILED`,
       });
@@ -410,7 +412,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?trigger=MANUAL`,
       });
@@ -421,7 +423,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('returns 404 for unknown source', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: '/api/sources/00000000-0000-0000-0000-000000000000/runs',
       });
@@ -432,7 +434,7 @@ describe('API /api/sources endpoints', () => {
     it('returns 400 for invalid status filter', async () => {
       const source = await createSourceWithRuns({ name: 'test' });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'GET',
         url: `/api/sources/${source.id}/runs?status=INVALID`,
       });
@@ -445,7 +447,7 @@ describe('API /api/sources endpoints', () => {
     it('enqueues a manual collection task and returns 202', async () => {
       const source = await createSourceWithRuns({ name: 'manual-source' });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         payload: {},
@@ -466,7 +468,7 @@ describe('API /api/sources endpoints', () => {
     it('answers an unsupported media type with 415, not 500', async () => {
       const source = await createSourceWithRuns({ name: 'form-posted' });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -480,7 +482,7 @@ describe('API /api/sources endpoints', () => {
     it('answers an empty JSON body with 400, not 500', async () => {
       const source = await createSourceWithRuns({ name: 'empty-json' });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         headers: { 'content-type': 'application/json' },
@@ -494,7 +496,7 @@ describe('API /api/sources endpoints', () => {
     it('returns 409 SOURCE_DISABLED for a disabled source and enqueues nothing (ADR-0003)', async () => {
       const source = await createSourceWithRuns({ name: 'disabled-source', enabled: false });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         payload: {},
@@ -529,7 +531,7 @@ describe('API /api/sources endpoints', () => {
         ],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         payload: {},
@@ -541,7 +543,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('returns 404 for unknown source', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: '/api/sources/00000000-0000-0000-0000-000000000000/run',
         payload: {},
@@ -558,7 +560,7 @@ describe('API /api/sources endpoints', () => {
         runs: [{ status: SourceRunStatus.RUNNING, trigger: SourceRunTrigger.SCHEDULE, jobsDiscovered: 0, jobsAccepted: 0 }],
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         payload: {},
@@ -582,7 +584,7 @@ describe('API /api/sources endpoints', () => {
         maxAttempts: 1,
       });
 
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: `/api/sources/${source.id}/run`,
         payload: {},
@@ -598,8 +600,8 @@ describe('API /api/sources endpoints', () => {
 
       // Fire two concurrent requests
       const [r1, r2] = await Promise.all([
-        app.inject({ method: 'POST', url: `/api/sources/${source.id}/run`, payload: {} }),
-        app.inject({ method: 'POST', url: `/api/sources/${source.id}/run`, payload: {} }),
+        authorized(app, principal, { method: 'POST', url: `/api/sources/${source.id}/run`, payload: {} }),
+        authorized(app, principal, { method: 'POST', url: `/api/sources/${source.id}/run`, payload: {} }),
       ]);
 
       // One should succeed (202), one should conflict (409)
@@ -614,7 +616,7 @@ describe('API /api/sources endpoints', () => {
     });
 
     it('returns 400 for invalid source ID', async () => {
-      const response = await app.inject({
+      const response = await authorized(app, principal, {
         method: 'POST',
         url: '/api/sources/not-a-uuid/run',
         payload: {},
@@ -633,7 +635,7 @@ describe('API /api/sources endpoints', () => {
       ];
 
       for (const tc of testCases) {
-        const response = await app.inject({ method: 'GET', url: tc.url });
+        const response = await authorized(app, principal, { method: 'GET', url: tc.url });
         const body = JSON.parse(response.body);
         expect(body.error).toBeDefined();
         expect(body.error.code).toBe(tc.expectedCode);
@@ -644,22 +646,14 @@ describe('API /api/sources endpoints', () => {
 });
 
 describe('API startup and configuration', () => {
-  it('rejects missing DATABASE_URL', () => {
-    expect(() => parseApiConfig({})).toThrow('DATABASE_URL is required');
-  });
-
-  it('defaults host to 127.0.0.1 and port to 3001', () => {
-    const config = parseApiConfig({ DATABASE_URL: 'postgresql://test' });
-    expect(config.host).toBe('127.0.0.1');
-    expect(config.port).toBe(3001);
-  });
-
-  it('rejects an out-of-range port', () => {
-    expect(() => parseApiConfig({ DATABASE_URL: 'postgresql://test', API_PORT: '70000' })).toThrow(
-      'API_PORT',
-    );
-  });
-
+  /**
+   * The one route that answers without a principal (ADR-0011 §4). It is reachable by `curl`, a
+   * supervisor and a browser tab, and it names nothing about any candidate — which is exactly why
+   * the guard's allowlist is one line rather than a mechanism.
+   *
+   * The configuration rules themselves — the required signing secret, the non-loopback bind gate,
+   * the `Host` allowlist — are pure parsing and live in `tests/unit/api-config.spec.ts`.
+   */
   it('health endpoint returns ok', async () => {
     const response = await app.inject({ method: 'GET', url: '/health' });
     expect(response.statusCode).toBe(200);

@@ -18,10 +18,9 @@ import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-m
 import {
   applyTestMigrations,
   createTestPrismaClient,
-  requireTestDatabaseUrl,
   truncateAll,
 } from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -61,13 +60,7 @@ beforeEach(async () => {
     await profiles.saveForUser({ userId, profile: profileFixture() })
   ).profileVersion;
 
-  const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
-  );
+  const api = await buildApi(testApiConfig());
   app = api.app;
   appPrisma = api.prisma;
   await app.ready();

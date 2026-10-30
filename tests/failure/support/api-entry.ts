@@ -1,6 +1,5 @@
-import { parseApiConfig } from '@app/api/config';
 import { startApi } from '@app/api/main';
-import { requireTestDatabaseUrl } from '../../support/db';
+import { testApiConfig } from '../../support/api';
 
 /**
  * Test entry point for the process-lifecycle test (AC-014, ENG-017).
@@ -10,13 +9,13 @@ import { requireTestDatabaseUrl } from '../../support/db';
  * here instead of by an operator: Windows cannot deliver a signal to a child process
  * (`kill()` terminates it outright), so the shutdown signal is emitted in-process. Everything
  * it reaches is the production path, and the process's own exit code becomes observable.
+ *
+ * `testApiConfig()` supplies the signing secret rather than inheriting one, so the process starts
+ * on a machine whose `.env` has none. What a *missing* secret does is a pure configuration
+ * question and belongs to `tests/unit/api-config.spec.ts`, where it can be asserted directly.
  */
 async function main(): Promise<void> {
-  const config = parseApiConfig({
-    ...process.env,
-    DATABASE_URL: requireTestDatabaseUrl(),
-    API_HOST: '127.0.0.1',
-  });
+  const config = testApiConfig();
 
   await startApi(config);
   // Printed before any signal, so the parent can tell "ready" from "never started".

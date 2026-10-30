@@ -14,8 +14,8 @@ import {
 import { MATCHER_VERSION } from '@domain/matching';
 import { asPercent, type JobMatch } from '@domain/types';
 import { PrismaJobMatchRepository } from '@infrastructure/ingestion/prisma-job-match-repository';
-import { applyTestMigrations, createTestPrismaClient, requireTestDatabaseUrl, truncateAll } from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
+import { authorized, testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -58,11 +58,7 @@ beforeEach(async () => {
   ).id;
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -160,7 +156,7 @@ describe('GET /api/matches', () => {
     await storeMatch({ score: 90 });
     await storeMatch({ score: 70 });
 
-    const response = await app.inject({ method: 'GET', url: '/api/matches' });
+    const response = await authorized(app, userId, { method: 'GET', url: '/api/matches' });
 
     expect(response.statusCode).toBe(200);
     const body = response.json() as {
@@ -206,7 +202,7 @@ describe('GET /api/matches', () => {
     for (let page = 0; page < 10; page += 1) {
       const url: string =
         cursor === null ? '/api/matches?limit=2' : `/api/matches?limit=2&cursor=${encodeURIComponent(cursor)}`;
-      const response = await app.inject({ method: 'GET', url });
+      const response = await authorized(app, userId, { method: 'GET', url });
       expect(response.statusCode).toBe(200);
       const body = response.json() as {
         matches: Array<{ id: string }>;
@@ -226,35 +222,51 @@ describe('GET /api/matches', () => {
     await storeMatch({ score: 90 });
     const old = await storeMatch({ score: 95, matcherVersion: '0.9.0' });
 
-    const current = await app.inject({ method: 'GET', url: '/api/matches' });
+    const current = await authorized(app, userId, { method: 'GET', url: '/api/matches' });
     const body = current.json() as { matches: Array<{ id: string; matcherVersion: string }> };
     expect(body.matches).toHaveLength(1);
     expect(body.matches[0].matcherVersion).toBe(MATCHER_VERSION);
 
-    const explicit = await app.inject({ method: 'GET', url: '/api/matches?matcherVersion=0.9.0' });
+    const explicit = await authorized(app, userId, { method: 'GET', url: '/api/matches?matcherVersion=0.9.0' });
     const oldBody = explicit.json() as { matches: Array<{ id: string }> };
     expect(oldBody.matches.map((row) => row.id)).toEqual([old]);
   });
 
-  it('scopes to one candidate when asked', async () => {
-    const otherUser = await prisma.user.create({
+  it('answers only the principal’s own matches, and cannot be told whose to read', async () => {
+    const other = await prisma.user.create({
       data: { email: `other-${Date.now()}-${counter++}@example.test` },
       select: { id: true },
     });
-    await storeMatch({ score: 90 });
-    const mine = await storeMatch({ score: 60, forUserId: otherUser.id });
+    const mine = await storeMatch({ score: 60 });
+    const theirs = await storeMatch({ score: 90, forUserId: other.id });
 
-    const response = await app.inject({
-      method: 'GET',
-      url: `/api/matches?userId=${otherUser.id}`,
-    });
-
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/matches` });
     const body = response.json() as { matches: Array<{ id: string }> };
     expect(body.matches.map((row) => row.id)).toEqual([mine]);
+
+    // The higher score belongs to the other candidate, so a caller who could name one would read
+    // it. `userId` is no longer a parameter at all, and Ajv says so rather than ignoring it.
+    const askingForTheirs = await authorized(app, userId, {
+      method: 'GET',
+      url: `/api/matches?userId=${other.id}`,
+    });
+    expect(askingForTheirs.statusCode).toBe(400);
+
+    // By id rather than by list, because a list filter is not the only way to reach a row.
+    const detailOfTheirs = await authorized(app, userId, {
+      method: 'GET',
+      url: `/api/matches/${theirs}`,
+    });
+    expect(detailOfTheirs.statusCode).toBe(404);
+
+    // And the same row is readable by the candidate it belongs to.
+    expect(
+      (await authorized(app, other.id, { method: 'GET', url: `/api/matches/${theirs}` })).statusCode,
+    ).toBe(200);
   });
 
   it('rejects a cursor it did not issue', async () => {
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'GET',
       url: `/api/matches?cursor=${Buffer.from('not json', 'utf8').toString('base64url')}`,
     });
@@ -268,7 +280,7 @@ describe('GET /api/matches/:id', () => {
   it('returns the evidence behind the summary', async () => {
     const id = await storeMatch({ score: 88 });
 
-    const response = await app.inject({ method: 'GET', url: `/api/matches/${id}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/matches/${id}` });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
@@ -285,7 +297,7 @@ describe('GET /api/matches/:id', () => {
   });
 
   it('answers 404 for a match that does not exist', async () => {
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'GET',
       url: '/api/matches/00000000-0000-4000-8000-000000000000',
     });
@@ -295,7 +307,7 @@ describe('GET /api/matches/:id', () => {
   });
 
   it('answers 400 for an id that is not an id', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/matches/not-a-uuid' });
+    const response = await authorized(app, userId, { method: 'GET', url: '/api/matches/not-a-uuid' });
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: { code: 'VALIDATION_ERROR' } });
@@ -314,7 +326,7 @@ describe('match read routes and the scoring vocabulary', () => {
       data: { lifecycleStatus: LifecycleStatus.EXPIRED },
     });
 
-    const response = await app.inject({ method: 'GET', url: `/api/matches/${id}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/matches/${id}` });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ id, score: 75 });
   });
@@ -322,7 +334,7 @@ describe('match read routes and the scoring vocabulary', () => {
   it('never invents evidence for a factor the matcher excluded', async () => {
     const id = await storeMatch({ score: 50 });
 
-    const response = await app.inject({ method: 'GET', url: `/api/matches/${id}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/matches/${id}` });
     const body = response.json() as { factors: Record<string, number | null>; unknownFactors: string[] };
     expect(body.unknownFactors.length).toBeGreaterThan(0);
     for (const name of body.unknownFactors) {

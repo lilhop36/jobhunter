@@ -17,7 +17,7 @@ import { MATCHER_VERSION, type UnversionedCandidateProfile } from '@domain/match
 import { asDecimalAmount, asProbability } from '@domain/types';
 import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/prisma-candidate-profile-repository';
 import { buildApi } from '../../apps/api/main';
-import { parseApiConfig } from '../../apps/api/config';
+import { authorized, testApiConfig } from '../support/api';
 import { createWorkerRuntime, type WorkerRuntime } from '../../apps/worker/runtime';
 import type { WorkerConfig } from '../../apps/worker/config';
 import {
@@ -47,6 +47,13 @@ import { FakeSourceAdapter, makeFakeConfig, makeRawJob } from '../support/fake-s
 const prisma = createTestPrismaClient();
 let app: FastifyInstance;
 let appPrisma: PrismaClient;
+
+/**
+ * The principal that enqueues the collection through the API. Source routes need a caller and no
+ * candidate owns a source, so this id is deliberately not a row — the signed credential is what
+ * authorises the request (SRS 8.1; ADR-0011).
+ */
+const principal = '00000000-0000-0000-0000-000000000001';
 let runtime: WorkerRuntime | undefined;
 
 /**
@@ -92,11 +99,7 @@ beforeAll(() => {
 beforeEach(async () => {
   await truncateAll(prisma);
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -175,7 +178,7 @@ async function startPipeline(): Promise<string> {
     }),
   ];
 
-  const response = await app.inject({ method: 'POST', url: `/api/sources/${source.id}/run` });
+  const response = await authorized(app, principal, { method: 'POST', url: `/api/sources/${source.id}/run` });
   expect(response.statusCode).toBe(202);
 
   runtime = createWorkerRuntime(workerConfig(), {
@@ -197,7 +200,7 @@ describe('manual run handoff', () => {  it('carries the API enqueue to the regis
       makeRawJob({ sourceJobIdentifier: 'h-2', rawTitle: 'Data Analyst', rawCompany: 'Acme' }),
     ];
 
-    const response = await app.inject({
+    const response = await authorized(app, principal, {
       method: 'POST',
       url: `/api/sources/${source.id}/run`,
     });

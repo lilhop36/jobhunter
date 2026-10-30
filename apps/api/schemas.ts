@@ -68,14 +68,16 @@ export const matchIdParams = {
 /**
  * `GET /api/matches` filters. `matcherVersion` is optional here and defaults in the route to the
  * running `MATCHER_VERSION`, so a client that does not care about revisions gets the current
- * ones; asking for an older revision is how A/B evidence stays readable after a matcher change.
+ * ones; asking for an older revision is how ADR-0005's evidence stays readable after a matcher
+ * change. There is no `userId`: a match is candidate-scoped, and the candidate comes from the
+ * authenticated principal (SRS 8.2; ADR-0011), so a query parameter could only ever have been a
+ * request to leak someone else's scores.
  */
 export const listMatchesQuery = {
   type: 'object',
   properties: {
     ...paginationProperties,
     matcherVersion: { type: 'string', minLength: 1 },
-    userId: { type: 'string', pattern: UUID_PATTERN },
   },
   additionalProperties: false,
 } as const;
@@ -88,15 +90,14 @@ export const notificationIdParams = {
 } as const;
 
 /**
- * `GET /api/notifications` filters. `userId` is optional for the same reason as on the matches
- * route: SRS 3.4 fixes no authentication, so the caller says whose notifications it wants, and
- * the running API binds to loopback until that is specified.
+ * `GET /api/notifications` filters. Whose notifications are not a filter: the outbox is
+ * candidate-scoped, so the principal on the request answers for one candidate and only that one
+ * (SRS 8.2; ADR-0011).
  */
 export const listNotificationsQuery = {
   type: 'object',
   properties: {
     ...paginationProperties,
-    userId: { type: 'string', pattern: UUID_PATTERN },
     status: { type: 'string', enum: Object.values(NotificationStatus) },
   },
   additionalProperties: false,
@@ -113,31 +114,6 @@ export const submitFeedbackBody = {
   type: 'object',
   required: ['value'],
   properties: { value: { type: 'string', enum: Object.values(NotificationFeedbackValue) } },
-  additionalProperties: false,
-} as const;
-
-/**
- * `POST /api/telegram/link` names the candidate the deep-link token is for (SRS 3.4). There is
- * no authentication and the userId is the seed's identity, so this is an operator Surface —
- * same standing as the PUT profile body above.
- */
-export const telegramLinkBody = {
-  type: 'object',
-  required: ['userId'],
-  properties: { userId: { type: 'string', pattern: UUID_PATTERN } },
-  additionalProperties: false,
-} as const;
-
-/**
- * `GET`/`PUT /api/profile` name the candidate in the query.
- *
- * Required here, unlike the list routes' optional `userId`: a profile belongs to exactly one
- * candidate, and a write with no owner would have to guess whose profile it replaces.
- */
-export const profileQuery = {
-  type: 'object',
-  required: ['userId'],
-  properties: { userId: { type: 'string', pattern: UUID_PATTERN } },
   additionalProperties: false,
 } as const;
 

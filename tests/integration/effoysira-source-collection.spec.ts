@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { FastifyInstance } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { buildApi } from '../../apps/api/main';
-import { parseApiConfig } from '../../apps/api/config';
+import { authorized, testApiConfig } from '../support/api';
 import { createWorkerRuntime, type WorkerRuntime } from '../../apps/worker/runtime';
 import type { WorkerConfig } from '../../apps/worker/config';
 import {
@@ -67,6 +67,12 @@ const stubbedFetch = (async (input: string | URL) => {
 const prisma = createTestPrismaClient();
 let app: FastifyInstance;
 let appPrisma: PrismaClient;
+
+/**
+ * The principal that triggers the manual run. Source routes need a caller but no candidate owns a
+ * source, so this id is deliberately not a row — the credential's signature is what authorises it.
+ */
+const principal = '00000000-0000-0000-0000-000000000001';
 let runtime: WorkerRuntime | undefined;
 
 beforeAll(() => {
@@ -77,11 +83,7 @@ beforeAll(() => {
 beforeEach(async () => {
   await truncateAll(prisma);
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -135,7 +137,7 @@ describe('EffoySira approved-source collection (production registry, no network)
     // so stubbing it here keeps the whole run offline.
     vi.stubGlobal('fetch', stubbedFetch);
 
-    const response = await app.inject({ method: 'POST', url: `/api/sources/${source.id}/run` });
+    const response = await authorized(app, principal, { method: 'POST', url: `/api/sources/${source.id}/run` });
     expect(response.statusCode).toBe(202);
     const taskId = response.json().task.id as string;
 

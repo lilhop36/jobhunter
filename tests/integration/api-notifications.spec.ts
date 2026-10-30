@@ -3,8 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { DescriptionQuality } from '@domain/enums';
 import { PrismaNotificationFactsReader } from '@infrastructure/matching/prisma-notification-facts-reader';
-import { applyTestMigrations, createTestPrismaClient, requireTestDatabaseUrl, truncateAll } from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
+import { authorized, testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -68,11 +68,7 @@ beforeEach(async () => {
   ).id;
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -126,7 +122,7 @@ describe('GET /api/notifications', () => {
       sentAt: BASE,
     });
 
-    const response = await app.inject({ method: 'GET', url: `/api/notifications?userId=${userId}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/notifications` });
 
     expect(response.statusCode).toBe(200);
     const body = response.json();
@@ -151,17 +147,17 @@ describe('GET /api/notifications', () => {
     const second = await reserve({ createdAt: new Date(BASE.getTime() - 60_000) });
     const third = await reserve({ createdAt: BASE });
 
-    const pageOne = await app.inject({
+    const pageOne = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&limit=2`,
+      url: `/api/notifications?limit=2`,
     });
     const one = pageOne.json();
     expect(one.notifications.map((row: { id: string }) => row.id)).toEqual([third.id, second.id]);
     expect(one.pagination.nextCursor).not.toBeNull();
 
-    const pageTwo = await app.inject({
+    const pageTwo = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&limit=2&cursor=${encodeURIComponent(one.pagination.nextCursor)}`,
+      url: `/api/notifications?limit=2&cursor=${encodeURIComponent(one.pagination.nextCursor)}`,
     });
     const two = pageTwo.json();
     expect(two.notifications.map((row: { id: string }) => row.id)).toEqual([first.id]);
@@ -173,17 +169,17 @@ describe('GET /api/notifications', () => {
     const a = await reserve({ createdAt: BASE });
     const b = await reserve({ createdAt: BASE });
 
-    const pageOne = await app.inject({
+    const pageOne = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&limit=1`,
+      url: `/api/notifications?limit=1`,
     });
     const one = pageOne.json();
     expect(one.notifications).toHaveLength(1);
     expect(one.pagination.nextCursor).not.toBeNull();
 
-    const pageTwo = await app.inject({
+    const pageTwo = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&limit=1&cursor=${encodeURIComponent(one.pagination.nextCursor)}`,
+      url: `/api/notifications?limit=1&cursor=${encodeURIComponent(one.pagination.nextCursor)}`,
     });
     const two = pageTwo.json();
     const seen = [one.notifications[0].id, ...two.notifications.map((row: { id: string }) => row.id)];
@@ -196,7 +192,7 @@ describe('GET /api/notifications', () => {
     const mine = await reserve();
     await reserve({ user: otherUserId, event: 'NEW_MATCH-THEIRS' });
 
-    const response = await app.inject({ method: 'GET', url: `/api/notifications?userId=${userId}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/notifications` });
 
     const body = response.json();
     expect(body.notifications.map((row: { id: string }) => row.id)).toEqual([mine.id]);
@@ -206,9 +202,9 @@ describe('GET /api/notifications', () => {
     await reserve({ event: 'PENDING-ONE' });
     const failed = await reserve({ event: 'FAILED-ONE', status: 'FAILED', attemptCount: 5 });
 
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&status=FAILED`,
+      url: `/api/notifications?status=FAILED`,
     });
 
     const body = response.json();
@@ -216,7 +212,7 @@ describe('GET /api/notifications', () => {
   });
 
   it('rejects a cursor that is not a cursor', async () => {
-    const badCursor = await app.inject({
+    const badCursor = await authorized(app, userId, {
       method: 'GET',
       url: `/api/notifications?cursor=not-a-cursor`,
     });
@@ -230,9 +226,9 @@ describe('GET /api/notifications', () => {
     // same as the source and match routes; this pins that the notification route does not differ.
     const { id } = await reserve();
 
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'GET',
-      url: `/api/notifications?userId=${userId}&includeDeleted=true`,
+      url: `/api/notifications?includeDeleted=true`,
     });
 
     expect(response.statusCode).toBe(200);
@@ -240,7 +236,7 @@ describe('GET /api/notifications', () => {
   });
 
   it('answers an empty outbox with an empty page, not an error', async () => {
-    const response = await app.inject({ method: 'GET', url: `/api/notifications?userId=${userId}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/notifications` });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ notifications: [], pagination: { nextCursor: null } });
@@ -251,7 +247,7 @@ describe('POST /api/notifications/:id/feedback', () => {
   it('records the verdict and returns it with the notification', async () => {
     const { id } = await reserve();
 
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/${id}/feedback`,
       payload: { value: 'RELEVANT' },
@@ -265,7 +261,7 @@ describe('POST /api/notifications/:id/feedback', () => {
   it('replaces the previous verdict rather than accumulating contradicting rows', async () => {
     const { id } = await reserve();
     const post = (value: string) =>
-      app.inject({ method: 'POST', url: `/api/notifications/${id}/feedback`, payload: { value } });
+      authorized(app, userId, { method: 'POST', url: `/api/notifications/${id}/feedback`, payload: { value } });
 
     await post('RELEVANT');
     const changed = await post('NOT_RELEVANT');
@@ -276,19 +272,19 @@ describe('POST /api/notifications/:id/feedback', () => {
 
   it('is visible in the list afterwards', async () => {
     const { id } = await reserve();
-    await app.inject({
+    await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/${id}/feedback`,
       payload: { value: 'UNSURE' },
     });
 
-    const response = await app.inject({ method: 'GET', url: `/api/notifications?userId=${userId}` });
+    const response = await authorized(app, userId, { method: 'GET', url: `/api/notifications` });
 
     expect(response.json().notifications[0]).toMatchObject({ id, feedback: 'UNSURE' });
   });
 
   it('answers 404 for a notification that does not exist, rather than creating a verdict for it', async () => {
-    const response = await app.inject({
+    const response = await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/00000000-0000-0000-0000-000000000000/feedback`,
       payload: { value: 'RELEVANT' },
@@ -302,7 +298,7 @@ describe('POST /api/notifications/:id/feedback', () => {
   it('rejects a verdict the SRS does not define, and a missing one', async () => {
     const { id } = await reserve();
 
-    const invented = await app.inject({
+    const invented = await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/${id}/feedback`,
       payload: { value: 'MAYBE' },
@@ -310,7 +306,7 @@ describe('POST /api/notifications/:id/feedback', () => {
     expect(invented.statusCode).toBe(400);
     expect(invented.json().error.code).toBe('VALIDATION_ERROR');
 
-    const missing = await app.inject({
+    const missing = await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/${id}/feedback`,
       payload: {},
@@ -322,7 +318,7 @@ describe('POST /api/notifications/:id/feedback', () => {
   it('closes the loop: the verdict is what SRS 3.2 reads to suppress the job', async () => {
     const { id } = await reserve();
 
-    await app.inject({
+    await authorized(app, userId, {
       method: 'POST',
       url: `/api/notifications/${id}/feedback`,
       payload: { value: 'NOT_RELEVANT' },

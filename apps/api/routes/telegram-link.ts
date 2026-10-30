@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { CreateTelegramLinkToken } from '@application/telegram';
 import type { TelegramLinkTokenStore } from '@ports/telegram-linking';
+import { principalOf } from '../auth';
 import { ApiError, ERROR_CODES } from '../errors';
-import { telegramLinkBody } from '../schemas';
 
 /**
  * `POST /api/telegram/link` (SRS 3.4, "Telegram link token"), for SRS 3.2's linking contract:
@@ -15,9 +15,11 @@ import { telegramLinkBody } from '../schemas';
  * its own token: a surface that accepted (token, chatId) pairs from anyone would let any
  * caller redirect a user's notifications.
  *
- * Same caveat as the profile routes: no authentication is specified, so any loopback caller
- * can mint a token for any userId. The token only ever names one candidate; it exposes
- * nothing about them.
+ * The token is minted for **the authenticated principal**, which takes the place of the `userId`
+ * this route used to read out of its body (SRS 8.2; ADR-0011). That body was the clearest hole in
+ * the old surface: a linking token names the account whose notifications are about to be
+ * redirected, so a caller that could choose it could point another candidate's alerts at its own
+ * chat. The route takes no identity from a request at all now.
  */
 export interface TelegramLinkRoutesDeps {
   tokens: TelegramLinkTokenStore;
@@ -34,7 +36,7 @@ export async function registerTelegramLinkRoutes(
   app: FastifyInstance,
   deps: TelegramLinkRoutesDeps,
 ): Promise<void> {
-  app.post('/api/telegram/link', { schema: { body: telegramLinkBody } }, async (request, reply) => {
+  app.post('/api/telegram/link', async (request, reply) => {
     if (deps.botUsername === undefined) {
       throw new ApiError(
         ERROR_CODES.INTERNAL_ERROR,
@@ -43,7 +45,7 @@ export async function registerTelegramLinkRoutes(
       );
     }
 
-    const { userId } = request.body as { userId: string };
+    const { userId } = principalOf(request);
     const created = await new CreateTelegramLinkToken({ tokens: deps.tokens }).run({
       userId,
       now: new Date(),

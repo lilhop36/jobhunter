@@ -15,10 +15,9 @@ import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/pris
 import {
   applyTestMigrations,
   createTestPrismaClient,
-  requireTestDatabaseUrl,
   truncateAll,
 } from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -58,12 +57,7 @@ beforeEach(async () => {
   profileVersion = (await profiles.saveForUser({ userId, profile: profileFixture() })).profileVersion;
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-      TELEGRAM_BOT_USERNAME: BOT_USERNAME,
-    }),
+    testApiConfig({ TELEGRAM_BOT_USERNAME: BOT_USERNAME }),
   );
   app = api.app;
   appPrisma = api.prisma;

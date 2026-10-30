@@ -21,7 +21,11 @@ import { listRunsQuery, listSourcesQuery, sourceIdParams } from '../schemas';
  * and the SRS fixes no response body for either. The shapes below are therefore *proposed*:
  * the SRS 5.2 JobSource attributes, plus the latest run, plus a `pagination` object shared by
  * both list endpoints. `accessPolicy` is deliberately not published — it records the approved
- * access mechanism, is not needed to report health, and the API has no authentication.
+ * access mechanism, is not needed to report health.
+ *
+ * Source state describes the deployment, not a candidate, so these routes require a principal
+ * (SRS 8.1; ADR-0011) without one owning the data: a manual run starts collection that feeds
+ * every stored profile, and the run history says which sources reached what.
  */
 export interface SourceRoutesDeps {
   sources: JobSourceRepository;

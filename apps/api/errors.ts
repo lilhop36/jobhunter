@@ -27,6 +27,12 @@ export const ERROR_CODES = {
   SOURCE_RUN_ACTIVE: 'SOURCE_RUN_ACTIVE',
   SOURCE_DISABLED: 'SOURCE_DISABLED',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  /**
+   * The caller proved nothing (SRS 8.1). Distinct from `FORBIDDEN` because the fix differs: 401
+   * means "authenticate", 403 means "you authenticated, and that is not what you may do".
+   */
+  UNAUTHENTICATED: 'UNAUTHENTICATED',
+  FORBIDDEN: 'FORBIDDEN',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -45,6 +51,16 @@ export class ApiError extends Error {
 
   static validation(message: string, details?: unknown): ApiError {
     return new ApiError(ERROR_CODES.VALIDATION_ERROR, message, 400, details);
+  }
+
+  /** SRS 8.1: the request proved no identity, so nothing about any candidate is answered. */
+  static unauthenticated(message: string): ApiError {
+    return new ApiError(ERROR_CODES.UNAUTHENTICATED, message, 401);
+  }
+
+  /** SRS 8.2: a caller that authenticated, but may not do *this*. */
+  static forbidden(message: string): ApiError {
+    return new ApiError(ERROR_CODES.FORBIDDEN, message, 403);
   }
 
   static notFound(message: string): ApiError {

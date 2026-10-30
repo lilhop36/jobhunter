@@ -5,6 +5,7 @@ import type {
   NotificationRecord,
   NotificationRepository,
 } from '@ports/notification-repository';
+import { ownedBy, principalOf } from '../auth';
 import { ApiError } from '../errors';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { listNotificationsQuery, notificationIdParams, submitFeedbackBody } from '../schemas';
@@ -24,9 +25,11 @@ import { listNotificationsQuery, notificationIdParams, submitFeedbackBody } from
  * can move a notification between delivery states: that is the dispatcher's, so a request cannot
  * mark an unsent alert as sent.
  *
- * The same caveat as the match routes applies: no authentication is specified, so the feedback
- * route lets any caller classify any notification by id. Only the loopback binding and the
- * unpublished ids stand in the way until SRS 3.4's authentication gap is closed.
+ * A notification belongs to a candidate, so both routes act for the authenticated principal and
+ * never for a `userId` in the request (SRS 8.2; ADR-0011). Feedback is the sharpest case: a verdict
+ * is training signal for the notification policy, and a caller that could file one against any id
+ * would be editing someone else's preferences — so the id is looked up under the principal's own
+ * notifications first, and answered as absent otherwise.
  */
 export interface NotificationRoutesDeps {
   notifications: NotificationRepository;
@@ -40,14 +43,16 @@ export async function registerNotificationRoutes(
 ): Promise<void> {
   app.get('/api/notifications', { schema: { querystring: listNotificationsQuery } }, async (request) => {
     const query = request.query as {
-      userId?: string;
       status?: NotificationStatus;
       cursor?: string;
       limit?: number;
     };
+    const { userId } = principalOf(request);
 
     const page = await deps.notifications.listNotifications({
-      ...(query.userId === undefined ? {} : { userId: query.userId }),
+      // The principal's own outbox, always: the optional `userId` filter used to mean "every
+      // candidate's delivery state", which is not a thing a personal tool has a caller for.
+      userId,
       ...(query.status === undefined ? {} : { status: query.status }),
       ...(query.cursor === undefined ? {} : { cursor: decodeNotificationCursor(query.cursor) }),
       limit: query.limit ?? DEFAULT_LIMIT,
@@ -67,12 +72,18 @@ export async function registerNotificationRoutes(
       const { value } = request.body as { value: NotificationFeedbackValue };
 
       // The verdict is recorded against a notification, so an unknown id is a 404 rather than a
-      // row created for a notification that does not exist.
-      if ((await deps.notifications.findById(id)) === null) {
-        throw ApiError.notFound(`Notification ${id} was not found`);
-      }
+      // row created for a notification that does not exist — and a notification that exists but
+      // belongs to another candidate is the same 404, so ids cannot be probed.
+      const notification = ownedBy(
+        await deps.notifications.findById(id),
+        principalOf(request),
+        `Notification ${id}`,
+      );
 
-      const updated = await deps.notifications.recordFeedback({ notificationId: id, value });
+      const updated = await deps.notifications.recordFeedback({
+        notificationId: notification.id,
+        value,
+      });
       return serializeNotification(updated);
     },
   );

@@ -10,6 +10,7 @@ import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work
 import { RequestMatchBackfill } from '@application/matching';
 import type { WorkerLogger } from '@ports/worker-logger';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
+import { registerAuthGuards } from './auth';
 import { registerErrorHandler } from './errors';
 import { registerJobRoutes } from './routes/jobs';
 import { registerMatchRoutes } from './routes/matches';
@@ -47,6 +48,11 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
   });
 
   registerErrorHandler(app);
+
+  // Registered before any route, because the guard is deny-by-path: every `/api/*` route needs a
+  // principal and a route added later is covered without its author remembering to ask (SRS 8.1,
+  // 8.2; ADR-0011).
+  registerAuthGuards(app, { config });
 
   app.get('/health', async () => ({ status: 'ok' }));
 

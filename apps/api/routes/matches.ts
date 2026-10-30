@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { MATCHER_VERSION } from '@domain/matching';
 import { isPercent, type MatchFactorScores } from '@domain/types';
 import type { JobMatchRecord, JobMatchRepository, MatchCursor } from '@ports/job-match-repository';
+import { ownedBy, principalOf } from '../auth';
 import { ApiError } from '../errors';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { listMatchesQuery, matchIdParams } from '../schemas';
@@ -15,9 +16,11 @@ import { listMatchesQuery, matchIdParams } from '../schemas';
  * derived from. The full evidence is deliberately kept out of the list — it is "why it matches"
  * text, and SRS 3.1 asks a low-bandwidth client not to fetch what it will not render.
  *
- * Only the running API binds (loopback by default, `API_HOST` in `./config`), so these routes
- * publish candidate-scoped data to the local machine until authentication is specified. The
- * same reason keeps `accessPolicy` unpublished on the source routes.
+ * A match is candidate-scoped data, so both routes take the candidate from the authenticated
+ * principal and never from the request (SRS 8.2; ADR-0011). A detail id belonging to someone else
+ * is answered as absent — the same shape as a genuine miss, because "that id exists and is not
+ * yours" is a fact no caller should be able to look up. `accessPolicy` stays unpublished on the
+ * source routes for the same reason: it is operator intent, not data a candidate asked for.
  */
 export interface MatchRoutesDeps {
   matches: JobMatchRepository;
@@ -32,16 +35,19 @@ export async function registerMatchRoutes(
   app.get('/api/matches', { schema: { querystring: listMatchesQuery } }, async (request) => {
     const query = request.query as {
       matcherVersion?: string;
-      userId?: string;
       cursor?: string;
       limit?: number;
     };
+    const { userId } = principalOf(request);
 
     const page = await deps.matches.listMatches({
       // Unstated revision means "the rules in force now" (ENG-013); naming an older one is how
       // stored evidence stays readable after a matcher change.
       matcherVersion: query.matcherVersion ?? MATCHER_VERSION,
-      ...(query.userId === undefined ? {} : { userId: query.userId }),
+      // Scoped to the principal, not to a filter the caller chose: an absent `userId` used to mean
+      // "every candidate's matches", which on a single machine leaked one person's scores to
+      // whatever else was running on it.
+      userId,
       ...(query.cursor === undefined ? {} : { cursor: decodeMatchCursor(query.cursor) }),
       limit: query.limit ?? DEFAULT_LIMIT,
     });
@@ -54,9 +60,9 @@ export async function registerMatchRoutes(
 
   app.get('/api/matches/:id', { schema: { params: matchIdParams } }, async (request) => {
     const { id } = request.params as { id: string };
-    const match = await deps.matches.findById(id);
-    if (match === null) throw ApiError.notFound(`Match ${id} was not found`);
-    return serializeMatchEvidence(match);
+    return serializeMatchEvidence(
+      ownedBy(await deps.matches.findById(id), principalOf(request), `Match ${id}`),
+    );
   });
 }
 

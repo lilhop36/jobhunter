@@ -2,8 +2,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { FastifyInstance } from 'fastify';
 import type { PrismaClient } from '@prisma/client';
 import { profileVersionOf, type UnversionedCandidateProfile } from '@domain/matching';
-import { applyTestMigrations, createTestPrismaClient, requireTestDatabaseUrl, truncateAll } from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
+import { authorized, testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -46,11 +46,7 @@ beforeEach(async () => {
   ).id;
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -101,10 +97,11 @@ function profileBody(overrides: Partial<ProfileBody> = {}): ProfileBody {
   };
 }
 
-const put = (body: unknown) =>
-  app.inject({ method: 'PUT', url: `/api/profile?userId=${userId}`, payload: body as object });
+const put = (body: unknown, as: string = userId) =>
+  authorized(app, as, { method: 'PUT', url: `/api/profile`, payload: body as object });
 
-const get = () => app.inject({ method: 'GET', url: `/api/profile?userId=${userId}` });
+const get = (as: string = userId) =>
+  authorized(app, as, { method: 'GET', url: `/api/profile` });
 
 async function backfillTasks() {
   return prisma.workTask.findMany({
@@ -121,8 +118,12 @@ describe('GET /api/profile', () => {
     expect(response.json().error.code).toBe('NOT_FOUND');
   });
 
-  it('requires the candidate to be named', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/profile' });
+  it('refuses a caller who still names a candidate in the query, rather than quietly answering ' +
+    'about themselves', async () => {
+    const response = await authorized(app, userId, {
+      method: 'GET',
+      url: '/api/profile?userId=0b6b5934-b42d-4b06-b203-5ddd4475d100',
+    });
 
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe('VALIDATION_ERROR');
@@ -257,19 +258,26 @@ describe('PUT /api/profile', () => {
     expect(await backfillTasks()).toHaveLength(0);
   });
 
-  it('keeps one profile per candidate and does not leak another candidate’s revision', async () => {
+  it('writes and reads only for the principal, so a query cannot name another candidate', async () => {
     const other = await prisma.user.create({ data: { email: `other-${Date.now()}@example.test` } });
     await put(profileBody());
-    await app.inject({
+
+    // `?userId=` used to be how a caller chose whose profile to replace. It is now an unknown
+    // parameter, and a rejected request is a stated answer rather than a save that quietly went
+    // somewhere else.
+    const namedInQuery = await authorized(app, userId, {
       method: 'PUT',
       url: `/api/profile?userId=${other.id}`,
       payload: profileBody({ experienceYears: 12 }),
     });
+    expect(namedInQuery.statusCode).toBe(400);
+    expect((await get()).json().experienceYears).toBe(5);
+
+    // The other candidate, acting for themselves, gets their own revision — not the caller's.
+    await put(profileBody({ experienceYears: 12 }), other.id);
 
     const mine = (await get()).json();
-    const theirs = (
-      await app.inject({ method: 'GET', url: `/api/profile?userId=${other.id}` })
-    ).json();
+    const theirs = (await get(other.id)).json();
 
     expect(mine.experienceYears).toBe(5);
     expect(theirs.experienceYears).toBe(12);

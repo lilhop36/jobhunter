@@ -17,8 +17,10 @@ import { UUID_PATTERN, jobIdParams, listJobsQuery } from '../schemas';
  * exactly as stored, because SRS 5.4/ENG-003 require a value's origin and evidence to stay
  * distinguishable from the value itself.
  *
- * Only the running API binds (loopback by default, `API_HOST` in `./config`), so these routes
- * publish stored job data to the local machine until authentication is specified.
+ * A job is collected, not asserted about a candidate, so it is published to any authenticated
+ * principal (SRS 8.1; ADR-0011) rather than scoped to one: two candidates scored against the same
+ * source see the same job, and hiding it from the second would make the shared collection
+ * unexplainable to it.
  */
 export interface JobRoutesDeps {
   jobs: JobReader;

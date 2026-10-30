@@ -10,8 +10,9 @@ import type {
 import type { UnversionedCandidateProfile } from '@domain/matching';
 import { asDecimalAmount, asProbability } from '@domain/types';
 import type { CandidateProfileRepository, StoredCandidateProfile } from '@ports/candidate-profile-repository';
+import { principalOf } from '../auth';
 import { ApiError } from '../errors';
-import { profileQuery, putProfileBody } from '../schemas';
+import { putProfileBody } from '../schemas';
 
 /**
  * The candidate profile routes (SRS 3.4 `GET /api/profile` and `PUT /api/profile`; FR-012).
@@ -24,6 +25,11 @@ import { profileQuery, putProfileBody } from '../schemas';
  * explicitly null or empty, because the repository replaces the child rows rather than merging
  * them: a field the client omits could only be guessed, and a guess is a fact the candidate never
  * asserted (ENG-001).
+ *
+ * **Whose** profile it is never comes from the request (SRS 8.2; ADR-0011): these routes take no
+ * `userId`, and act for the authenticated principal alone. Before that, `?userId=` meant any
+ * caller could read or replace any candidate's facts — a profile is the most private thing this
+ * system stores.
  *
  * ## Why a save enqueues work
  *
@@ -76,26 +82,22 @@ export async function registerProfileRoutes(
   app: FastifyInstance,
   deps: ProfileRoutesDeps,
 ): Promise<void> {
-  app.get('/api/profile', { schema: { querystring: profileQuery } }, async (request) => {
-    const { userId } = request.query as { userId: string };
+  app.get('/api/profile', async (request) => {
+    const { userId } = principalOf(request);
 
     const stored = await deps.profiles.findForUser(userId);
     // No profile yet is a state, not an empty profile: answering `{}` would claim the candidate
     // has stated nothing about everything, which is a different fact from never having looked.
-    if (stored === null) throw ApiError.notFound(`No profile exists for user ${userId}`);
+    if (stored === null) throw ApiError.notFound('No profile exists for this candidate');
     return serializeProfile(stored);
   });
 
-  app.put(
-    '/api/profile',
-    { schema: { querystring: profileQuery, body: putProfileBody } },
-    async (request) => {
-      const { userId } = request.query as { userId: string };
-      const profile = toProfile(request.body as ProfileBody);
-      const stored = await saveProfile(deps, userId, profile, request.log);
-      return serializeProfile(stored);
-    },
-  );
+  app.put('/api/profile', { schema: { body: putProfileBody } }, async (request) => {
+    const { userId } = principalOf(request);
+    const profile = toProfile(request.body as ProfileBody);
+    const stored = await saveProfile(deps, userId, profile, request.log);
+    return serializeProfile(stored);
+  });
 }
 
 /**

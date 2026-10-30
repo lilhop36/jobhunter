@@ -1,13 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { Prisma, type PrismaClient } from '@prisma/client';
-import {
-  applyTestMigrations,
-  createTestPrismaClient,
-  requireTestDatabaseUrl,
-  truncateAll,
-} from '../support/db';
-import { parseApiConfig } from '../../apps/api/config';
+import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
+import { authorized, testApiConfig } from '../support/api';
 import { buildApi } from '../../apps/api/main';
 
 /**
@@ -27,6 +22,13 @@ let counter = 0;
 let sourceId: string;
 let otherSourceId: string;
 
+/**
+ * A job is collected data, not a candidate's fact, so the read needs a principal without one
+ * owning the row. This id is nobody in the database: what authorises the request is the signature,
+ * which is the point of the check (SRS 8.1; ADR-0011).
+ */
+const principal = '00000000-0000-0000-0000-000000000001';
+
 beforeAll(() => {
   process.env.NODE_ENV = 'test';
   applyTestMigrations();
@@ -39,11 +41,7 @@ beforeEach(async () => {
   otherSourceId = await createSource();
 
   const api = await buildApi(
-    parseApiConfig({
-      ...process.env,
-      DATABASE_URL: requireTestDatabaseUrl(),
-      API_HOST: '127.0.0.1',
-    }),
+    testApiConfig(),
   );
   app = api.app;
   appPrisma = api.prisma;
@@ -87,8 +85,8 @@ async function createJob(overrides: Partial<Prisma.JobUncheckedCreateInput> = {}
   return job.id;
 }
 
-const list = (query = '') => app.inject({ method: 'GET', url: `/api/jobs${query}` });
-const detail = (id: string) => app.inject({ method: 'GET', url: `/api/jobs/${id}` });
+const list = (query = '') => authorized(app, principal, { method: 'GET', url: `/api/jobs${query}` });
+const detail = (id: string) => authorized(app, principal, { method: 'GET', url: `/api/jobs/${id}` });
 
 describe('GET /api/jobs', () => {
   it('lists newest discovery first and names the source of each job', async () => {
