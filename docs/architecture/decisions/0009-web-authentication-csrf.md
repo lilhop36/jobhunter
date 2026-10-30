@@ -1,6 +1,7 @@
 # ADR-0009: Web authentication and CSRF
 
 - **Status:** Accepted — 2026-10-22. SameSite=Lax session cookie + double-submit CSRF token; no password; candidate chooser; in-memory store; 30-day TTL.
+- **Partly superseded 2026-10-30 by ADR-0011:** §2.3 (the candidate chooser was the login, and a page that lists stored candidate ids hands out sessions for any of them) and §2.5 (`POST /api/telegram/link` answering any body `userId`) are withdrawn. §2.1, §2.2 and §2.4 stand unchanged — the cookie, the double-submit token and the in-memory store are what ADR-0011 builds its principal on.
 - **Date:** 2026-10-22
 - **Relates to:** ADR-0007 (server-rendered HTML), SRS 3.1 (`/profile`, `/settings`, `/settings/telegram`), SRS 3.4 (`PUT /api/profile`, `POST /api/telegram/link`), FR-012, FR-018, ENG-008
 - **Depends on:** ADR-0007 accepted; the read-only pages and JSON API already exist.

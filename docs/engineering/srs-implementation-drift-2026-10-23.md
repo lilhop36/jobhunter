@@ -55,7 +55,7 @@ One internal inconsistency remains inside v1.1: the Document Control row still s
 
 The SRS is a **single-user** document: "Primary User: One seeded candidate" (§ header), "One seeded candidate owns one profile and one Telegram destination" (§2.2), registration deferred (§2.2), multi-user SaaS a non-goal (§1.7).
 
-The implementation is **multi-candidate capable**: `users` is a table with no singleton constraint, the match/notification/profile routes accept `?userId=`, the web layer has a candidate chooser at `/login?userId=<id>` (ADR-0009), and `/profile` writes whichever candidate the session names. There is no registration, invitation or admin UI, so operationally it is still one-person software with several seeded rows.
+The implementation is **multi-candidate capable**: `users` is a table with no singleton constraint, and every row — profile, matches, notifications, Telegram link — is keyed by `userId`. What a caller can *ask* for is not a candidate: since ADR-0011 no route or page accepts a `userId`, and the one a handler acts on comes from the credential it presented. Several candidates are therefore several sign-ins (`npm run login -- --email …`), not several ids on one page; the candidate chooser that used to list them at `/login?userId=<id>` is gone, because a page that names stored ids is a page that hands out sessions for them. There is still no registration, invitation or admin UI, so operationally this remains one-person software with several seeded rows.
 
 Classification: **intentional extension, not a defect** — the owner asked for a system that does not assume a single candidate. But it is currently undocumented as a scope change and it collides with §8.1/§8.2 (below).
 
@@ -71,9 +71,9 @@ Status: **MATCH** · **PARTIAL** · **MISSING** · **DIVERGENT** (implemented di
 
 | ID | SRS | Status | Evidence | Class | Risk |
 | --- | --- | --- | --- | --- | --- |
-| D1 | §8.1 "The seeded user shall be authenticated"; §8.2 "Ownership must be enforced server-side at the service layer"; ENG ownership intent | **PARTIAL** | Web pages have a session cookie (ADR-0009), but the **JSON API has no authentication at all**; routes trust `?userId=` and `:id` (`apps/api/routes/notifications.ts:27-29` says so explicitly). Any local caller can read or overwrite any candidate's profile and classify any notification. Mitigation is loopback binding only. | unresolved | high |
-| D2 | §8.1 passwords "if used" | **MATCH** | No password, so the conditional clause does not apply; ADR-0009 chose session-without-password and was accepted. | intentional | low |
-| D3 | §2.2 one candidate / §1.7 no multi-user SaaS | **DIVERGENT** | Multi-candidate data model + chooser, no registration; see §3. | unresolved | medium |
+| D1 | §8.1 "The seeded user shall be authenticated"; §8.2 "Ownership must be enforced server-side at the service layer"; ENG ownership intent | **MATCH** | Closed 2026-10-30 (ADR-0011; audit H2). A root `preHandler` decides who is asking before any route runs: `/api/*` needs a bearer credential the deployment signed or the browser's session, every non-public page needs a session, and handlers read the identity only from that principal. Ownership is enforced at the read (`FindMatchesForUser`, `findForUser`, `/matches/:id` answers a foreign row with the same 404 a missing one gets), and a caller that names `userId` anywhere is refused 400 rather than ignored. `Host` is allowlisted, mutating requests must be same-origin, and a non-loopback `API_HOST` refuses to boot without `API_ALLOW_EXTERNAL_BIND=true` and `API_ALLOWED_HOSTS`. §8.1's "passwords … if used" is read as permission, not requirement: the credential is a locally minted signed claim, which is unforgeable without `AUTH_SECRET`. **Open:** TLS on an opted-in external bind is still not implemented, so the clause "unless auth and TLS are explicitly enabled" is half-satisfied by refusing the bind outright. | resolved (was: audit H2) | low |
+| D2 | §8.1 passwords "if used" | **MATCH** | Still no password, now by ADR-0011 §1's reading rather than ADR-0009 §2.3's: a credential is whatever is hard to forge and easy to check, and the operator chose the locally-minted one-time link. `AUTH_SECRET` is a required boot secret (≥32 bytes), and rotating it — which invalidates every outstanding link, token and session — is the only revocation mechanism. | intentional | low |
+| D3 | §2.2 one candidate / §1.7 no multi-user SaaS | **DIVERGENT** | Multi-candidate data model, no registration; since ADR-0011 there is no candidate chooser, so N candidates are N local sign-ins rather than N ids on one page. See §3. | unresolved | medium |
 
 ### 4.2 Matching inputs
 
@@ -180,7 +180,7 @@ All are documented in schema comments or ADRs, so none is silent:
 - `JobMatch.profileVersion`, `inputHash`, `scoredAt`.
 - `SalaryPeriod.OTHER`; `RemotePreference`, `RelocationPreference`, `HealthStatus`, `SourceRunStatus`, `SourceRunTrigger` value sets (ADR-0003/0005).
 - `/login`, `/logout`, `/matches/:id`, `GET /api/sources/:id`, `GET /api/sources/:id/runs`.
-- Session/CSRF layer (ADR-0009).
+- Session/CSRF layer (ADR-0009), and the signed sign-in link and API credential that replaced its `?userId=` login (ADR-0011).
 
 ---
 
@@ -201,13 +201,13 @@ Ordered by cost, not importance; each is independently reviewable.
 | D19 backup | **Scripts are as strong as they can be without a second machine** — 2026-10-25 added the dump and drill; 2026-10-30 made the drill schema-aware (migration ledger + the scheduler's query), added a byte-verified `BACKUP_COPY_DIR` copy, `backup:prune` retention and `backup:schedule`. What is left is not code: register the task (`npm run backup:schedule -- --apply`), point `BACKUP_COPY_DIR` at an encrypted destination on another host or volume, and drill that copy. No `BackupRun` model is needed for a single-operator MVP. |
 | D21 precision | Spreadsheet, not code. |
 | D20 yield drift (§7.8) | **Done 2026-10-28 for a source that runs** — `classifyYieldDrift` raises `DEGRADED` and logs a warning when a clean run parses less than half the median of the last three clean runs (baseline of at least five records). The thresholds are documented engineering defaults (`0.5`, `5`, `3`), not SRS values, and are the owner's to tune. Still open: `lastSuccessfulRunAt` ageing past the source's interval, which needs the same kind of threshold and a place to evaluate it even when the scheduler is not firing. The row claimed MATCH until 2026-10-27, which overstated §7.8. |
-| D1 API auth | Decide the trust boundary first (see §8); the code change follows the decision. |
+| D1 API auth | **Done 2026-10-30.** The boundary was decided and implemented: identity comes from a signed credential or the session and never from the request (ADR-0011). Remaining: TLS if the API is ever bound outside loopback. |
 
 ---
 
 ## 8. Decisions only the owner can make
 
-1. **Trust boundary.** Is the API loopback-only forever (then §8.1 must be amended to say so), or must it authenticate (then the session layer extends to `/api/*` and ownership checks become mandatory)? Everything about D1/D3 follows from this.
+1. **Trust boundary.** **Answered 2026-10-30:** the API authenticates. `/api/*` answers only through a principal (a bearer credential from `npm run token`, or the browser's session), the browser gets that session only by opening a one-time link `npm run login` minted locally, and a non-loopback bind refuses to start without two explicit opt-ins. ADR-0011 records the reasoning; §8.1 needs no amendment, and §3.4's "no authentication" reading is what changed. The open sub-decision is the one ADR-0011 §6 leaves: whether to install TLS before `API_ALLOW_EXTERNAL_BIND` is ever set.
 2. **Candidate model.** Confirm "single tenant, N seeded candidates, no registration", so §2.2/§1.7 can be amended once rather than repeatedly.
 3. **Cross-source dedupe.** In scope for the MVP or explicitly out? D8 stays open until this is answered.
 4. **NestJS.** The SRS names it; the code uses Fastify. Record the substitution, or schedule a rewrite (not recommended — it buys nothing here).

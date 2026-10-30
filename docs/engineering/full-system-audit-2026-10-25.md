@@ -35,7 +35,9 @@ The system is **not safe to operate as-is**, for four independent reasons:
    so the detection gap that made this outage invisible is open.)*
 2. **There is no authorization boundary.** Every JSON route and the web "login" trust a
    caller-supplied `userId`; the only control is the default loopback binding, and even the `Host`
-   header is unchecked (DNS rebinding).
+   header is unchecked (DNS rebinding). *(Closed 2026-10-30 — see H2 and ADR-0011: identity comes
+   from a signed credential or the session, `Host`/`Origin` are checked, and a non-loopback bind
+   fails closed. TLS on such a bind is still not implemented.)*
 3. **A crash during collection can disable a source for its whole schedule interval.** Work-task
    retries exhaust before the stale-run reaper is allowed to act, and nothing re-enqueues the
    source after reaping.
@@ -134,6 +136,24 @@ Telegram alerts. SRS 8.1/8.2 require authentication and server-side ownership.
 token (or Unix socket) for `/api/*`; enforce ownership in the service/repository layer; validate
 `Host`/`Origin`; fail closed when `API_HOST` is not loopback unless auth and TLS are explicitly
 enabled; require a session to mint Telegram link tokens.
+
+**Resolved 2026-10-30, except the TLS half.** ADR-0011 records the decision; the implementation came
+in four commits. Identity is now read only from a principal that a root `preHandler` proves before
+any route runs — a bearer credential the deployment signed, or the browser's session — deny-by-path,
+so a route added later is covered without its author remembering to ask. Every `userId` the caller
+names is refused with 400 rather than ignored, on `/api/*` and on the pages alike. The browser earns
+its session by opening a signed, 60-second, single-use link that only `npm run login` can mint, and
+the candidate chooser that handed out sessions for any stored id is gone; `npm run token` covers
+scripted callers. `/matches/:id` compares the row's owner to the principal and answers a foreign
+match with the same 404 a missing one gets. `Host` is allowlisted, mutating requests must be
+same-origin, and a non-loopback `API_HOST` now refuses to boot without
+`API_ALLOW_EXTERNAL_BIND=true` and `API_ALLOWED_HOSTS`. The sign-in code lives in a query parameter,
+and Fastify 4 cannot redact just the query, so request logging is this process's own and writes the
+path, never the URL (SRS 8.5). What remains open is the "unless … TLS" clause: the bind fails closed
+and names its hosts, but opting in does not require a certificate, so an externally bound API is
+still cleartext. Two consequences the operator should know: signature buys unforgeability, not
+revocation, so rotating `AUTH_SECRET` invalidates every outstanding link, token and session; and a
+session is in-memory, so a restart logs the browser out.
 
 #### H3 — A crash during collection can dead-letter recovery and idle the source for 3–6 hours — **new, verified**
 
@@ -568,7 +588,7 @@ mixed-type comparison instead.
 | FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but ordering assumption and races remain (M1/M2/M6) |
 | FR-020 health | Yield-drift detection added 2026-10-28; unscheduled-source staleness still open (H7) |
 | FR-021 backup | Scripts + schema-aware drill; copy/retention/schedule commands exist but no encrypted off-machine copy or installed task (M7) |
-| SRS 8.1/8.2 auth/ownership | Not met (H2) |
+| SRS 8.1/8.2 auth/ownership | Met 2026-10-30 (H2, ADR-0011); TLS for an externally bound API still absent |
 | SRS 6.5 accessibility | Mostly met; unlabeled textareas/error association (M9) |
 | SRS 7.8 observability | Yield drift added 2026-10-28; funnel page and matched/notified metrics still missing (L8) |
 | AC-017 / AC-020 | Not met (D13/D21) |
@@ -620,7 +640,9 @@ marked theoretical or downgraded.
 ### P1 — this week
 
 5. **Authorization/Host/Origin (H2)**: session-derived identity, API token, ownership checks,
-   Telegram-link session requirement, loopback fail-closed.
+   Telegram-link session requirement, loopback fail-closed. **Done 2026-10-30** — ADR-0011, and the
+   web sign-in is a one-time local code rather than a `?userId=` link. TLS for an opted-in external
+   bind is the remaining half, and installing a certificate is the operator's step.
 6. **Yield-drift detection (H7)** and correct D20. **Done 2026-10-28** for a
    source that runs (median baseline, `DEGRADED`, warning); the unscheduled-source
    staleness signal is still open, and D20 stays PARTIAL for it.

@@ -51,7 +51,9 @@ Node's `--env-file`, so `.env` must exist. Tests load it themselves (`tests/supp
 | `DATABASE_URL` | API, worker, Prisma CLI, seeds | yes | PostgreSQL connection string |
 | `TEST_DATABASE_URL` | integration + failure tests | for those tests | Must name a database ending in `_test`; its rows are TRUNCATEd |
 | `SHADOW_DATABASE_URL` | `prisma migrate dev` only | no | This project does not use `migrate dev` |
-| `API_HOST` / `API_PORT` | API | no (defaults) | `127.0.0.1` / `3001` |
+| `API_HOST` / `API_PORT` | API | no (defaults) | `127.0.0.1` / `3001`; a non-loopback host needs the two opt-ins below |
+| `AUTH_SECRET` | API, `npm run login`, `npm run token` | **yes** | ≥32 bytes; signs sign-in links and API credentials. Rotating it invalidates every outstanding credential |
+| `API_ALLOW_EXTERNAL_BIND` / `API_ALLOWED_HOSTS` | API | no | The pair that lets the API bind a non-loopback address and the `Host` names it will answer to |
 | `TELEGRAM_BOT_USERNAME` | API | no | Renders the `t.me` deep link |
 | `TELEGRAM_BOT_TOKEN` | worker, `telegram:resolve` | no at start | Without it the worker runs but does not dispatch |
 | `SOURCE_STALE_RUN_SECONDS` | worker | **yes** | Bound for reaping an abandoned source run; `900` is the value observed working |
@@ -84,8 +86,20 @@ npm run start:api
 npm run start:worker
 ```
 
-The JSON API has **no authentication**; it binds to loopback by default and must not be exposed
-(drift report D1). The web pages use a session cookie plus a CSRF token (ADR-0009).
+Nothing here answers about a candidate until it has proved who is asking (ADR-0011). The web pages
+need a session, and a session starts only by opening a one-time link a local command minted:
+
+```bash
+npm run login            # prints a sign-in link, valid 60 seconds, for the one stored candidate
+npm run login -- --email you@example.com   # names a candidate when several are seeded
+npm run token            # a bearer credential for scripted calls to /api/*
+```
+
+`AUTH_SECRET` (≥32 bytes) signs both, is required at boot, and must never be committed or logged.
+Rotating it invalidates every outstanding link, token and session — that rotation is the only
+revocation there is. The API binds loopback by default and refuses a non-loopback `API_HOST` unless
+`API_ALLOW_EXTERNAL_BIND=true` and `API_ALLOWED_HOSTS` name the hosts it may answer to; there is no
+TLS yet, so do not set that on a routable interface.
 
 ## Database
 
@@ -163,9 +177,9 @@ build: the UI is server-rendered HTML.
 
 ## Known gaps
 
-No API authentication, no installed backup schedule (the backup and restore-drill scripts exist and
-have been verified; scheduling and off-machine storage are deployment steps), no AI provider, no
-CI, and no cross-source deduplication. See the
+No TLS for an externally bound API, no installed backup schedule (the backup and restore-drill
+scripts exist and have been verified; scheduling and off-machine storage are deployment steps), no
+AI provider, no CI, and no cross-source deduplication. See the
 [drift report](docs/engineering/srs-implementation-drift-2026-10-23.md) for evidence and the
 smallest correction for each.
 
