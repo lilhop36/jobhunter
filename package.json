@@ -21,6 +21,8 @@
     "test:failure": "vitest --run tests/failure",
     "seed:sources": "node --env-file=.env scripts/seed-sources.mjs",
     "seed:candidate": "node --env-file=.env --import tsx scripts/seed-candidate.ts",
+    "login": "node --env-file=.env --import tsx scripts/login.ts",
+    "token": "node --env-file=.env --import tsx scripts/token.ts",
     "telegram:resolve": "node --env-file=.env --import tsx scripts/telegram-resolve.ts",
     "backup": "node --env-file=.env scripts/backup.mjs",
     "backup:drill": "node --env-file=.env scripts/restore-drill.mjs",
