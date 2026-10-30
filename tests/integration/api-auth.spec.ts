@@ -25,7 +25,7 @@ import { buildApi } from '../../apps/api/main';
  * before it reaches a handler.
  *
  * Sessions are created through the real store rather than by logging in, because the login flow is
- * the web pages' business and has its own suite (`web-mutations`); the guard only reads the cookie.
+ * the web pages' business and has its own suite (`web-sign-in`); the guard only reads the cookie.
  */
 
 const prisma = createTestPrismaClient();
@@ -137,12 +137,23 @@ describe('a caller that names a candidate in its own parameters', () => {
     expect(response.json().error.code).toBe('UNAUTHENTICATED');
   });
 
-  it('leaves a browser route that does take a userId alone', async () => {
-    // The guard is scoped to `/api/`: `/dashboard?userId=` is the web pages' own question, and the
-    // page policy is ADR-0009's, not this module's.
-    const response = await app.inject({ method: 'GET', url: '/dashboard?userId=anything' });
+  it('refuses a signed-in page the same way, and sends an anonymous one to sign in first', async () => {
+    // The guard covers the pages too (ADR-0011 §3): `/dashboard?userId=` used to *be* the login, and
+    // leaving it unrefused would leave a bookmark that silently shows somebody else's data.
+    const { cookie } = sessionCookies(userId);
 
-    expect(response.statusCode).not.toBe(400);
+    const signedIn = await app.inject({
+      method: 'GET',
+      url: '/dashboard?userId=0b6b5934-b42d-4b06-b203-5ddd4475d100',
+      headers: { cookie },
+    });
+    const anonymous = await app.inject({ method: 'GET', url: '/dashboard?userId=anything' });
+
+    expect(signedIn.statusCode).toBe(400);
+    expect(signedIn.json().error.code).toBe('VALIDATION_ERROR');
+    // Proof of nothing comes before a lesson about parameters.
+    expect(anonymous.statusCode).toBe(302);
+    expect(anonymous.headers.location).toBe('/login');
   });
 });
 

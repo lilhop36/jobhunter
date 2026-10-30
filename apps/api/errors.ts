@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { pathOf } from './url';
 
 /**
  * The SRS 3.4 error format, verbatim:
@@ -134,9 +135,12 @@ export function registerErrorHandler(app: FastifyInstance): void {
       .send(envelope(ERROR_CODES.INTERNAL_ERROR, 'An unexpected error occurred'));
   });
 
+  // The path, never the query string: an unmatched URL can carry a credential in its parameters (a
+  // sign-in link does), and echoing it into a response body puts that credential in whatever the
+  // caller's proxy or browser history keeps (SRS 8.5).
   app.setNotFoundHandler((request, reply) =>
     reply
       .code(404)
-      .send(envelope(ERROR_CODES.NOT_FOUND, `No route for ${request.method} ${request.url}`)),
+      .send(envelope(ERROR_CODES.NOT_FOUND, `No route for ${request.method} ${pathOf(request.url)}`)),
   );
 }

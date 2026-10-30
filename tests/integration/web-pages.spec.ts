@@ -21,15 +21,17 @@ import {
   truncateAll,
 } from '../support/db';
 import { testApiConfig } from '../support/api';
+import { cookieHeader, signIn, type Cookies } from '../support/web';
 import { buildApi } from '../../apps/api/main';
 
 /**
  * The read-only web pages (SRS 3.1, ADR-0007).
  *
- * What is pinned here is what a browser page owes that a JSON route does not: untrusted job text
- * is escaped (job titles and descriptions come from hostile sources), a stored URL only becomes a
- * link when it is http(s), unknown values stay visibly unknown rather than blank, the pages carry
- * the structural accessibility the SRS asks for, and none of them ships a script or an asset.
+ * What is pinned here is what a browser page owes that a JSON route does not: untrusted job text is
+ * escaped (job titles and descriptions come from hostile sources), a stored URL only becomes a link
+ * when it is http(s), unknown values stay visibly unknown rather than blank, the pages carry the
+ * structural accessibility the SRS asks for, none of them ships a script or an asset — and every one
+ * of them answers for the signed-in candidate only (ADR-0011).
  */
 
 const prisma = createTestPrismaClient();
@@ -39,6 +41,7 @@ let appPrisma: PrismaClient;
 let counter = 0;
 let userId: string;
 let profileVersion: string;
+let cookies: Cookies;
 
 const matches = new PrismaJobMatchRepository(prisma);
 const profiles = new PrismaCandidateProfileRepository(prisma);
@@ -64,6 +67,8 @@ beforeEach(async () => {
   app = api.app;
   appPrisma = api.prisma;
   await app.ready();
+
+  cookies = await signIn(app, userId);
 });
 
 afterEach(async () => {
@@ -121,10 +126,10 @@ async function createJob(
   return job.id;
 }
 
-async function createMatch(jobId: string): Promise<string> {
+async function createMatch(jobId: string, forUserId: string): Promise<string> {
   const inputHash = `web-hash-${counter++}`;
   await matches.saveIfChanged({
-    userId,
+    userId: forUserId,
     jobId,
     profileVersion,
     inputHash,
@@ -152,7 +157,7 @@ async function createMatch(jobId: string): Promise<string> {
     },
   });
   const stored = await matches.findByInput({
-    userId,
+    userId: forUserId,
     jobId,
     matcherVersion: MATCHER_VERSION,
     inputHash,
@@ -161,10 +166,11 @@ async function createMatch(jobId: string): Promise<string> {
   return stored.id;
 }
 
-const get = (url: string) => app.inject({ method: 'GET', url });
+const get = (url: string, as: Cookies = cookies) =>
+  app.inject({ method: 'GET', url, headers: { cookie: cookieHeader(as) } });
 
 describe('page shell', () => {
-  it('sends / to the dashboard', async () => {
+  it('sends a signed-in / to the dashboard', async () => {
     const response = await get('/');
 
     expect(response.statusCode).toBe(302);
@@ -195,10 +201,20 @@ describe('page shell', () => {
     expect(body).not.toContain('<link rel=');
     expect(body).not.toContain('<img');
   });
+
+  it('links its lists by cursor alone, with no candidate in any address', async () => {
+    const jobId = await createJob();
+    await createMatch(jobId, userId);
+
+    for (const body of [(await get('/dashboard')).body, (await get('/matches')).body]) {
+      expect(body).not.toContain('userId=');
+    }
+    expect((await get('/dashboard')).body).toContain('href="/matches"');
+  });
 });
 
 describe('GET /dashboard', () => {
-  it('explains the empty state when no candidate profile exists', async () => {
+  it('explains the empty state to a signed-in candidate whose profile is gone', async () => {
     await truncateAll(prisma);
 
     const response = await get('/dashboard');
@@ -210,7 +226,7 @@ describe('GET /dashboard', () => {
 
   it('prioritises best matches, high confidence, notification status and source health', async () => {
     const jobId = await createJob({ title: 'Senior Backend Engineer' });
-    const matchId = await createMatch(jobId);
+    const matchId = await createMatch(jobId, userId);
     await prisma.notificationOutbox.create({
       data: {
         userId,
@@ -237,26 +253,51 @@ describe('GET /dashboard', () => {
     // The unknown factor is named, not silently dropped: it is why the confidence is not higher.
     expect(response.body).toContain('Factors without evidence');
   });
+});
 
-  it('offers a choice instead of assuming one candidate when several profiles exist', async () => {
+describe('ownership across candidates', () => {
+  it("lists only the signed-in candidate's matches when several are scored", async () => {
     const other = await prisma.user.create({ data: { email: `other-${counter++}@example.test` } });
     await profiles.saveForUser({ userId: other.id, profile: profileFixture() });
 
-    const response = await get('/dashboard');
+    const mine = await createMatch(await createJob({ title: 'My Backend Role' }), userId);
+    const theirs = await createMatch(await createJob({ title: 'Their Backend Role' }), other.id);
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('Choose a candidate');
-    // Choosing is the login (ADR-0009), so the links establish a session rather than just
-    // re-render the same page with a query parameter.
-    expect(response.body).toContain(`/login?userId=${userId}`);
-    expect(response.body).toContain(`/login?userId=${other.id}`);
+    const response = await get('/matches');
+
+    expect(response.body).toContain('My Backend Role');
+    expect(response.body).not.toContain('Their Backend Role');
+    expect(response.body).toContain(`href="/matches/${mine}"`);
+    expect(response.body).not.toContain(`href="/matches/${theirs}"`);
+
+    // The other candidate's dashboard shows the mirror image, from the same code path.
+    const theirsPage = await get('/matches', await signIn(app, other.id));
+    expect(theirsPage.body).toContain('Their Backend Role');
+    expect(theirsPage.body).not.toContain('My Backend Role');
   });
 
-  it('answers 404 for a candidate id that has no profile', async () => {
-    const response = await get('/dashboard?userId=00000000-0000-4000-8000-000000000000');
+  it('answers a match belonging to another candidate exactly like no match at all', async () => {
+    // A different status would confirm the id exists and name someone else: a fact a page has no
+    // business publishing (SRS 8.2).
+    const other = await prisma.user.create({ data: { email: `else-${counter++}@example.test` } });
+    const theirs = await createMatch(await createJob({ title: 'Their Private Role' }), other.id);
+
+    const response = await get(`/matches/${theirs}`);
 
     expect(response.statusCode).toBe(404);
-    expect(response.body).toContain('No profile exists for that candidate');
+    expect(response.body).toContain('That match was not found');
+    expect(response.body).not.toContain('Their Private Role');
+  });
+
+  it('shows every collected job to a signed-in browser: jobs are shared, matches are not', async () => {
+    // The job list is collected data, not candidate data, so the page filters it by nothing. The
+    // boundary this suite pins is the candidate's own rows, above.
+    const jobId = await createJob({ title: 'Collected Role' });
+
+    const response = await get(`/jobs/${jobId}`);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('Collected Role');
   });
 });
 
@@ -365,7 +406,7 @@ describe('jobs pages', () => {
 describe('matches pages', () => {
   it('shows the factor breakdown, the explanation and the evidence for one match', async () => {
     const jobId = await createJob({ title: 'Platform Engineer', company: 'Acme' });
-    const matchId = await createMatch(jobId);
+    const matchId = await createMatch(jobId, userId);
 
     const response = await get(`/matches/${matchId}`);
 

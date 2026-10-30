@@ -4,7 +4,13 @@ import {
   verifyCredential,
   type CredentialRefusal,
 } from '@application/auth/credentials';
-import { getSession, parseCookies, SESSION_COOKIE, verifyCsrf } from '@application/web/session';
+import {
+  getSession,
+  parseCookies,
+  SESSION_COOKIE,
+  verifyCsrf,
+  type SessionData,
+} from '@application/web/session';
 import { normalizeHostname, type ApiConfig } from './config';
 import { decodeQueryKey, pathOf, queryOf } from './url';
 import { ApiError, ERROR_CODES } from './errors';
@@ -12,23 +18,30 @@ import { ApiError, ERROR_CODES } from './errors';
 /**
  * Who is asking (SRS 8.1, 8.2; ADR-0011).
  *
- * Every `/api/*` route except `/health` answers a request only through a principal, and a
- * principal's `userId` is the *only* place a route may read an identity from. That inversion is
- * the whole change: before, the caller named the user it wanted to act as and the route believed
- * it, which made ownership unenforceable no matter how carefully each repository filtered by
- * `userId`.
+ * Nothing in this process answers about a candidate until a hook has decided who the caller is. Two
+ * surfaces, one rule: every `/api/*` route except `/health` answers a request only through a
+ * principal, every browser page except the sign-in pair requires a session, and the `userId` a
+ * handler acts on is the *only* place an identity may be read from. That inversion is the whole
+ * change: before, the caller named the user it wanted to act as and the route believed it, which
+ * made ownership unenforceable no matter how carefully each repository filtered by `userId`.
  *
  * Two ways to become a principal:
  *
  *   - **`Authorization: Bearer <credential>`** — a signed API credential, minted locally by
  *     `npm run token` and bound to one candidate. This is the scripted path.
  *   - **the `jh_session` cookie** — the browser's session (ADR-0009), which is why the JSON API
- *     needs no separate login and no CORS affordance.
+ *     needs no separate login and no CORS affordance. A browser gets that cookie only by opening a
+ *     code minted by `npm run login`, which is what turned "whoever can reach the port is the
+ *     candidate" into "whoever can run a local command is the candidate".
  *
  * A bearer credential is refused *as a credential* rather than falling through to the cookie: a
  * caller that presented something invalid is not the same as a caller that presented nothing, and
  * silently ignoring the bad one would let a truncated token be answered from a session nobody
  * meant to send.
+ *
+ * The refusal is shaped by the surface, not by the finding: an API caller gets the SRS error
+ * envelope, a browser gets a redirect to the sign-in page. Neither is a fact about the candidate
+ * they asked for.
  */
 export interface Principal {
   readonly userId: string;
@@ -39,6 +52,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     /** Set by the guard below before any guarded handler runs; absent on public routes. */
     principal?: Principal;
+    /** Set by the guard below before any page handler runs; the session behind `principal`. */
+    session?: SessionData;
   }
 }
 
@@ -51,29 +66,62 @@ export function isGuarded(url: string): boolean {
   return pathOf(url).startsWith('/api/');
 }
 
+/**
+ * The paths a browser may reach with no session at all.
+ *
+ * `/login` is the page that creates a session and `/logout` ends one that may already have expired,
+ * so guarding either would make the sign-in flow unreachable — or, for logout, unendable. `/health`
+ * is guarded by path instead, and listed here so it does not become a page. Everything else is a
+ * page, including paths that match no route: an unknown URL is not allowed to answer as if it were
+ * public.
+ */
+const PUBLIC_PAGE_PATHS = new Set(['/login', '/logout', '/health']);
+
+/** Whether this request is for a browser page that owes a session. */
+export function isPage(url: string): boolean {
+  return !isGuarded(url) && !PUBLIC_PAGE_PATHS.has(pathOf(url));
+}
+
 const NON_MUTATING = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
- * Install the two hooks the API's authorization rests on.
+ * Install the hooks the authorization rests on.
  *
- * They are hooks rather than per-route `preHandler`s so that a route added next month is covered
- * by default. The guard is therefore deny-by-path: anything under `/api/` needs a principal, and
- * opting out means editing this file.
+ * They are hooks rather than per-route `preHandler`s so that a route added next month is covered by
+ * default. The guard is therefore deny-by-path: anything under `/api/` needs a principal, anything
+ * that is not a public page needs a session, and opting out means editing this file.
  */
 export function registerAuthGuards(app: FastifyInstance, deps: AuthGuardsDeps): void {
   app.addHook('onRequest', async (request) => {
     rejectMisdirectedRequest(request, deps.config);
   });
 
-  app.addHook('preHandler', async (request) => {
-    if (!isGuarded(request.url)) return;
-    const principal = resolvePrincipal(request, deps.config);
+  app.addHook('preHandler', async (request, reply) => {
+    if (isGuarded(request.url)) {
+      const principal = resolvePrincipal(request, deps.config);
 
-    // Answered after the principal, not before: an unauthenticated caller is refused as such, and
-    // is not owed a lesson about their parameters.
+      // Answered after the principal, not before: an unauthenticated caller is refused as such, and
+      // is not owed a lesson about their parameters.
+      refuseCallerNamedIdentity(request);
+
+      request.principal = principal;
+      return;
+    }
+
+    if (!isPage(request.url)) return;
+
+    const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+    if (session === null) return void reply.redirect('/login');
+
+    // The same refusal the API owes a stale bookmark or an old script: a page that silently ignored
+    // `?userId=` would show the signed-in candidate's data to someone who believes they asked for
+    // somebody else's.
     refuseCallerNamedIdentity(request);
 
-    request.principal = principal;
+    // A page is a cookie-authenticated surface, so it gets the same principal shape as the API: the
+    // handler reads an identity the guard proved, and cannot be aimed at anyone else.
+    request.session = session;
+    request.principal = { userId: session.userId, via: 'session' };
   });
 }
 
@@ -115,8 +163,8 @@ export function resolvePrincipal(request: FastifyRequest, config: ApiConfig): Pr
  * first. Removing them from the schemas would leave a caller who still sends one getting an answer
  * about themselves while believing they asked about somebody else — a silently ignored parameter is
  * the worst outcome, because the request succeeds. So the parameter is rejected out loud instead,
- * on every guarded route, from here rather than from each route's schema: no route added later can
- * forget to declare it, and none can accept it.
+ * on every route and page this guard covers, from here rather than from each route's schema: no
+ * handler added later can forget to declare it, and none can accept it.
  */
 export function refuseCallerNamedIdentity(request: FastifyRequest): void {
   if (queryNamesUserId(request.url) || bodyNamesUserId(request.body)) {
@@ -232,6 +280,28 @@ export function principalOf(request: FastifyRequest): Principal {
     );
   }
   return request.principal;
+}
+
+/**
+ * The browser session behind a page's principal.
+ *
+ * A page handler needs one thing from it that the principal does not carry: the CSRF token to put
+ * in the form, so the POST coming back can be recognised as the same browser's. Identity still comes
+ * from `principalOf` — this is the token, not the candidate.
+ *
+ * Absent session means the guard was skipped, which is a bug in this file rather than a caller
+ * error, so it is a 500 and not a redirect: a page that rendered a form with no session would show
+ * a token nobody can echo.
+ */
+export function sessionOf(request: FastifyRequest): SessionData {
+  if (request.session === undefined) {
+    throw new ApiError(
+      ERROR_CODES.INTERNAL_ERROR,
+      'This page was reached without a browser session',
+      500,
+    );
+  }
+  return request.session;
 }
 
 /**

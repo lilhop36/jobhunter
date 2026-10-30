@@ -18,15 +18,16 @@ import {
   truncateAll,
 } from '../support/db';
 import { testApiConfig } from '../support/api';
+import { cookieHeader, csrfFrom, signIn, type Cookies } from '../support/web';
 import { buildApi } from '../../apps/api/main';
 
 /**
- * The mutating web pages (SRS 3.1; ADR-0009): `/profile`, `/settings`, `/settings/telegram`,
- * `/login`, `/logout`.
+ * The mutating web pages (SRS 3.1; ADR-0009, ADR-0011): `/profile`, `/settings`,
+ * `/settings/telegram`.
  *
- * What is pinned here is what a form owes that a JSON route does not: a session the browser is
- * given on first render, a CSRF token a forged cross-origin POST cannot produce, validation that
- * rejects rather than silently stores a different profile, and a save that takes the same path as
+ * What is pinned here is what a form owes that a JSON route does not: a session the browser had to
+ * sign in for, a CSRF token a forged cross-origin POST cannot produce, validation that rejects
+ * rather than silently stores a different profile, and a save that takes the same path as
  * `PUT /api/profile` (same repository, same re-score request).
  */
 
@@ -38,6 +39,7 @@ let appPrisma: PrismaClient;
 let counter = 0;
 let userId: string;
 let profileVersion: string;
+let cookies: Cookies;
 
 const BOT_USERNAME = 'jobhunterethiobot';
 
@@ -62,6 +64,8 @@ beforeEach(async () => {
   app = api.app;
   appPrisma = api.prisma;
   await app.ready();
+
+  cookies = await signIn(app, userId);
 });
 
 afterEach(async () => {
@@ -93,39 +97,20 @@ function profileFixture(): UnversionedCandidateProfile {
   };
 }
 
-type Cookies = Record<string, string>;
-
-function cookieHeader(cookies: Cookies): string {
-  return Object.entries(cookies)
-    .map(([name, value]) => `${name}=${value}`)
-    .join('; ');
-}
-
-function cookiesOf(response: { cookies: Array<{ name: string; value: string }> }): Cookies {
-  const jar: Cookies = {};
-  for (const cookie of response.cookies) jar[cookie.name] = cookie.value;
-  return jar;
-}
-
-/** The hidden CSRF field of the rendered form. */
-function csrfFrom(body: string): string {
-  return /name="_csrf" value="([^"]*)"/.exec(body)?.[1] ?? '';
-}
-
-const get = (url: string, cookies?: Cookies) =>
+const get = (url: string, as: Cookies = cookies) =>
   app.inject({
     method: 'GET',
     url,
-    ...(cookies === undefined ? {} : { headers: { cookie: cookieHeader(cookies) } }),
+    headers: { cookie: cookieHeader(as) },
   });
 
-const post = (url: string, payload: string, cookies?: Cookies) =>
+const post = (url: string, payload: string, as: Cookies = cookies) =>
   app.inject({
     method: 'POST',
     url,
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
-      ...(cookies === undefined ? {} : { cookie: cookieHeader(cookies) }),
+      cookie: cookieHeader(as),
     },
     payload,
   });
@@ -139,18 +124,16 @@ async function createSource(name = `mutations-src-${counter++}`): Promise<string
 }
 
 describe('session handshake', () => {
-  it('renders the editor and gives the browser a session and a CSRF token', async () => {
+  it('renders the editor with the CSRF token of the session the browser signed in with', async () => {
     const response = await get('/profile');
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('<form method="post" action="/profile">');
-
-    const cookies = cookiesOf(response);
-    expect(cookies.jh_session).toBeTruthy();
-    expect(cookies.jh_csrf).toBeTruthy();
-    // The form echoes the readable CSRF cookie, and the session cookie itself is never rendered.
+    // The token is the one this session was issued, readable so the form can echo it; the session
+    // cookie itself is HttpOnly and never rendered.
     expect(csrfFrom(response.body)).toBe(cookies.jh_csrf);
     expect(response.body).not.toContain(cookies.jh_session as string);
+    expect(response.cookies).toEqual([]);
   });
 
   it('allows a same-origin form post and nothing else, in the page policy', async () => {
@@ -161,62 +144,41 @@ describe('session handshake', () => {
     expect(policy).toContain("default-src 'none'");
   });
 
-  it('signs in through the chooser and then stops asking which candidate', async () => {
+  it('shows each session its own candidate once several are stored', async () => {
     const other = await prisma.user.create({ data: { email: `other-${counter++}@example.test` } });
     await profiles.saveForUser({
       userId: other.id,
       profile: { ...profileFixture(), experienceYears: 11 },
     });
 
-    const chooser = await get('/dashboard');
-    expect(chooser.body).toContain(`/login?userId=${other.id}`);
-
-    const login = await get(`/login?userId=${other.id}`);
-    expect(login.statusCode).toBe(302);
-    expect(login.headers.location).toBe('/dashboard');
-    expect(cookiesOf(login).jh_session).toBeTruthy();
-
-    const dashboard = await get('/dashboard', cookiesOf(login));
-    expect(dashboard.body).not.toContain('Choose a candidate');
-
-    const profile = await get('/profile', cookiesOf(login));
-    expect(profile.body).toContain('value="11"');
-  });
-
-  it('clears the session on logout, so the chooser returns', async () => {
-    const other = await prisma.user.create({ data: { email: `other-${counter++}@example.test` } });
-    await profiles.saveForUser({ userId: other.id, profile: profileFixture() });
-
-    // With two candidates, signing in is what makes the dashboard stop asking.
-    const cookies = cookiesOf(await get(`/login?userId=${userId}`));
-    expect((await get('/dashboard', cookies)).body).not.toContain('Choose a candidate');
-
-    const logout = await get('/logout', cookies);
-    expect(logout.statusCode).toBe(302);
-    expect(logout.headers.location).toBe('/login');
-    expect(JSON.stringify(logout.headers['set-cookie'])).toContain('Max-Age=0');
-
-    // The cookie is gone from the session store, not merely re-sent.
-    expect((await get('/dashboard', cookies)).body).toContain('Choose a candidate');
+    expect((await get('/profile')).body).toContain('value="5"');
+    expect((await get('/profile', await signIn(app, other.id))).body).toContain('value="11"');
   });
 });
 
 describe('POST /profile', () => {
-  it('refuses a save without a session or a matching token, and stores nothing', async () => {
-    const page = await get('/profile');
-    const cookies = cookiesOf(page);
+  it('refuses a save whose token does not match the session, and stores nothing', async () => {
+    // The session is real, so this is the CSRF half alone: a cross-site form that rides the cookie
+    // but cannot read the token out of the page it did not originate.
+    const response = await post('/profile', '_csrf=not-the-token');
 
-    const noSession = await post('/profile', '_csrf=whatever');
-    const wrongToken = await post('/profile', '_csrf=not-the-token', cookies);
+    expect(response.statusCode).toBe(403);
+    expect(response.body).toContain('form token is missing or wrong');
+    expect((await profiles.findForUser(userId))?.profileVersion).toBe(profileVersion);
+  });
 
-    expect(noSession.statusCode).toBe(403);
-    expect(wrongToken.statusCode).toBe(403);
+  it('refuses a save that names the candidate in its own body', async () => {
+    // ADR-0011 removed `userId` from the page routes too, and a form that still sends one is told so
+    // rather than quietly answered about the person who signed in.
+    const response = await post('/profile', '_csrf=whatever&userId=0b6b5934-b42d-4b06-b203-5ddd4475d100');
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('VALIDATION_ERROR');
     expect((await profiles.findForUser(userId))?.profileVersion).toBe(profileVersion);
   });
 
   it('rejects an invalid field, shows the form again filled in, and stores nothing', async () => {
     const page = await get('/profile');
-    const cookies = cookiesOf(page);
 
     const response = await post(
       '/profile',
@@ -229,7 +191,6 @@ describe('POST /profile', () => {
         targetRoles: '',
         locationPreferences: '',
       }).toString(),
-      cookies,
     );
 
     expect(response.statusCode).toBe(400);
@@ -241,7 +202,6 @@ describe('POST /profile', () => {
   it('saves the submitted profile and requests the same re-score as the JSON route', async () => {
     await createSource();
     const page = await get('/profile');
-    const cookies = cookiesOf(page);
 
     const response = await post(
       '/profile',
@@ -257,7 +217,6 @@ describe('POST /profile', () => {
         targetRoles: 'Platform Engineer',
         locationPreferences: 'ETHIOPIA_REMOTE | anywhere',
       }).toString(),
-      cookies,
     );
 
     expect(response.statusCode).toBe(302);
@@ -280,7 +239,6 @@ describe('POST /profile', () => {
   it('enqueues nothing when the saved profile is unchanged', async () => {
     await createSource();
     const page = await get('/profile');
-    const cookies = cookiesOf(page);
 
     // Submit the stored profile back, unchanged.
     const response = await post(
@@ -298,7 +256,6 @@ describe('POST /profile', () => {
         targetRoles: 'Backend Engineer',
         locationPreferences: 'ADDIS_ABABA',
       }).toString(),
-      cookies,
     );
 
     expect(response.statusCode).toBe(302);
@@ -318,9 +275,8 @@ describe('/settings/telegram', () => {
 
   it('mints a one-use link for the signed-in candidate and sends the browser to Telegram', async () => {
     const page = await get('/settings/telegram');
-    const cookies = cookiesOf(page);
 
-    const response = await post('/settings/telegram', `_csrf=${csrfFrom(page.body)}`, cookies);
+    const response = await post('/settings/telegram', `_csrf=${csrfFrom(page.body)}`);
 
     expect(response.statusCode).toBe(302);
     expect(String(response.headers.location)).toMatch(
@@ -334,11 +290,24 @@ describe('/settings/telegram', () => {
   });
 
   it('refuses to mint a link without a matching token', async () => {
-    const page = await get('/settings/telegram');
+    await get('/settings/telegram');
 
-    const response = await post('/settings/telegram', '_csrf=wrong', cookiesOf(page));
+    const response = await post('/settings/telegram', '_csrf=wrong');
 
     expect(response.statusCode).toBe(403);
+    expect(await prisma.telegramLinkToken.count()).toBe(0);
+  });
+
+  it('mints for the session, not for a candidate the form names', async () => {
+    const victim = await prisma.user.create({ data: { email: `victim-${counter++}@example.test` } });
+    await profiles.saveForUser({ userId: victim.id, profile: profileFixture() });
+
+    const response = await post(
+      '/settings/telegram',
+      new URLSearchParams({ _csrf: cookies.jh_csrf as string, userId: victim.id }).toString(),
+    );
+
+    expect(response.statusCode).toBe(400);
     expect(await prisma.telegramLinkToken.count()).toBe(0);
   });
 

@@ -2,13 +2,14 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { MATCHER_VERSION } from '@domain/matching';
 import { NOTIFICATION_ELIGIBILITY_VERSION, NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
 import type { MatchFactorScores } from '@domain/types';
+import { LOGIN_CODE_TTL_MS, type NonceRegistry } from '@application/auth/credentials';
+import { openSignInCode } from '@application/auth/sign-in';
 import { CreateTelegramLinkToken } from '@application/telegram';
 import {
   clearSetCookie,
   createSession,
   csrfSetCookie,
   deleteSession,
-  getSession,
   parseCookies,
   sessionSetCookie,
   verifyCsrf,
@@ -25,6 +26,7 @@ import type { JobSourceRepository, SourceDetail } from '@ports/job-source-reposi
 import type { NotificationRecord, NotificationRepository } from '@ports/notification-repository';
 import type { TelegramLinkTokenStore } from '@ports/telegram-linking';
 import { encodeCursor } from '../cursor';
+import { principalOf, sessionOf } from '../auth';
 import { UUID_PATTERN } from '../schemas';
 import { errorPage, html, page, sendPage, type Html, type NavKey } from '../web/html';
 import { formValuesFromInput, parseProfileForm, profileForm, toFormValues } from '../web/profile-form';
@@ -33,19 +35,22 @@ import { decodeMatchCursor, unknownFactors } from './matches';
 import { saveProfile, toProfile, type ProfileRoutesDeps } from './profile';
 
 /**
- * The web pages (SRS 3.1; ADR-0007 read-only, ADR-0009 mutations): `/dashboard`, `/jobs`,
- * `/jobs/:id`, `/matches`, `/matches/:id`, `/profile`, `/settings`, `/settings/telegram`,
+ * The web pages (SRS 3.1; ADR-0007 read-only, ADR-0009 mutations, ADR-0011 sign-in): `/dashboard`,
+ * `/jobs`, `/jobs/:id`, `/matches`, `/matches/:id`, `/profile`, `/settings`, `/settings/telegram`,
  * `/login`, `/logout`.
  *
  * The read pages never show a fact the JSON API would not publish, every stored value is escaped by
  * the template, and a URL only becomes a link when it is http(s) — job text is untrusted input.
  *
- * The mutating pages (`/profile`, `/settings/telegram`) sit behind a session and a double-submit
- * CSRF token (ADR-0009): `jh_session` is HttpOnly, `jh_csrf` is readable and echoed into each form,
- * and a POST is accepted only when the two agree. There is no password — v1 is a personal,
- * loopback tool, and choosing a candidate *is* the login.
+ * Every page below is behind the session guard in `apps/api/auth.ts`: a handler reads its candidate
+ * from the principal the guard proved and never from a parameter, so a page cannot be aimed at
+ * somebody else by editing its URL. The two mutating form posts add the double-submit CSRF token on
+ * top of that (ADR-0009): `jh_session` is HttpOnly, `jh_csrf` is readable and echoed into each form,
+ * and a POST is accepted only when the two agree.
  *
- * The candidate is never hard-coded: the session names one, a second candidate is data.
+ * There is no password, and there is no candidate chooser either: a session starts when the operator
+ * opens a one-time link that only a local command can mint (ADR-0011 §3). The candidate is never
+ * hard-coded — the session names one, and a second candidate is a second sign-in.
  */
 export interface WebRoutesDeps {
   profiles: CandidateProfileRepository;
@@ -59,6 +64,10 @@ export interface WebRoutesDeps {
   telegramTokens: TelegramLinkTokenStore;
   /** The bot's public username, from configuration; absent means linking is not configured. */
   botUsername?: string;
+  /** The key a sign-in code must have been signed with to open a session (ADR-0011). */
+  authSecret: string;
+  /** Which codes have already been opened, so a second click of one link buys nothing. */
+  loginCodes: NonceRegistry;
 }
 
 const PAGE_LIMIT = 25;
@@ -101,7 +110,7 @@ of the profile the evidence covers.
 
 <h2>Best matches</h2>
 ${best.length === 0 ? html`<p class="muted">No jobs have been scored yet.</p>` : matchTable(best, jobs)}
-<p><a href="/matches?userId=${profile.userId}">All matches</a></p>
+<p><a href="/matches">All matches</a></p>
 
 <h2>High-confidence matches</h2>
 <p class="muted">
@@ -154,7 +163,7 @@ ${sources.sources.length === 0
     const body = html`${result.matches.length === 0
       ? html`<p class="muted">No matches have been scored for this candidate.</p>`
       : matchTable(result.matches, jobs)}
-${nextPageLink('/matches', { userId: profile.userId }, result.nextCursor && encodeCursor(result.nextCursor))}`;
+${nextPageLink('/matches', result.nextCursor && encodeCursor(result.nextCursor))}`;
 
     return sendPage(
       reply,
@@ -168,13 +177,15 @@ ${nextPageLink('/matches', { userId: profile.userId }, result.nextCursor && enco
     if (!isUuid(id)) return sendPage(reply, 400, errorPage(400, 'That match id is not valid.'));
 
     const match = await deps.matches.findById(id);
-    if (match === null) {
+    // Another candidate's match is answered exactly like no match at all. A different status would
+    // be a fact about the id — that it exists, and belongs to somebody you are not (SRS 8.2).
+    if (match === null || match.userId !== principalOf(request).userId) {
       return sendPage(reply, 404, errorPage(404, 'That match was not found.'));
     }
     // The SRS 3.1 match detail includes the job's own facts; the match row alone has none of them.
     const job = await deps.jobs.findJob(match.jobId);
 
-    const body = html`<p><a href="/matches?userId=${match.userId}">Back to matches</a></p>
+    const body = html`<p><a href="/matches">Back to matches</a></p>
 <dl>
 <dt>Score</dt><dd>${formatPercent(match.score)} / 100</dd>
 <dt>Confidence</dt><dd>${formatPercent(match.confidence)} / 100</dd>
@@ -232,7 +243,7 @@ ${listOrNone('Uncertain evidence', match.uncertainEvidence)}`;
     const body = html`${result.jobs.length === 0
       ? html`<p class="muted">No jobs have been collected yet.</p>`
       : jobTable(result.jobs)}
-${nextPageLink('/jobs', {}, result.nextCursor && encodeCursor({
+${nextPageLink('/jobs', result.nextCursor && encodeCursor({
   createdAt: result.nextCursor.createdAt.toISOString(),
   id: result.nextCursor.id,
 }))}`;
@@ -286,42 +297,36 @@ ${provenanceHtml(job.provenance)}`;
   });
 
   // ---------------------------------------------------------------------------------------------
-  // Sessions (ADR-0009)
+  // Sessions (ADR-0009, ADR-0011)
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * Choosing a candidate is the only "login": no password, because v1 is a personal, loopback tool
-   * (ADR-0009 §2.3). The link carries the user id, so this is a state-changing GET — it mints
-   * nothing secret (the token is random either way) and a form would ask the user to type a value
-   * they cannot see.
+   * Opening a sign-in link is the only way a browser becomes somebody (SRS 8.1; ADR-0011 §3).
+   *
+   * This used to be `?userId=`: whoever reached the port could name any stored candidate and the
+   * server handed out a session for them, which is the hole the audit called H2. The link carries a
+   * signed claim instead, so the `userId` is one only `npm run login` can put there — and it is worth
+   * one click, because the code is consumed here and expires a minute after it was minted.
+   *
+   * There is deliberately no list of candidates on this page. A chooser is a link anyone who can
+   * reach the port can click, and clicking it *was* the login; with several candidates, signing in as
+   * a particular one is `npm run login -- --email …`, which is the same local-command authority the
+   * rest of the deployment already assumes.
+   *
+   * A refusal quotes nothing of what was presented: the string in this parameter is a credential, and
+   * SRS 8.5 keeps credentials out of anything an operator might paste or screenshot.
    */
   app.get('/login', async (request, reply) => {
-    const { userId } = request.query as { userId?: string };
-    if (userId !== undefined && isUuid(userId)) {
-      const profile = await deps.profiles.findForUser(userId);
-      if (profile !== null) {
-        const { sessionToken, csrfToken } = createSession(profile.userId);
-        return reply
-          .header('set-cookie', [sessionSetCookie(sessionToken), csrfSetCookie(csrfToken)])
-          .redirect('/dashboard');
-      }
-    }
+    const { code } = request.query as { code?: string };
+    if (code === undefined) return sendPage(reply, 200, signInPage());
 
-    const stored = await deps.profiles.listProfiles();
-    const body =
-      stored.length === 0
-        ? html`<p class="muted">No candidate profile exists yet. Seed one with
-<code>npm run seed:candidate</code>.</p>`
-        : html`<p>Choose the candidate these pages should act for:</p>
-<ul class="plain">${stored.map(
-            (profile) =>
-              html`<li><a href="/login?userId=${profile.userId}">Profile ${profile.profileVersion}</a></li>`,
-          )}</ul>`;
-    return sendPage(
-      reply,
-      200,
-      page({ title: 'Sign in', heading: 'Sign in', body, current: 'dashboard' }),
-    );
+    const verdict = openSignInCode(deps.authSecret, deps.loginCodes, code);
+    if (!verdict.ok) return sendPage(reply, 401, signInPage(verdict.message));
+
+    const { sessionToken, csrfToken } = createSession(verdict.userId);
+    return reply
+      .header('set-cookie', [sessionSetCookie(sessionToken), csrfSetCookie(csrfToken)])
+      .redirect('/dashboard');
   });
 
   /**
@@ -345,9 +350,6 @@ ${provenanceHtml(job.provenance)}`;
     if (early !== null) return early;
     const { profile } = candidate as { profile: StoredCandidateProfile };
 
-    const session = activeSession(request, profile.userId);
-    if (session.setCookies !== null) reply.header('set-cookie', session.setCookies);
-
     return sendPage(
       reply,
       200,
@@ -355,7 +357,7 @@ ${provenanceHtml(job.provenance)}`;
         title: 'Edit profile',
         heading: 'Edit profile',
         current: 'profile',
-        body: profileForm(toFormValues(profile.profile), [], session.csrfToken),
+        body: profileForm(toFormValues(profile.profile), [], sessionOf(request).csrfToken),
       }),
     );
   });
@@ -384,11 +386,8 @@ ${provenanceHtml(job.provenance)}`;
     const candidate = await resolveCandidateForPage(request, deps.profiles);
     const early = earlyResponse(reply, candidate, 'settings');
     if (early !== null) return early;
-    const { profile } = candidate as { profile: StoredCandidateProfile };
 
-    const session = activeSession(request, profile.userId);
-    if (session.setCookies !== null) reply.header('set-cookie', session.setCookies);
-
+    const csrfToken = sessionOf(request).csrfToken;
     const headings = { title: 'Telegram notifications', heading: 'Telegram notifications', current: 'settings' as NavKey };
 
     if (deps.botUsername === undefined) {
@@ -406,7 +405,7 @@ ${provenanceHtml(job.provenance)}`;
     const body = html`<p>Notifications are delivered by the
 <a href="https://t.me/${deps.botUsername}">@${deps.botUsername}</a> bot.</p>
 <form method="post" action="/settings/telegram">
-<input type="hidden" name="_csrf" value="${session.csrfToken}">
+<input type="hidden" name="_csrf" value="${csrfToken}">
 <button type="submit">Link my Telegram account</button>
 </form>
 <p class="hint">You will be sent to Telegram to press Start. The link is one-use and expires in
@@ -424,9 +423,12 @@ ${provenanceHtml(job.provenance)}`;
    *  - the `application/x-www-form-urlencoded` parser belongs only to them. Registering it at the
    *    root would let the media type leak into the JSON API, where an unsupported content type must
    *    stay a 415 (a caller mistake) rather than being accepted and silently ignored;
-   *  - both are guarded the same way: a save needs a session and the CSRF token that session was
-   *    issued, and the two must agree. Without the session the token cannot be forged from another
-   *    origin, and without the token a cross-site form cannot ride the session cookie.
+   *  - both are guarded the same way, and by two different mechanisms doing different jobs: the
+   *    session guard in `apps/api/auth.ts` decides *who* is posting before this handler runs, and
+   *    the CSRF check below decides whether that someone is their own browser. A save therefore
+   *    needs a session the guard proved and the token that session was issued, and the two must
+   *    agree. Without the session the token cannot be forged from another origin, and without the
+   *    token a cross-site form cannot ride the session cookie.
    *
    * A malformed submission is rejected and shown again filled in; a profile save then takes the
    * same path as `PUT /api/profile` (same repository, same re-score request), so the two write
@@ -451,9 +453,9 @@ ${provenanceHtml(job.provenance)}`;
     );
 
     form.post('/profile', async (request, reply) => {
-      const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+      const session = sessionOf(request);
       const input = (request.body ?? {}) as Record<string, unknown>;
-      if (session === null || !verifyCsrf(session, input['_csrf'])) {
+      if (!verifyCsrf(session, input['_csrf'])) {
         return sendPage(
           reply,
           403,
@@ -490,9 +492,9 @@ ${provenanceHtml(job.provenance)}`;
      * body could otherwise aim someone else's notifications at the attacker's chat.
      */
     form.post('/settings/telegram', async (request, reply) => {
-      const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
+      const session = sessionOf(request);
       const input = (request.body ?? {}) as Record<string, unknown>;
-      if (session === null || !verifyCsrf(session, input['_csrf'])) {
+      if (!verifyCsrf(session, input['_csrf'])) {
         return sendPage(
           reply,
           403,
@@ -519,123 +521,77 @@ ${provenanceHtml(job.provenance)}`;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Session & candidate resolution
+// Candidate resolution & the sign-in page
 // ---------------------------------------------------------------------------------------------
 
 type CandidateResolution =
   | { kind: 'one'; profile: StoredCandidateProfile }
-  | { kind: 'none' }
-  | { kind: 'choose'; profiles: StoredCandidateProfile[] }
-  | { kind: 'missing'; userId: string };
+  | { kind: 'none' };
 
 /**
- * Candidate resolution for a page: the session's candidate when there is one, otherwise the
- * explicit `?userId=` override, otherwise the single stored profile, otherwise a chooser.
- * Session first, so an operator who has signed in is not re-asked on every page.
+ * The candidate a page shows: the one the session names, and no other.
+ *
+ * A page used to fall back through an explicit `?userId=`, then to the single stored profile, then
+ * to a chooser — three ways for a URL to decide whose data a page displays. The guard has already
+ * sent anyone without a session to `/login`, so what is left is one lookup. A session whose profile
+ * has since been deleted is the honest empty state, not a reason to show somebody else's.
  */
 async function resolveCandidateForPage(
   request: FastifyRequest,
   profiles: CandidateProfileRepository,
 ): Promise<CandidateResolution> {
-  const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
-  if (session !== null) {
-    const profile = await profiles.findForUser(session.userId);
-    // A session naming a user whose profile is gone falls through to the chooser below.
-    if (profile !== null) return { kind: 'one', profile };
-  }
-  const { userId } = request.query as { userId?: string };
-  return resolveCandidate(profiles, userId);
+  const profile = await profiles.findForUser(principalOf(request).userId);
+  return profile === null ? { kind: 'none' } : { kind: 'one', profile };
 }
 
 /**
- * The session a page should act through: the current one when it already names this candidate,
- * otherwise a freshly created one and the cookies the caller must set on the reply.
+ * The sign-in page, and the one failure it can show.
  *
- * Rendering a form goes through this, so the page always carries a CSRF token to echo back — even
- * for an operator who arrived without a session (a single stored profile needs no chooser).
+ * The page prints no candidate list and quotes no presented code: the first would be a chooser again,
+ * the second a credential in a page an operator might screenshot (SRS 8.5).
  */
-function activeSession(
-  request: FastifyRequest,
-  userId: string,
-): { csrfToken: string; setCookies: string[] | null } {
-  const session = getSession(parseCookies(request.headers.cookie)[SESSION_COOKIE]);
-  if (session !== null && session.userId === userId) {
-    return { csrfToken: session.csrfToken, setCookies: null };
-  }
-  const { sessionToken, csrfToken } = createSession(userId);
-  return { csrfToken, setCookies: [sessionSetCookie(sessionToken), csrfSetCookie(csrfToken)] };
+function signInPage(refusal?: string): Html {
+  const seconds = Math.round(LOGIN_CODE_TTL_MS / 1000);
+  return page({
+    title: 'Sign in',
+    heading: 'Sign in',
+    body: html`${refusal === undefined
+      ? html``
+      : html`<div class="errors"><p>${refusal}</p></div>`}
+<p>There is no password here. A sign-in link is minted on the machine this API runs on, and opening
+it starts one session for the candidate its signature names:</p>
+<p><code>npm run login</code></p>
+<p class="muted">A link works once and expires after ${seconds} seconds. To sign in as a different
+candidate, name them: <code>npm run login -- --email you@example.com</code>. To let a script read
+the JSON API instead, mint it a credential with <code>npm run token</code>.</p>`
+  });
 }
 
 /**
- * Resolution from an explicit `?userId=` (a manual URL, and the miss case a page reports as 404),
- * or from the stored profiles when there is no session to name one.
- */
-async function resolveCandidate(
-  profiles: CandidateProfileRepository,
-  userId: string | undefined,
-): Promise<CandidateResolution> {
-  if (userId !== undefined) {
-    if (!isUuid(userId)) return { kind: 'missing', userId };
-    const profile = await profiles.findForUser(userId);
-    return profile === null ? { kind: 'missing', userId } : { kind: 'one', profile };
-  }
-
-  const stored = await profiles.listProfiles();
-  const [only] = stored;
-  if (only === undefined) return { kind: 'none' };
-  if (stored.length === 1) return { kind: 'one', profile: only };
-  return { kind: 'choose', profiles: stored };
-}
-
-/**
- * The pages that need a candidate share three early answers: no profile yet, an unknown candidate,
- * and "which candidate?". Returns `null` when the caller may render the page.
+ * The one early answer a candidate-bearing page shares: a session that names no stored profile.
+ * Returns `null` when the caller may render the page.
  */
 function earlyResponse(
   reply: FastifyReply,
   resolution: CandidateResolution,
   current: NavKey,
 ): FastifyReply | null {
-  if (resolution.kind === 'missing') {
-    return sendPage(reply, 404, errorPage(404, 'No profile exists for that candidate.'));
-  }
+  if (resolution.kind !== 'none') return null;
 
-  if (resolution.kind === 'none') {
-    return sendPage(
-      reply,
-      200,
-      page({
-        title: 'No candidate profile',
-        heading: 'No candidate profile yet',
-        current,
-        body: html`<p>
-No candidate profile is stored, so there is nothing to score against. Seed one with
-<code>npm run seed:candidate</code>, or save it through <code>PUT /api/profile</code>.
+  return sendPage(
+    reply,
+    200,
+    page({
+      title: 'No candidate profile',
+      heading: 'No candidate profile yet',
+      current,
+      body: html`<p>
+You are signed in, but no candidate profile is stored for you, so there is nothing to score against.
+Seed one with <code>npm run seed:candidate</code>, or save it through <code>PUT /api/profile</code>
+or the <a href="/profile">profile editor</a>.
 </p>`,
-      }),
-    );
-  }
-
-  if (resolution.kind === 'choose') {
-    return sendPage(
-      reply,
-      200,
-      page({
-        title: 'Choose a candidate',
-        heading: 'Choose a candidate',
-        current,
-        body: html`<p>More than one candidate profile is stored. Choose one:</p>
-<ul>
-${resolution.profiles.map(
-  (profile) =>
-    html`<li><a href="/login?userId=${profile.userId}">Profile ${profile.profileVersion}</a></li>`,
-)}
-</ul>`,
-      }),
-    );
-  }
-
-  return null;
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -863,10 +819,13 @@ ${values.length === 0
   : html`<ul class="plain">${values.map((value) => html`<li>${value}</li>`)}</ul>`}`;
 }
 
-function nextPageLink(base: string, params: Record<string, string>, cursor: string | null): Html {
+/**
+ * The next page of a list. The cursor is the only parameter a page link carries: an identity in a
+ * URL would be an invitation to edit it, and the session already names the candidate.
+ */
+function nextPageLink(base: string, cursor: string | null): Html {
   if (cursor === null) return html``;
-  const query = new URLSearchParams({ ...params, cursor });
-  return html`<p><a href="${`${base}?${query.toString()}`}">Next page</a></p>`;
+  return html`<p><a href="${`${base}?${new URLSearchParams({ cursor }).toString()}`}">Next page</a></p>`;
 }
 
 /** Unknown is rendered as a word, not as an empty cell or a dash (SRS 3.1: never colour alone). */

@@ -7,11 +7,13 @@ import { PrismaCandidateProfileRepository } from '@infrastructure/ingestion/pris
 import { PrismaNotificationRepository } from '@infrastructure/matching/prisma-notification-repository';
 import { PrismaTelegramLinkRepository } from '@infrastructure/matching/prisma-telegram-link-repository';
 import { PrismaWorkTaskRepository } from '@infrastructure/work-tasks/prisma-work-task-repository';
+import { NonceRegistry } from '@application/auth/credentials';
 import { RequestMatchBackfill } from '@application/matching';
 import type { WorkerLogger } from '@ports/worker-logger';
 import { ApiConfig, ApiConfigError, parseApiConfig } from './config';
 import { registerAuthGuards } from './auth';
 import { registerErrorHandler } from './errors';
+import { registerRequestLogging } from './request-log';
 import { registerJobRoutes } from './routes/jobs';
 import { registerMatchRoutes } from './routes/matches';
 import { registerNotificationRoutes } from './routes/notifications';
@@ -45,13 +47,22 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
   const prisma = new PrismaClient({ datasources: { db: { url: config.databaseUrl } } });
   const app = Fastify({
     logger: process.env.NODE_ENV === 'test' ? false : { level: process.env.LOG_LEVEL ?? 'info' },
+    // Replaced by `registerRequestLogging` below, which logs the path and not the URL: a sign-in
+    // link is a one-time credential sitting in a query parameter, and Fastify's default line
+    // serialises the whole of `req.url` into every log (SRS 8.5; ADR-0011 §3).
+    disableRequestLogging: true,
   });
 
   registerErrorHandler(app);
+  registerRequestLogging(app);
+
+  // Codes this process has already opened. Per instance, like the session store: one process owns
+  // the browser's sign-in, and a restart only re-opens codes that are past their 60-second life.
+  const loginCodes = new NonceRegistry();
 
   // Registered before any route, because the guard is deny-by-path: every `/api/*` route needs a
-  // principal and a route added later is covered without its author remembering to ask (SRS 8.1,
-  // 8.2; ADR-0011).
+  // principal, every other page needs a session, and a route added later is covered without its
+  // author remembering to ask (SRS 8.1, 8.2; ADR-0011).
   registerAuthGuards(app, { config });
 
   app.get('/health', async () => ({ status: 'ok' }));
@@ -94,6 +105,8 @@ export async function buildApi(config: ApiConfig): Promise<ApiApp> {
     rescore,
     telegramTokens: new PrismaTelegramLinkRepository(prisma),
     botUsername: config.telegramBotUsername,
+    authSecret: config.authSecret,
+    loginCodes,
   });
 
   await registerNotificationRoutes(app, {
