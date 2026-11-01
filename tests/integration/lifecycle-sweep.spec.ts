@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DescriptionQuality, LifecycleStatus, SourceRunStatus } from '@domain/enums';
-import { silentWorkerLogger } from '@ports/worker-logger';
+import { LIFECYCLE_POLICY_VERSION } from '@domain/lifecycle/lifecycle-policy';
+import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
+import type { JobRepository, LifecycleStatusUpdate, UpsertJobInput } from '@ports/job-repository';
 import { SweepSourceLifecycle } from '@application/lifecycle';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
@@ -407,4 +409,146 @@ describe('lifecycle sweep - restoring and isolating', () => {
     expect(second).toEqual({ sourceId, examined: 1, retired: 0, restored: 0 });
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
+
+  // Audit M1, second half: presence restores on its own evidence. A run that read one page and
+  // could claim nothing about the rest may not retire, but it *did* see the jobs it captured, and
+  // a job it published again is proof the earlier retirement no longer holds. Before this, the
+  // handler only looked after a run that stated coverage, so such a job stayed REMOVED until some
+  // later run happened to claim a window.
+  it('restores a retired job observed by a run that claimed no coverage at all', async () => {
+    const sourceId = await createSource('s1');
+    // Observed at 06:00, inside the run that started at 00:00 - direct evidence of presence.
+    const jobId = await createJob(sourceId, 'back', OBSERVED_AFTER, LifecycleStatus.REMOVED);
+    await createRun(sourceId, {
+      startedAt: RUN_AT,
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
+
+    const result = await sweep.sweep(sourceId);
+
+    expect(result).toEqual({ sourceId, examined: 1, retired: 0, restored: 1 });
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+  });
 });
+
+describe('lifecycle reconciliation - compare-and-set (audit M1)', () => {
+  it('refuses to write over a status another writer moved after this pass read it', async () => {
+    const sourceId = await createSource('s1');
+    const staleJobId = await createJob(sourceId, 'a', OBSERVED_BEFORE);
+    const freshJobId = await createJob(sourceId, 'b', OBSERVED_BEFORE);
+    await createRun(sourceId);
+
+    const candidates = await jobs.listLifecycleCandidates(sourceId);
+    expect(candidates).toHaveLength(2);
+    // Both are ACTIVE and both are absent from a listing the run read to the end, so both are
+    // decided REMOVED. Then one of them moves underneath the pass, as it would under a second
+    // worker or the deadline policy.
+    await prisma.job.update({
+      where: { id: staleJobId },
+      data: { lifecycleStatus: LifecycleStatus.EXPIRED },
+    });
+
+    const applied = await jobs.applyLifecycleStatuses(
+      candidates.map((candidate) => ({
+        jobId: candidate.jobId,
+        expectedStatus: candidate.currentStatus,
+        status: LifecycleStatus.REMOVED,
+      })),
+    );
+
+    expect(applied).toBe(1);
+    // The deadline policy's determination survives the presence pass that never saw it.
+    expect(await statusOf(staleJobId)).toBe(LifecycleStatus.EXPIRED);
+    expect(await statusOf(freshJobId)).toBe(LifecycleStatus.REMOVED);
+  });
+
+  it('leaves a job another writer expired while this pass was deciding', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(sourceId, 'racy', OBSERVED_AFTER, LifecycleStatus.REMOVED);
+    await createRun(sourceId, {
+      startedAt: RUN_AT,
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
+
+    const logged: LogEntry[] = [];
+    // The pass reads the job as REMOVED and decides to restore it; before its write lands, the
+    // deadline policy moves the same row. Without the fence this pass would overwrite a stated
+    // deadline with a status it can never re-derive.
+    const racing = new RacingJobs(jobs, async () => {
+      await prisma.job.update({
+        where: { id: jobId },
+        data: { lifecycleStatus: LifecycleStatus.EXPIRED },
+      });
+    });
+    const result = await new SweepSourceLifecycle({
+      jobs: racing,
+      logger: capturingLogger(logged),
+    }).sweep(sourceId);
+
+    expect(result.restored).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.EXPIRED);
+    expect(
+      logged.filter((entry) => entry.message === 'lifecycle sweep left newer state untouched'),
+    ).toEqual([
+      {
+        level: 'info',
+        message: 'lifecycle sweep left newer state untouched',
+        meta: { sourceId, decided: 1, applied: 0, superseded: 1, policy: LIFECYCLE_POLICY_VERSION },
+      },
+    ]);
+  });
+});
+
+interface LogEntry {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  meta?: unknown;
+}
+
+function capturingLogger(sink: LogEntry[]): WorkerLogger {
+  return {
+    info: (message, meta) => sink.push({ level: 'info', message, meta }),
+    warn: (message, meta) => sink.push({ level: 'warn', message, meta }),
+    error: (message, meta) => sink.push({ level: 'error', message, meta }),
+  };
+}
+
+/** Delegates to a real repository, running `before` once just before the lifecycle write. */
+class RacingJobs implements JobRepository {
+  private raced = false;
+
+  constructor(
+    private readonly inner: JobRepository,
+    private readonly before: () => Promise<void>,
+  ) {}
+
+  async applyLifecycleStatuses(updates: readonly LifecycleStatusUpdate[]) {
+    if (!this.raced) {
+      this.raced = true;
+      await this.before();
+    }
+    return this.inner.applyLifecycleStatuses(updates);
+  }
+
+  findById(id: string) {
+    return this.inner.findById(id);
+  }
+
+  countForSource(sourceId: string) {
+    return this.inner.countForSource(sourceId);
+  }
+
+  listLifecycleCandidates(sourceId: string) {
+    return this.inner.listLifecycleCandidates(sourceId);
+  }
+
+  listDeadlineCandidates() {
+    return this.inner.listDeadlineCandidates();
+  }
+
+  upsert(input: UpsertJobInput) {
+    return this.inner.upsert(input);
+  }
+}

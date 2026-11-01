@@ -1,6 +1,7 @@
 # ADR-0010: Presence sweep under bounded listing coverage
 
-- **Status:** Accepted — 2026-10-24 (owner selected windowed coverage; see §5).
+- **Status:** Accepted — 2026-10-24 (owner selected windowed coverage; see §5); amended 2026-11-01
+  by the audit's M1 fix (see §8).
 - **Date:** 2026-10-24
 - **Relates to:** FR-019, SRS 4.4 (job lifecycle), AC-018, ENG-001 (no evidence is not negative evidence), ADR-0001 (identity), ADR-0004 (adapter registry)
 - **Depends on:** ADR-0001 accepted; the `source_runs` funnel counters and the adapter registry exist.
@@ -82,10 +83,11 @@ and are never overwritten from listing presence.
 
 ### 2.3 Trigger
 
-`SweepSourceLifecycle` is invoked once, after a run finishes `SUCCEEDED` and made a coverage
-claim (`catalogueExhausted` or a non-null floor). A failed sweep is logged and swallowed: a
-good collection must not be failed by a downstream reconciliation step. The sweep is scoped to
-the run's source, so it is bounded and retryable.
+`SweepSourceLifecycle` is invoked once, after a run finishes `SUCCEEDED` — with a coverage claim or
+without one. The original trigger also required a claim; §8 records why that was dropped. A failed
+sweep is logged and swallowed: a good collection must not be failed by a downstream reconciliation
+step. The sweep is scoped to the run's source, so it is bounded and retryable, and every write it
+makes is fenced on the status the pass read (§8).
 
 ### 2.4 Policy version
 
@@ -114,7 +116,7 @@ migration from a boolean-only gate are one policy change.
 
 | Alternative | Why not |
 |---|---|
-| Wire the sweep with "SUCCEEDED and discovered > 0" as the qualifier | Measured: retires 44 of 62 live EffoySira jobs on the first run. |
+| Wire the sweep with "SUCCEEDED and discovered > 0" as the qualifier | Measured: retires 44 of 62 live EffoySira jobs on the first run. The trigger is that condition again today (§8) and it is safe only because §2.2's rule moved inside the read model: a claim-less run can restore what it captured, but it can never speak for what it did not read. |
 | Require `catalogueExhausted` only | Correct but inert: no approved source can read its archive within its politeness budget, so `REMOVED` would stay unreachable. |
 | Count missed runs or days instead of a window | Needs the same coverage evidence to be safe, adds a tunable threshold, and still cannot distinguish "older than the pages read" from "removed". |
 | Retire every unobserved Job | Mass false retirement; violates ENG-001. Treating "not read" as "not published" is exactly the error this ADR exists to prevent. |
@@ -148,3 +150,30 @@ newest N postings and widening as the page budget widens.
   dated; an unreadable or undated entry yields `NULL`.
 - `tests/integration/source-run-identity-counters.spec.ts` — the floor round-trips through
   `source_runs` without a timezone shift.
+
+## 8. Amendment — 2026-11-01: trigger widened, writes fenced (audit M1)
+
+Neither change alters the rule in §2.2; both were found by the 2026-10-25 full-system audit.
+
+1. **Presence restores without a coverage claim.** §2.2's read model already counts "this run
+   captured the Job" as a run that can speak for it, and rule 2 restores on presence alone.
+   Requiring a claim in the *trigger* therefore only ever delayed restoration: a Job re-published by
+   a capped run that recorded no floor stayed `REMOVED` until some later run happened to state
+   coverage. The handler now sweeps after every `SUCCEEDED` run. Retirement is unaffected — rules 3
+   and 4 still need a run that read the listing to the end or reached below the Job's date, so a
+   wider trigger creates no new evidence of absence.
+2. **Each write is a compare-and-set.** `LifecycleStatusUpdate` carries the status the deciding pass
+   read, and the store applies the move only while the row still holds it. The presence and deadline
+   policies write the same column and interleave under a second worker or a re-claimed task; before
+   this, whichever write landed last won, and could replace a determination it cannot re-derive —
+   an `EXPIRED` from a stated deadline, or a `REMOVED` from a covered read — with a conclusion drawn
+   from a read that no longer describes the row. A move whose expectation no longer holds is dropped,
+   not retried: the other writer acted on fresher evidence, and the next pass re-reads before deciding
+   again. The gap is logged with `decided`/`applied`/`superseded`, because the log is the only place a
+   lifecycle reason is recorded.
+
+Tests for the amendment: `lifecycle-sweep.spec.ts` (a claim-less run restoring a `REMOVED` Job; the
+fence refusing to overwrite a status moved underneath the pass; the deadline policy winning a race
+mediated between the pass's read and its write) and `deadline-expiry.spec.ts` (the mirror case, where
+presence retires during the deadline pass).
+

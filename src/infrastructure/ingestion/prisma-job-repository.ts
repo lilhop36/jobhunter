@@ -344,20 +344,26 @@ export class PrismaJobRepository implements JobRepository {
   async applyLifecycleStatuses(updates: readonly LifecycleStatusUpdate[]): Promise<number> {
     if (updates.length === 0) return 0;
 
-    // Grouped by target status so a sweep is at most two statements regardless of how many
-    // Jobs move. The client (not hand-written SQL) is used here so `@updatedAt` is
-    // maintained and uuid arrays need no cast.
-    const byStatus = new Map<LifecycleStatus, string[]>();
-    for (const { jobId, status } of updates) {
-      const ids = byStatus.get(status);
-      if (ids === undefined) byStatus.set(status, [jobId]);
-      else ids.push(jobId);
+    // Grouped by the (expected -> target) pair so one pass is at most a handful of statements
+    // regardless of how many Jobs move, while each statement still carries the status its Jobs
+    // were read in. That predicate is what makes the write a compare-and-set: a Job another
+    // writer already moved is left with that newer determination instead of being overwritten
+    // with this pass's older conclusion (audit M1).
+    //
+    // The client (not hand-written SQL) is used here so `@updatedAt` is maintained and uuid
+    // arrays need no cast.
+    const groups = new Map<string, { expected: LifecycleStatus; status: LifecycleStatus; ids: string[] }>();
+    for (const { jobId, expectedStatus, status } of updates) {
+      const key = `${expectedStatus}->${status}`;
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, { expected: expectedStatus, status, ids: [jobId] });
+      else group.ids.push(jobId);
     }
 
     let applied = 0;
-    for (const [status, ids] of byStatus) {
+    for (const { expected, status, ids } of groups.values()) {
       const { count } = await this.prisma.job.updateMany({
-        where: { id: { in: ids } },
+        where: { id: { in: ids }, lifecycleStatus: expected },
         data: { lifecycleStatus: status },
       });
       applied += count;

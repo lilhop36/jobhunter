@@ -163,7 +163,11 @@ describe('source collection handler — post-collection lifecycle sweep (FR-019)
     expect(swept).toEqual([SOURCE_ID]);
   });
 
-  it('does not sweep when the run left part of the listing unread and claimed no window', async () => {
+  // Audit M1: presence restores on its own, so the sweep looks after every successful run. What
+  // a claim-less run may not do is *retire* - that restriction lives in the read model, which
+  // only offers a run able to speak for the Job, and `lifecycle-sweep.spec.ts` pins it against
+  // real PostgreSQL. Asserting it here would only restate this gate.
+  it('sweeps after a SUCCEEDED run that left part of the listing unread and claimed no window', async () => {
     const swept: string[] = [];
     const { handler } = handlerCapturingRun(adapterWithExpectation(undefined), {
       outcome: {
@@ -173,12 +177,12 @@ describe('source collection handler — post-collection lifecycle sweep (FR-019)
       },
       sweep: async (sourceId) => {
         swept.push(sourceId);
-        return { retired: 0, restored: 0, examined: 5 };
+        return { retired: 0, restored: 1, examined: 5 };
       },
     });
 
     await handler({ task: TASK, signal: new AbortController().signal });
-    expect(swept).toEqual([]);
+    expect(swept).toEqual([SOURCE_ID]);
   });
 
   it('does not sweep a partial run even if the adapter reported coverage', async () => {

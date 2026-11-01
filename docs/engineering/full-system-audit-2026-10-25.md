@@ -5,10 +5,11 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Ten items were fixed afterwards: P0
+**Status of this document:** findings and recommendations. Eleven items were fixed afterwards: P0
 item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery), H4 (the refresh merge),
 H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27; M2 (the source-run liveness signal,
-which also closed the heartbeat half H3 left open) on 2026-10-31;
+which also closed the heartbeat half H3 left open) on 2026-10-31; M1 (the lifecycle write race and
+restore-on-observation) on 2026-11-01;
 H7 (reduced-yield detection) on 2026-10-28, and H2 (the authorization boundary), M7 (the schema-aware
 drill, verified copy, retention and schedule commands) and H7's source-silence half on 2026-10-30 — H7's
 funnel-metric half stays open, H2's TLS half needs an operator certificate, and M7 stays PARTIAL
@@ -406,6 +407,23 @@ until a later covered run, because the sweep only runs for `SUCCEEDED` runs with
 **Fix:** carry the expected status per update and add `lifecycleStatus = expected` to the grouped
 `updateMany`; restore `ACTIVE` on observation; add concurrent sweep/expiry tests.
 
+**Resolved 2026-11-01.** `LifecycleStatusUpdate` carries `expectedStatus` — the status the deciding
+pass read — and `applyLifecycleStatuses` groups by the `(expected → target)` pair and adds
+`lifecycleStatus: expected` to each `updateMany`, returning the count actually written. A pass whose
+row moved underneath it therefore does not apply: the other writer's determination stands, the next
+pass re-reads it before deciding again, and the divergence is logged as
+`lifecycle sweep left newer state untouched` / `deadline reconciliation left newer state untouched`
+with `decided`/`applied`/`superseded`, so a lost race is visible instead of mysterious. `EXPIRED`
+and `NOT_FOUND` can no longer be flattened by a presence pass that never saw them, and vice versa.
+The restore half needed only the handler's gate: the candidate read model already qualified a run
+that *captured* the Job (`rj."lastSeenAt" >= r."startedAt"`), and rule 2 of ADR-0010 §2.2 restores on
+presence alone, so an observation retires nothing new and the sweep now runs after every `SUCCEEDED`
+run, claimed coverage or not. Retirement stays restricted to runs that covered the Job, so no
+additional job is retired by the wider gate. Tests: `lifecycle-sweep.spec.ts`
+(`restores a retired job observed by a run that claimed no coverage at all`, plus a repository-level
+fence test and a `RacingJobs` test in which the deadline policy wins the race) and
+`deadline-expiry.spec.ts` (the mirror case: a presence sweep retires during the deadline pass's read).
+
 #### M2 — A source run has no liveness signal; a live run can be reaped and a zombie can keep writing — **new, verified**
 
 `reapStaleRuns` uses only `startedAt` (`prisma-source-run-repository.ts:232-248`), and `SourceRun`
@@ -647,7 +665,7 @@ mixed-type comparison instead.
 | FR-009/014 skills & confidence | Blocked by missing `JobSkill` (D4) |
 | FR-012..016 matching | Implemented and explainable; skills weight permanently unknown |
 | FR-017..018 notifications/feedback | Durable delivery; feedback API exists; AC-017 UI/buttons absent (D13) |
-| FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but the ordering assumption and races remain (M1/M6); the run-liveness race closed 2026-10-31 (M2) |
+| FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; the run-liveness race closed 2026-10-31 (M2) and the two-policy write race plus restore-on-observation 2026-11-01 (M1); identity-key/provenance retention still open (M6) |
 | FR-020 health | Yield drift 2026-10-28 and source silence 2026-10-30 (H7): both §7.8 abnormal-behaviour cases now warn the operator; funnel metrics still open |
 | FR-021 backup | Scripts + schema-aware drill; copy/retention/schedule commands exist but no encrypted off-machine copy or installed task (M7) |
 | SRS 8.1/8.2 auth/ownership | Met 2026-10-30 (H2, ADR-0011); TLS for an externally bound API still absent |
@@ -712,7 +730,8 @@ marked theoretical or downgraded.
    operator; D20 stays PARTIAL for the rest of §7.8 — the pipeline funnel view and the notification
    metrics roll-up (L8).
 7. **Lifecycle CAS + restore-on-observation (M1)**, and **source-run heartbeat (M2)** —
-   **Done 2026-10-31**; M1 is the remaining half.
+   **Done 2026-10-31** for the heartbeat and **2026-11-01** for the compare-and-set and the wider
+   sweep trigger. Both halves of the item are closed.
 8. **Outbox recovery/revalidation and shutdown order (M3)**.
 9. **Backup schedule + migration-aware drill (M7)**. **Done 2026-10-30 for the drill and the
    commands** — the drill compares the migration ledger and answers the scheduler's query,

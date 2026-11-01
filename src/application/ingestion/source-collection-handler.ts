@@ -80,10 +80,10 @@ export interface SourceCollectionHandlerOptions {
    */
   sourceRunHeartbeatMs?: number;
   /**
-   * Post-collection lifecycle sweep (FR-019). Called only after a run that finished
-   * `SUCCEEDED` and made a coverage claim — read the listing to the end, or at least read a
-   * dated window of it. Every other run says nothing about what it did not see. Absent means
-   * the sweep never runs.
+   * Post-collection lifecycle sweep (FR-019). Called after any run that finished `SUCCEEDED`,
+   * whether or not it claimed coverage: a run that captured a Job restores it from `REMOVED` on
+   * presence alone, and retirement stays restricted to the runs that can actually speak for that
+   * Job (see `listLifecycleCandidates`). Absent means the sweep never runs.
    */
   sweep?: (sourceId: string) => Promise<{ retired: number; restored: number; examined: number }>;
   /** Optional logger for the sweep outcome; absent means silent. */
@@ -138,20 +138,18 @@ export function createSourceCollectionHandler(
       );
     }
 
-    // FR-019: reconcile lifecycles against this run's coverage. Only a SUCCEEDED run that
-    // made a coverage claim may retire anything; every other run says nothing about what it
-    // did not see. A sweep failure must not turn a good run into a retried task — the
-    // collection data is durable and the next covered run sweeps again.
-    if (
-      options.sweep &&
-      result.run !== null &&
-      result.status === SourceRunStatus.SUCCEEDED &&
-      (result.run.catalogueExhausted || result.run.oldestListingPublishedAt !== null)
-    ) {
+    // FR-019: reconcile lifecycles against this run. Retirement is not decided here - the read
+    // model only offers a run that can speak for the Job it is judging, so a run that read one
+    // page cannot retire what it never reached. What this gate decides is *when to look*, and
+    // presence needs looking even when coverage is absent: a Job an earlier run retired is
+    // restored the moment a claim-less run observes it again (audit M1), instead of staying
+    // retired until some later run happens to state a window. A failed sweep is not a failed
+    // collection: the data is durable and the next successful run reconciles again.
+    if (options.sweep && result.run !== null && result.status === SourceRunStatus.SUCCEEDED) {
       try {
         const swept = await options.sweep(result.run.sourceId);
         if (swept.retired > 0 || swept.restored > 0) {
-          options.logger?.info('lifecycle sweep retired stale jobs', {
+          options.logger?.info('lifecycle sweep reconciled jobs', {
             sourceId,
             runId: result.run.id,
             retired: swept.retired,

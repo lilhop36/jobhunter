@@ -143,6 +143,31 @@ describe('ExpireDeadlines', () => {
     expect(await statusOf(movedForward)).toBe(LifecycleStatus.ACTIVE);
     expect(await statusOf(evidenceGone)).toBe(LifecycleStatus.ACTIVE);
   });
+
+  it('does not overwrite a status the presence sweep moved after this pass read it', async () => {
+    // Audit M1, seen from the other policy: the two passes write the same column, so each fences
+    // on what it read. `REMOVED` is the source's verdict about whether the posting still exists
+    // and this pass can never re-derive it, so a read that raced with a sweep must not clobber it.
+    const jobId = await jobWith({ deadline: PAST });
+    const candidates = await jobs.listDeadlineCandidates();
+    expect(candidates).toHaveLength(1);
+
+    await prisma.job.update({
+      where: { id: jobId },
+      data: { lifecycleStatus: LifecycleStatus.REMOVED },
+    });
+
+    const applied = await jobs.applyLifecycleStatuses(
+      candidates.map((candidate) => ({
+        jobId: candidate.jobId,
+        expectedStatus: candidate.currentStatus,
+        status: LifecycleStatus.EXPIRED,
+      })),
+    );
+
+    expect(applied).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+  });
 });
 
 describe('the dispatch guard agrees with the domain deadline rule', () => {

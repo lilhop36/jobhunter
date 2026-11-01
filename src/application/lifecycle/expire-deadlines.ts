@@ -59,7 +59,11 @@ export class ExpireDeadlines {
       });
       if (decision.status === LifecycleStatus.EXPIRED) expired += 1;
       else restored += 1;
-      updates.push({ jobId: candidate.jobId, status: decision.status });
+      updates.push({
+        jobId: candidate.jobId,
+        expectedStatus: candidate.currentStatus,
+        status: decision.status,
+      });
     }
 
     const changed = await this.deps.jobs.applyLifecycleStatuses(updates);
@@ -69,6 +73,18 @@ export class ExpireDeadlines {
         expired,
         restored,
         changed,
+        policy: DEADLINE_POLICY_VERSION,
+      });
+    }
+    if (changed < updates.length) {
+      // The row moved between this read and the fenced write - the presence sweep, another worker,
+      // or a newer collection got there first. This pass owns deadline state, not the source's
+      // verdict about whether the posting still exists, so a Job it no longer holds is left as the
+      // other writer set it; the next pass re-reads before deciding (audit M1).
+      this.deps.logger.info('deadline reconciliation left newer state untouched', {
+        decided: updates.length,
+        changed,
+        superseded: updates.length - changed,
         policy: DEADLINE_POLICY_VERSION,
       });
     }

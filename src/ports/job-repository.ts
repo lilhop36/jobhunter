@@ -67,8 +67,21 @@ export interface LifecycleCandidate {
   latestQualifyingRun: LifecycleRunEvidence | null;
 }
 
+/**
+ * One lifecycle move, as a compare-and-set (audit M1).
+ *
+ * `expectedStatus` is the state the policy read when it decided. Applying only while the row
+ * still holds it means the two policies that write this column - presence and deadline - cannot
+ * clobber each other's determination when they interleave, and neither can overwrite a newer
+ * observation made after its own read. A move whose expectation no longer holds is not applied
+ * and is not retried: the other writer's state is the fresher evidence, and the next pass reads
+ * it before deciding again.
+ */
 export interface LifecycleStatusUpdate {
   jobId: string;
+  /** The status this Job holds now, per the caller's read. The write is fenced on it. */
+  expectedStatus: LifecycleStatus;
+  /** The status the policy decided the evidence supports. */
   status: LifecycleStatus;
 }
 
@@ -115,8 +128,9 @@ export interface JobRepository {
   listDeadlineCandidates(): Promise<DeadlineCandidate[]>;
 
   /**
-   * Apply decided lifecycle statuses. Returns how many Jobs were actually written; callers
-   * pass only real changes, so a non-zero result means that many rows moved.
+   * Apply decided lifecycle statuses, each fenced on the status the caller read. Returns how
+   * many Jobs were actually written, so a caller that decided from a stale read sees its move
+   * silently not applied rather than overwriting what it never saw (audit M1).
    */
   applyLifecycleStatuses(updates: readonly LifecycleStatusUpdate[]): Promise<number>;
 }

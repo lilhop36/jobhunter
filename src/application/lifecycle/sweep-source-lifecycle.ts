@@ -21,18 +21,24 @@ export interface SourceLifecycleSweepResult {
 /**
  * FR-019 (SRS 4.4): reconcile one source's Job lifecycle against its collection history.
  * Wired as a post-collection step of the source collection handler (apps/worker/runtime.ts):
- * it runs after a run that finished SUCCEEDED and made a coverage claim (read the listing to
- * the end, or recorded the publication-date window it read).
+ * it runs after a run that finished SUCCEEDED, claimed coverage or not.
  *
  * Scoped to a single source so a sweep is a bounded, retryable unit of work rather than a
  * table-wide scan, and so one source's sweep cannot be starved by another's.
+ *
+ * What makes a run *informative* is not decided here: the read model only offers, for each Job,
+ * a run that can speak for it - one that captured the Job, read the listing to the end, or read
+ * down past the Job's publication date. That is why the sweep can run after any successful
+ * collection: presence restores on its own evidence, and absence retires only against a run that
+ * actually covered the Job (ADR-0010, audit M1).
  *
  * Every move is logged with the evidence and the policy version that decided it. No column
  * stores a lifecycle reason, so the log is the audit trail; this is why the policy returns a
  * reason instead of a bare status.
  *
- * The handler decides whether a run may drive a sweep; this class only executes it and
- * reports what moved.
+ * The handler decides when to look; this class decides what the evidence supports and writes
+ * each move fenced on the status it read, so a determination made by another writer - or by the
+ * deadline pass - is not overwritten by an older conclusion here.
  */
 export class SweepSourceLifecycle {
   constructor(private readonly deps: SweepSourceLifecycleDeps) {}
@@ -63,7 +69,11 @@ export class SweepSourceLifecycle {
         policy: LIFECYCLE_POLICY_VERSION,
         reason: decision.reason,
       });
-      updates.push({ jobId: candidate.jobId, status: decision.status });
+      updates.push({
+        jobId: candidate.jobId,
+        expectedStatus: candidate.currentStatus,
+        status: decision.status,
+      });
     }
 
     const applied = await this.deps.jobs.applyLifecycleStatuses(updates);
@@ -74,6 +84,18 @@ export class SweepSourceLifecycle {
         retired,
         restored,
         applied,
+        policy: LIFECYCLE_POLICY_VERSION,
+      });
+    }
+    if (applied < updates.length) {
+      // The row moved between this read and the fenced write, so another determination is now
+      // on it - a concurrent sweep, a deadline pass, or a newer collection. Leaving it alone is
+      // the correct outcome; saying so is what makes the race visible instead of mysterious.
+      this.deps.logger.info('lifecycle sweep left newer state untouched', {
+        sourceId,
+        decided: updates.length,
+        applied,
+        superseded: updates.length - applied,
         policy: LIFECYCLE_POLICY_VERSION,
       });
     }
