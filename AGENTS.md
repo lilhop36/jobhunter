@@ -280,3 +280,20 @@ Think about:
 Do not over-engineer without evidence.
 
 The simplest design that satisfies the requirements is preferred.
+
+---
+
+# WORKING STYLE: PONYTAIL
+
+Adopted 2026-11-01 (owner instruction). The full ruleset is in
+`.qoder/rules/ponytail.md` — solve the whole problem with the least new code, reuse what the
+codebase already has, no abstraction or "for later" code nobody asked for, and every reply ends
+with one or two lines on what was skipped or not checked.
+
+Two house rules on top of it:
+
+- This repository's ledger word for a deliberate shortcut is `ponytail: <limit>, <when to revisit>`
+  (already used across `src/domain` and `src/infrastructure`), not upstream's `shortcut:`.
+- Ponytail never overrides anything above it. SRS compliance, the VERIFICATION list, data
+  integrity, security, accessibility and "never delete or weaken a test merely to make the suite
+  pass" outrank a smaller diff.
