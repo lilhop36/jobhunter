@@ -255,10 +255,11 @@ export function createWorkerRuntime(
     async stop(): Promise<void> {
       if (!started) return;
       started = false;
-      // Order matters: stop scheduling first so no new work is enqueued while the worker
-      // unwinds, then let the worker release its in-flight attempt, then close the pool. The
-      // dispatch loop joins after the worker: an in-flight send may already own a claimed
-      // outbox row, and a pass abandoned here would be re-recovered by the next start.
+      // Order matters. The dispatch loop joins first: an in-flight send may own a claimed outbox
+      // row, and the pass has to finish its own records (or hand its rows back to `PENDING`)
+      // before the pool closes under it — a pass abandoned here would otherwise wait for the next
+      // start's recovery. Then scheduling stops, so no new work is enqueued while the worker
+      // unwinds, then the worker releases its in-flight attempt, then the pool closes.
       dispatchController?.abort();
       await dispatchLoopPromise?.catch(() => undefined);
       dispatchController = undefined;

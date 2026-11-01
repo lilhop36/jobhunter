@@ -51,6 +51,17 @@ first-failure short-circuit would hide the second one.
 Informational listings stay off by default: `policy.allowInformationalListings` is the explicit
 opt-in SRS 3.5 requires.
 
+At send time the dispatcher re-checks four of these in SQL (audit M3, 2026-11-01) — `ACTIVE`, the
+stated deadline, the usable application path, and a `NOT_RELEVANT` verdict on the row itself —
+because a reservation can sit in the outbox through a retry ladder while the job changes underneath
+it, and FR-016 speaks about the job the alert describes at the moment it is delivered. The two
+thresholds are deliberately **not** among them: they are the reservation's judgement about the
+match, they are already written into the payload the message renders, and a second copy of
+`NOTIFICATION_THRESHOLDS_V1` inside a delivery guard is a constant that can drift. The path clause
+is row 2's rule, not a new one, and is pinned to `hasUsableApplicationPath` case by case in
+`tests/integration/deadline-expiry.spec.ts`, the same way its deadline clause is pinned to
+`isPastDeadline`.
+
 ### 3. Thresholds
 
 ```ts

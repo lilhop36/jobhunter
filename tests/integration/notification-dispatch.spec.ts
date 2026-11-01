@@ -1,7 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { ApplicationMethod, DescriptionQuality, SalaryPeriod, SalaryType } from '@domain/enums';
+import type { NotificationMessageContent } from '@domain/notification';
 import { DispatchNotifications } from '@application/notification';
 import { PrismaNotificationOutboxRepository } from '@infrastructure/matching/prisma-notification-outbox-repository';
+import type {
+  ClaimedNotification,
+  NotificationOutboxRepository,
+} from '@ports/notification-outbox';
 import type { NotificationSender, SendOutcome } from '@ports/notification-sender';
 import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../support/db';
 
@@ -12,7 +17,8 @@ import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../sup
  * The channel is a port, so what is pinned here is the dispatcher's contract with the *outbox*:
  * a due row is claimed exactly once and sent once; a retryable failure is rescheduled with a
  * growing wait and its attempt counted; a permanent failure or an exhausted ladder becomes
- * terminal; and a row is never left in `PROCESSING` where nothing would look at it again.
+ * terminal; and a row is never left in `PROCESSING` where nothing would look at it again —
+ * neither a message this revision cannot render nor a status write that failed (audit M3).
  */
 
 const prisma = createTestPrismaClient();
@@ -106,12 +112,63 @@ async function reserve(
   });
 }
 
-function dispatcherWith(sender: NotificationSender): DispatchNotifications {
-  return new DispatchNotifications({ outbox, sender });
+function dispatcherWith(
+  sender: NotificationSender,
+  via: NotificationOutboxRepository = outbox,
+): DispatchNotifications {
+  return new DispatchNotifications({ outbox: via, sender });
 }
 
 async function row(id: string) {
   return prisma.notificationOutbox.findFirstOrThrow({ where: { id } });
+}
+
+/**
+ * The real repository with one call made to fail, or one claimed row's content broken.
+ *
+ * Both are ways a pass can end with rows still in `PROCESSING`, which the claim query cannot see
+ * again — the situation the outbox port's recovery note is about. Delegating everything else
+ * keeps the claim fences, the batch ordering and the status writes themselves real.
+ */
+class InterferingOutbox implements NotificationOutboxRepository {
+  failMarkSent = false;
+  breakContentOfId: string | null = null;
+
+  constructor(private readonly inner: NotificationOutboxRepository) {}
+
+  async claimDue(input: { now: Date; limit: number }): Promise<ClaimedNotification[]> {
+    const rows = await this.inner.claimDue(input);
+    return rows.map((row) => {
+      if (row.id !== this.breakContentOfId) return row;
+      // The renderer reads `content.salary` unguarded after a null check, which is how a stored
+      // row of a shape this revision does not recognise reaches the same place.
+      return {
+        ...row,
+        content: { ...row.content, salary: undefined } as unknown as NotificationMessageContent,
+      };
+    });
+  }
+
+  markSent(input: { id: string; sentAt: Date }): Promise<void> {
+    if (this.failMarkSent) return Promise.reject(new Error('connection terminated unexpectedly'));
+    return this.inner.markSent(input);
+  }
+
+  markFailed(input: { id: string; lastError: string; nextAttemptAt: Date | null }): Promise<void> {
+    return this.inner.markFailed(input);
+  }
+
+  recoverAbandoned(): Promise<number> {
+    return this.inner.recoverAbandoned();
+  }
+
+  releaseUnsent(input: { ids: readonly string[] }): Promise<number> {
+    return this.inner.releaseUnsent(input);
+  }
+
+  cancelIneligible(input: { now: Date }): Promise<number> {
+    return this.inner.cancelIneligible(input);
+  }
 }
 
 describe('DispatchNotifications', () => {
@@ -274,6 +331,19 @@ describe('DispatchNotifications', () => {
     expect(sender.seen).toEqual([]);
   });
 
+  it('returns the claimed batch in due order, not in the order the claim emitted it', async () => {
+    // The due order is chosen by the subquery inside the claim, but `UPDATE … RETURNING` hands
+    // back its rows in scan order, so the claim cannot inherit that order. It comes from the
+    // read-back, and the dispatcher's sends depend on it.
+    const newest = await reserve({ event: 'NEWEST', nextAttemptAt: NOW });
+    const oldest = await reserve({ event: 'OLDEST', nextAttemptAt: new Date(NOW.getTime() - 120_000) });
+    const middle = await reserve({ event: 'MIDDLE', nextAttemptAt: new Date(NOW.getTime() - 60_000) });
+
+    const claimed = await outbox.claimDue({ now: NOW, limit: 3 });
+
+    expect(claimed.map((row) => row.id)).toEqual([oldest.id, middle.id, newest.id]);
+  });
+
   it('claims a bounded batch, oldest due first', async () => {
     // Distinct events, because one (user, job, type, event) is one row ever (AC-016).
     await reserve({ event: 'OLDEST', nextAttemptAt: new Date(NOW.getTime() - 120_000) });
@@ -286,5 +356,46 @@ describe('DispatchNotifications', () => {
     expect(result).toEqual({ attempted: 2, sent: 2, retried: 0, failed: 0 });
     expect(await prisma.notificationOutbox.count({ where: { status: 'PENDING' } })).toBe(1);
     expect((await row(second.id)).status).toBe('SENT');
+  });
+
+  it('reschedules a row it cannot render and still delivers the rest of the batch', async () => {
+    const broken = await reserve({ event: 'BROKEN' });
+    const good = await reserve({ event: 'GOOD' });
+    const interfering = new InterferingOutbox(outbox);
+    interfering.breakContentOfId = broken.id;
+
+    const result = await dispatcherWith(senderReturning({ delivered: true }), interfering).run({
+      now: NOW,
+    });
+
+    expect(result).toEqual({ attempted: 2, sent: 1, retried: 1, failed: 0 });
+    const stranded = await row(broken.id);
+    expect(stranded.status).toBe('PENDING');
+    expect(stranded.attemptCount).toBe(1);
+    expect(stranded.lastError).not.toBeNull();
+    expect((await row(good.id)).status).toBe('SENT');
+  });
+
+  it('hands its own rows back instead of stranding them when a status write fails', async () => {
+    const delivered = await reserve({ event: 'FIRST', nextAttemptAt: new Date(NOW.getTime() - 60_000) });
+    const untouched = await reserve({ event: 'SECOND' });
+    const interfering = new InterferingOutbox(outbox);
+    interfering.failMarkSent = true;
+
+    await expect(
+      dispatcherWith(senderReturning({ delivered: true }), interfering).run({ now: NOW }),
+    ).rejects.toThrow('connection terminated unexpectedly');
+
+    // Nothing is left where the next claim cannot see it, and the row whose send went
+    // unrecorded is tried again: one duplicate message, which is the at-least-once delivery
+    // ENG-027 documents as accepted and the alternative to never telling the candidate at all.
+    expect(await prisma.notificationOutbox.count({ where: { status: 'PROCESSING' } })).toBe(0);
+    expect((await row(delivered.id)).status).toBe('PENDING');
+    expect((await row(untouched.id)).status).toBe('PENDING');
+
+    const retried = await dispatcherWith(senderReturning({ delivered: true })).run({ now: NOW });
+    expect(retried).toEqual({ attempted: 2, sent: 2, retried: 0, failed: 0 });
+    // The release is fenced on `PROCESSING`, so it cannot undo a recorded outcome.
+    expect(await outbox.releaseUnsent({ ids: [delivered.id] })).toBe(0);
   });
 });

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { LifecycleStatus, NotificationStatus } from '@domain/enums';
+import { ApplicationMethod, LifecycleStatus, NotificationStatus } from '@domain/enums';
 import { DEADLINE_GRACE_MS, isPastDeadline } from '@domain/lifecycle/deadline-policy';
+import { hasUsableApplicationPath } from '@domain/normalizers/application-target';
 import { ExpireDeadlines } from '@application/lifecycle';
 import { DispatchNotifications } from '@application/notification';
 import { PrismaJobRepository } from '@infrastructure/ingestion/prisma-job-repository';
@@ -14,9 +15,10 @@ import { applyTestMigrations, createTestPrismaClient, truncateAll } from '../sup
  *
  * What is pinned here:
  *  - the reconciliation moves exactly ACTIVE -> EXPIRED and never another policy's states;
- *  - the dispatcher's SQL guard answers the same question as `isPastDeadline`, because that
- *    predicate is repeated in SQL for a single-statement claim, and a drift would silently
- *    notify candidates about postings they can no longer act on;
+ *  - the dispatcher's SQL guard answers the same question as `isPastDeadline`, and the same
+ *    question as `hasUsableApplicationPath`, because both predicates are repeated in SQL for a
+ *    single-statement claim, and a drift would silently notify candidates about postings they can
+ *    no longer act on;
  *  - a reservation made before a deadline passed is cancelled, not sent (SRS 3.2: ACTIVE).
  */
 
@@ -53,7 +55,13 @@ afterAll(async () => {
 });
 
 async function jobWith(
-  overrides: Partial<{ deadline: Date | null; status: LifecycleStatus }> = {},
+  overrides: Partial<{
+    deadline: Date | null;
+    status: LifecycleStatus;
+    method: ApplicationMethod;
+    applyUrl: string | null;
+    applyEmail: string | null;
+  }> = {},
 ): Promise<string> {
   createdJobs += 1;
   const job = await prisma.job.create({
@@ -64,6 +72,13 @@ async function jobWith(
       descriptionQuality: 'SUFFICIENT',
       lifecycleStatus: overrides.status ?? LifecycleStatus.ACTIVE,
       applicationDeadline: overrides.deadline ?? null,
+      // The reservation path cannot create a row for a job with no usable path (AC-004), so the
+      // fixtures carry one by default. A test that asks the path question passes the method and
+      // both targets explicitly, including `null` for the one its rule requires to be missing —
+      // which is why `applyEmail` is read with `in` rather than with a coalesce.
+      applicationMethod: overrides.method ?? ApplicationMethod.EMAIL,
+      applyUrl: overrides.applyUrl ?? null,
+      applyEmail: 'applyEmail' in overrides ? (overrides.applyEmail ?? null) : 'jobs@example.test',
     },
     select: { id: true },
   });
@@ -170,7 +185,7 @@ describe('ExpireDeadlines', () => {
   });
 });
 
-describe('the dispatch guard agrees with the domain deadline rule', () => {
+describe('the dispatch guard agrees with the domain eligibility rules', () => {
   it('cancels a reservation exactly when isPastDeadline says the deadline passed', async () => {
     const deadline = new Date('2026-10-30T00:00:00.000Z');
     const jobId = await jobWith({ deadline });
@@ -194,6 +209,88 @@ describe('the dispatch guard agrees with the domain deadline rule', () => {
 
     await outbox.cancelIneligible({ now: new Date(deadline.getTime() + DEADLINE_GRACE_MS) });
     expect(await outboxStatusOf(jobId)).toBe(NotificationStatus.CANCELLED);
+  });
+
+  it('cancels a reservation exactly when hasUsableApplicationPath says the path is unusable (AC-004)', async () => {
+    // The application target can drift after a reservation: a recapture that loses the link, or a
+    // source that republishes the posting with the address removed. Each row of `ApplicationMethod`
+    // appears with and without the target its own rule requires, so the SQL cannot silently
+    // disagree with the domain about any of them.
+    const targets = [
+      { method: ApplicationMethod.ONLINE_URL, applyUrl: 'https://example.test/apply', applyEmail: null },
+      { method: ApplicationMethod.ONLINE_URL, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.PDF_FORM, applyUrl: 'https://example.test/form.pdf', applyEmail: null },
+      { method: ApplicationMethod.PDF_FORM, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.EMAIL, applyUrl: null, applyEmail: 'jobs@example.test' },
+      { method: ApplicationMethod.EMAIL, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.SOURCE_ACCOUNT, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.IN_PERSON, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.INSTRUCTIONS, applyUrl: null, applyEmail: null },
+      { method: ApplicationMethod.UNKNOWN, applyUrl: null, applyEmail: null },
+    ];
+    const user = await prisma.user.create({ data: { email: `path-${counter}@example.test` } });
+    const expected: { jobId: string; usable: boolean }[] = [];
+
+    for (const target of targets) {
+      const jobId = await jobWith(target);
+      await prisma.notificationOutbox.create({
+        data: {
+          userId: user.id,
+          jobId,
+          notificationType: 'NEW_MATCH',
+          event: 'NEW_MATCH',
+          payload: {},
+          nextAttemptAt: NOW,
+        },
+      });
+      expected.push({
+        jobId,
+        usable: hasUsableApplicationPath({ ...target, evidence: null }),
+      });
+    }
+
+    const cancelled = await outbox.cancelIneligible({ now: NOW });
+
+    expect(cancelled).toBe(expected.filter((entry) => !entry.usable).length);
+    for (const entry of expected) {
+      expect(await outboxStatusOf(entry.jobId)).toBe(
+        entry.usable ? NotificationStatus.PENDING : NotificationStatus.CANCELLED,
+      );
+    }
+  });
+
+  it('cancels a reservation the user already marked not relevant (FR-018)', async () => {
+    const rejected = await jobWith();
+    const untouched = await jobWith();
+    const user = await prisma.user.create({ data: { email: `verdict-${counter}@example.test` } });
+    const rejectedRow = await prisma.notificationOutbox.create({
+      data: {
+        userId: user.id,
+        jobId: rejected,
+        notificationType: 'NEW_MATCH',
+        event: 'NEW_MATCH',
+        payload: {},
+        nextAttemptAt: NOW,
+      },
+      select: { id: true },
+    });
+    await prisma.notificationOutbox.create({
+      data: {
+        userId: user.id,
+        jobId: untouched,
+        notificationType: 'NEW_MATCH',
+        event: 'NEW_MATCH',
+        payload: {},
+        nextAttemptAt: NOW,
+      },
+    });
+    await prisma.notificationFeedback.create({
+      data: { notificationId: rejectedRow.id, value: 'NOT_RELEVANT' },
+    });
+
+    expect(await outbox.cancelIneligible({ now: NOW })).toBe(1);
+    expect(await outboxStatusOf(rejected)).toBe(NotificationStatus.CANCELLED);
+    expect(await outboxStatusOf(untouched)).toBe(NotificationStatus.PENDING);
   });
 });
 

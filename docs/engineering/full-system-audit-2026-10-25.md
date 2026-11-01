@@ -479,6 +479,44 @@ claimed batch on failure; add a claim token/lease for multi-instance dispatch; u
 notification eligibility predicate in `cancelIneligible`; exclude terminal non-sent rows from
 `alreadyNotified` where re-notification is intended.
 
+**Resolved 2026-11-01, except the lease and the re-notification, both declined.** Rendering moved
+inside the per-row `try`, so a stored payload this revision cannot render is one rescheduled row
+rather than an abandoned batch. A status write that fails now ends the pass after handing back the
+rows *that pass* claimed: `releaseUnsent({ids})` moves them `PROCESSING → PENDING`, fenced on
+`PROCESSING` so a recorded outcome is never undone. It is id-scoped rather than blanket precisely
+so it can run inside a live pass — `recoverAbandoned` still cannot, and still runs at process start
+only, because resetting every `PROCESSING` row would pull a row out from under a send in progress.
+That is the narrower half of the lease the finding asks for: a second dispatcher no longer strands
+its own rows, and the remaining exposure (a rolling restart, or a genuinely concurrent dispatcher,
+resetting a live send into a duplicate) stays the documented `ponytail:` escalation on
+`NotificationOutboxRepository.recoverAbandoned`, because a lease column is schema and machinery for
+a deployment that does not exist while the single worker is the only dispatcher.
+`cancelIneligible` now rechecks all four SRS 3.2 predicates that are facts about the job or the row:
+lifecycle, deadline, usable application path (AC-004) and a `NOT_RELEVANT` verdict on this
+notification (FR-018). Score and confidence are deliberately not rechecked in SQL — they are the
+reservation's judgement about the match, they are already in the payload the message renders, and
+repeating `NOTIFICATION_THRESHOLDS_V1` in a delivery guard would put an ADR-0006 constant in two
+places that can drift. The path clause is `hasUsableApplicationPath` under the default policy and is
+pinned to it row by row, the way the deadline clause is pinned to `isPastDeadline`.
+The `alreadyNotified` half is **not** a `WHERE` change and is declined as written: the event key is
+`one_notification_per_event`, a *plain* unique index, and the reservation inserts
+`ON CONFLICT DO NOTHING`. Excluding `CANCELLED`/`FAILED` from the read would therefore not
+re-notify anything — the insert would be silently refused, and the only effect would be that the
+eligibility decision lies. Re-notifying a job that became eligible again needs a different event key
+or an explicit re-arm of the cancelled row, which is a product decision about what "equivalent
+event" means (AC-016 forbids repeated delivery of one); the reasoning is recorded at the read
+(`prisma-notification-facts-reader.ts`) and in the drift register's D14.
+One further defect surfaced while testing this: `claimDue` promised oldest-due-first and did not
+deliver it. The due order is chosen by the claim's subquery, but `UPDATE … RETURNING` emits its rows
+in scan order, so the dispatcher sent in whatever order the planner returned. The read-back is
+ordered now (`nextAttemptAt`, then `id`) and the promise is pinned.
+Tests: `notification-dispatch.spec.ts` (`reschedules a row it cannot render and still delivers the
+rest of the batch`, `hands its own rows back instead of stranding them when a status write fails`,
+`returns the claimed batch in due order…`) and `deadline-expiry.spec.ts` (the guard's
+`hasUsableApplicationPath` mirror over all seven methods, and a `NOT_RELEVANT` verdict cancelling
+one row while its neighbour stays `PENDING`). The worker's shutdown comment was wrong about its own
+order — the dispatch loop joins *first*, before the pool closes — and now says so.
+
 #### M4 — A source without a resolvable adapter is re-enqueued every 30 seconds forever — **new, verified**
 
 The handler throws `PermanentWorkTaskError` before opening a run when no adapter resolves
@@ -733,7 +771,11 @@ marked theoretical or downgraded.
 7. **Lifecycle CAS + restore-on-observation (M1)**, and **source-run heartbeat (M2)** —
    **Done 2026-10-31** for the heartbeat and **2026-11-01** for the compare-and-set and the wider
    sweep trigger. Both halves of the item are closed.
-8. **Outbox recovery/revalidation and shutdown order (M3)**.
+8. **Outbox recovery/revalidation and shutdown order (M3)**. **Done 2026-11-01** except the two
+   halves declined there: the multi-instance lease (schema and machinery for a deployment that does
+   not exist, still the documented `ponytail:` escalation) and re-notification of a cancelled event
+   (a product decision about the event key, not a `WHERE` clause). A `claimDue` ordering defect the
+   M3 tests surfaced was fixed in the same change.
 9. **Backup schedule + migration-aware drill (M7)**. **Done 2026-10-30 for the drill and the
    commands** — the drill compares the migration ledger and answers the scheduler's query,
    `BACKUP_COPY_DIR` writes a verified copy, `backup:prune` and `backup:schedule` exist. Installing

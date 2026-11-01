@@ -39,6 +39,12 @@ export interface DispatchNotificationsResult {
  * cadence and a long backlog cannot monopolise a worker tick. A row that fails is rescheduled by
  * the policy, not retried inline; a row that was delivered is never claimed again, because its
  * status is no longer `PENDING`.
+ *
+ * A batch is only safe to abandon mid-way because nothing here may leave a row in `PROCESSING`
+ * with no record of it: rendering and delivery are both inside the per-row `try`, and a status
+ * write that fails ends the pass after handing this pass's own rows back to `PENDING`. A row in
+ * `PROCESSING` is invisible to the next claim, so an unhandled throw would strand it until the
+ * process restarted (audit M3).
  */
 export class DispatchNotifications {
   constructor(private readonly deps: DispatchNotificationsDeps) {}
@@ -71,56 +77,73 @@ export class DispatchNotifications {
       failed: 0,
     };
 
-    for (const notification of claimed) {
-      const text = renderNotificationMessage(notification.content);
+    // Every row this pass owns and has not yet recorded an outcome for.
+    const unresolved = new Set(claimed.map((notification) => notification.id));
 
-      let delivered = false;
-      let retryable = true;
-      let reason = 'the channel did not report an outcome';
-      let retryAfterSeconds: number | null = null;
+    try {
+      for (const notification of claimed) {
+        let delivered = false;
+        let retryable = true;
+        let reason = 'the channel did not report an outcome';
+        let retryAfterSeconds: number | null = null;
 
-      try {
-        const outcome = await this.deps.sender.send({
-          notificationId: notification.id,
-          userId: notification.userId,
-          text,
-          jobId: notification.jobId,
-        });
-        if (outcome.delivered) {
-          delivered = true;
-        } else {
-          retryable = outcome.retryable;
-          reason = outcome.reason;
-          retryAfterSeconds = outcome.retryAfterSeconds ?? null;
+        try {
+          // Rendering is inside the try because it reads stored, unverified JSON: a payload this
+          // revision cannot render is one bad message, not a batch abandoned mid-way with rows
+          // still in `PROCESSING` (audit M3).
+          const text = renderNotificationMessage(notification.content);
+          const outcome = await this.deps.sender.send({
+            notificationId: notification.id,
+            userId: notification.userId,
+            text,
+            jobId: notification.jobId,
+          });
+          if (outcome.delivered) {
+            delivered = true;
+          } else {
+            retryable = outcome.retryable;
+            reason = outcome.reason;
+            retryAfterSeconds = outcome.retryAfterSeconds ?? null;
+          }
+        } catch (error) {
+          // A sender that throws is a channel problem, not a decision to give up: reschedule it
+          // like any other transient failure so a buggy adapter cannot silently drop a row into
+          // PROCESSING forever.
+          reason = error instanceof Error ? error.message : String(error);
         }
-      } catch (error) {
-        // A sender that throws is a channel problem, not a decision to give up: reschedule it
-        // like any other transient failure so a buggy adapter cannot silently drop a row into
-        // PROCESSING forever.
-        reason = error instanceof Error ? error.message : String(error);
+
+        if (delivered) {
+          await this.deps.outbox.markSent({ id: notification.id, sentAt: input.now });
+          unresolved.delete(notification.id);
+          result.sent += 1;
+          continue;
+        }
+
+        const next = retryable
+          ? nextAttemptAt({
+              attemptCount: notification.attemptCount,
+              now: input.now,
+              retryAfterSeconds,
+            })
+          : null;
+
+        await this.deps.outbox.markFailed({
+          id: notification.id,
+          lastError: reason,
+          nextAttemptAt: next,
+        });
+        unresolved.delete(notification.id);
+        if (next === null) result.failed += 1;
+        else result.retried += 1;
       }
-
-      if (delivered) {
-        await this.deps.outbox.markSent({ id: notification.id, sentAt: input.now });
-        result.sent += 1;
-        continue;
-      }
-
-      const next = retryable
-        ? nextAttemptAt({
-            attemptCount: notification.attemptCount,
-            now: input.now,
-            retryAfterSeconds,
-          })
-        : null;
-
-      await this.deps.outbox.markFailed({
-        id: notification.id,
-        lastError: reason,
-        nextAttemptAt: next,
-      });
-      if (next === null) result.failed += 1;
-      else result.retried += 1;
+    } catch (error) {
+      // Only a status write can get here, so the database is the thing that just failed. Hand
+      // back the rows this pass claimed but could not record: left in `PROCESSING` they are
+      // invisible to the next claim and would wait for a restart (`recoverAbandoned` runs at
+      // process start, and cannot run here without disturbing a row another dispatcher holds).
+      // Best effort: if this write fails too the caller still sees the one that ended the pass.
+      await this.deps.outbox.releaseUnsent({ ids: [...unresolved] }).catch(() => undefined);
+      throw error;
     }
 
     return result;

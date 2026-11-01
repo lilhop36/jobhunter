@@ -23,6 +23,13 @@ export class PrismaNotificationFactsReader implements NotificationFactsReader {
     }
 
     const [notified, rejected] = await Promise.all([
+      // Every status counts, including `CANCELLED` and `FAILED`, and that is deliberate: this is
+      // the mirror of the event key, not a count of delivered alerts. `one_notification_per_event`
+      // is a plain unique index, so an equivalent event can never be inserted a second time
+      // (AC-016, ENG-027) — filtering the read to `SENT` would only make the decision disagree
+      // with the write, which answers with `ON CONFLICT DO NOTHING` and reserves nothing.
+      // Re-notifying a job that became eligible again therefore needs a different event key (or
+      // a re-arm of the cancelled row), which is a product decision, not a WHERE clause.
       this.prisma.notificationOutbox.findMany({
         where: {
           userId: input.userId,

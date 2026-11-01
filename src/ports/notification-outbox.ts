@@ -100,16 +100,39 @@ export interface NotificationOutboxRepository {
   recoverAbandoned(): Promise<number>;
 
   /**
+   * Put the rows *this pass* claimed back to `PENDING` after the pass ended without recording
+   * them, and report how many moved.
+   *
+   * The narrower half of recovery: `recoverAbandoned` can only run when nothing is in flight, so
+   * a row stranded by a failed status write waits for a restart. This one names the ids it owns,
+   * so it is safe while another dispatcher is mid-send and can run inside a pass. Fenced on
+   * `PROCESSING` like every other write here: a row whose outcome did land is left alone.
+   */
+  releaseUnsent(input: { ids: readonly string[] }): Promise<number>;
+
+  /**
    * Cancel `PENDING` rows whose Job can no longer be notified (FR-016, SRS 3.2: "ACTIVE"), and
    * report how many were cancelled.
    *
    * A reservation is made at scoring time and may sit in the outbox through a retry ladder, so
-   * the job's state at send time is the one that decides. Two things can change it: the job left
-   * `ACTIVE`, or its stated deadline passed after the reservation.
+   * the job's state at send time is the one that decides. Four things can change it, and they are
+   * the SRS 3.2 predicates that are facts about the job or this row rather than about the match:
    *
-   * The deadline comparison is the same rule as `@domain/lifecycle`'s `isPastDeadline`, repeated
-   * in SQL because this is a single-statement guard over a batch. `tests/integration/
-   * deadline-expiry.spec.ts` pins the two to the same answer.
+   *  - the job left `ACTIVE`;
+   *  - its stated deadline passed after the reservation;
+   *  - its application path is no longer usable (AC-004) — the method recorded says it needs a
+   *    URL or address the job no longer carries, or the method is `UNKNOWN`;
+   *  - the user marked *this* notification not relevant (FR-018), which suppresses the job.
+   *
+   * Score and confidence are deliberately not rechecked here: they are the reservation's
+   * judgement about the match, they are already written into the payload the message renders, and
+   * repeating the thresholds in SQL would put a versioned matching constant (ADR-0006) in a
+   * delivery guard. A re-score that falls below them produces no new reservation and removes none.
+   *
+   * The deadline comparison is the same rule as `@domain/lifecycle`'s `isPastDeadline`, and the
+   * path comparison the same rule as `@domain/normalizers`' `hasUsableApplicationPath` with the
+   * default policy, repeated in SQL because this is a single-statement guard over a batch.
+   * `tests/integration/deadline-expiry.spec.ts` pins the two deadline answers to each other.
    */
   cancelIneligible(input: { now: Date }): Promise<number>;
 }

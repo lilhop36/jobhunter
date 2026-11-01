@@ -49,6 +49,8 @@ A no-op sender that answered `delivered: true` would poison `alreadyNotified` (E
 
 The loop runs `recoverAbandoned()` once before its first send (single-dispatcher discipline, outbox port note) and posts no logging when a pass finds nothing due. Stop order: the dispatch loop joins *before* the scheduler and worker unwind so an in-flight send is left for the next start's recovery rather than torn from a closed pool.
 
+Amended 2026-11-01 (audit M3): a pass that cannot write a row's outcome now returns the rows **it** claimed to `PENDING` before the error reaches the loop, so a database hiccup cannot strand a batch until the next start. The blanket `recoverAbandoned` stays at process start — it resets every `PROCESSING` row and so cannot run while a send is in flight; the per-pass release is id-scoped, which is what makes it safe inside a live pass. Multi-instance dispatch still needs the lease column, not a second recovery call.
+
 ### 1.6 The API never sees the bot token
 
 The API process needs only `TELEGRAM_BOT_USERNAME` (to render the deep link). The token lives in the worker's environment. Split so that the token's blast radius is one process type, and the link route's misconfiguration (missing username) is a 500 with a nameable reason when hit, not a boot failure — the API boots without the credential it never needs.

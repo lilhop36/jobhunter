@@ -116,15 +116,14 @@ export class PrismaNotificationOutboxRepository implements NotificationOutboxRep
     const rows = await this.prisma.notificationOutbox.findMany({
       where: { id: { in: claimed.map((row) => row.id) } },
       select: CLAIM_SELECT,
+      // The due order is chosen by the subquery, but the outer `UPDATE … RETURNING` emits rows in
+      // whatever order its scan produced, so the claim list carries no order at all. Sorting the
+      // read-back is what actually delivers the oldest due first, which is what the dispatcher and
+      // `tests/integration/notification-dispatch.spec.ts` rely on.
+      orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
     });
 
-    // `findMany` has no order of its own; the claim's order (oldest due first) is the honest one,
-    // so the dispatcher sends in that order rather than in whatever the planner returned.
-    const byId = new Map(rows.map((row) => [row.id, toClaimed(row)]));
-    return claimed.flatMap((row) => {
-      const found = byId.get(row.id);
-      return found === undefined ? [] : [found];
-    });
+    return rows.map((row) => toClaimed(row));
   }
 
   async markSent(input: { id: string; sentAt: Date }): Promise<void> {
@@ -165,21 +164,55 @@ export class PrismaNotificationOutboxRepository implements NotificationOutboxRep
     `;
   }
 
+  async releaseUnsent(input: { ids: readonly string[] }): Promise<number> {
+    if (input.ids.length === 0) return 0;
+    const ids = Prisma.join(input.ids);
+    return this.prisma.$executeRaw`
+      UPDATE "notification_outbox"
+      SET "status" = 'PENDING'::"NotificationStatus"
+      WHERE "id"::text IN (${ids})
+        AND "status" = 'PROCESSING'::"NotificationStatus"
+    `;
+  }
+
   async cancelIneligible(input: { now: Date }): Promise<number> {
     // One statement, no read-then-write window: a row is cancelled only while it is still
     // PENDING, so this can never steal a row another dispatcher is sending.
+    //
+    // The path clause is `hasUsableApplicationPath` under the default policy (AC-004): the
+    // reservation path calls the domain with no policy override, so `UNKNOWN` and a method whose
+    // required target is missing are the only unusable states. If a policy ever permits
+    // informational listings, this clause must stop cancelling on it.
+    //
+    // One `lastError` for every clause because a rejected alert is also, now, a not-notifiable
+    // one; the reason an operator wants is which clause fired, and the job row plus this row's
+    // feedback answer that without a second verdict column.
     return this.prisma.$executeRaw`
       UPDATE "notification_outbox" o
       SET "status" = 'CANCELLED'::"NotificationStatus",
           "lastError" = 'the job is no longer notifiable'
       WHERE o."status" = 'PENDING'::"NotificationStatus"
-        AND EXISTS (
-          SELECT 1 FROM "jobs" j
-          WHERE j."id" = o."jobId"
-            AND (j."lifecycleStatus" <> 'ACTIVE'::"LifecycleStatus"
-                 OR (j."applicationDeadline" IS NOT NULL
-                     AND j."applicationDeadline" + INTERVAL '1 day'
-                         <= ${asTimestamp(input.now)}::timestamp(3)))
+        AND (
+          EXISTS (
+            SELECT 1 FROM "jobs" j
+            WHERE j."id" = o."jobId"
+              AND (
+                j."lifecycleStatus" <> 'ACTIVE'::"LifecycleStatus"
+                OR (j."applicationDeadline" IS NOT NULL
+                    AND j."applicationDeadline" + INTERVAL '1 day'
+                        <= ${asTimestamp(input.now)}::timestamp(3))
+                OR (j."applicationMethod" = 'UNKNOWN'::"ApplicationMethod"
+                    OR (j."applicationMethod" IN ('ONLINE_URL'::"ApplicationMethod", 'PDF_FORM'::"ApplicationMethod")
+                        AND j."applyUrl" IS NULL)
+                    OR (j."applicationMethod" = 'EMAIL'::"ApplicationMethod"
+                        AND j."applyEmail" IS NULL))
+              )
+          )
+          OR EXISTS (
+            SELECT 1 FROM "notification_feedback" f
+            WHERE f."notificationId" = o."id"
+              AND f."value" = 'NOT_RELEVANT'::"NotificationFeedbackValue"
+          )
         )
     `;
   }
