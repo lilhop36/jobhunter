@@ -4,7 +4,8 @@ import {
   SOURCE_SILENCE_POLICY_VERSION,
   classifySourceSilence,
 } from '@domain/health/source-silence';
-import type { JobSourceRepository } from '@ports/job-source-repository';
+import type { JobSourceRepository, SchedulableSource } from '@ports/job-source-repository';
+import type { JobSourceAdapter } from '@ports/source-adapter';
 import type { SourceRunRepository } from '@ports/source-run-repository';
 import type { WorkTaskRepository } from '@ports/work-task-repository';
 import { consoleWorkerLogger, WorkerLogger } from '@ports/worker-logger';
@@ -34,7 +35,10 @@ interface ResolvedOptions {
 export interface SchedulerPassResult {
   /** Source ids newly enqueued this pass. */
   enqueued: string[];
-  /** Source ids whose schedule is present but unparseable; these are never scheduled. */
+  /**
+   * Sources whose schedule is present but unparseable, newly reported this pass; these are never
+   * scheduled.
+   */
   invalidSchedules: string[];
   /** Abandoned runs recovered before enqueuing (SRS 7.6). */
   reapedRuns: number;
@@ -43,12 +47,25 @@ export interface SchedulerPassResult {
    * arrived from them for longer than their own schedule allows.
    */
   silentSourceIds: string[];
+  /**
+   * Sources a collection was due for, but for which no adapter is configured (SRS 7.2,
+   * Appendix E), newly reported this pass. A configuration error, not a runtime failure: the
+   * source cannot be collected until its approval is registered, and no retry can change that.
+   */
+  unconfiguredSourceIds: string[];
 }
 
 export interface SourceSchedulerDeps {
   sources: JobSourceRepository;
   sourceRuns: SourceRunRepository;
   tasks: WorkTaskRepository;
+  /**
+   * The same adapter resolver the collection handler runs (SRS 7.2; ADR-0004), consulted
+   * before a task is created. Without it the scheduler cannot tell a source that is due from
+   * one that could never be collected, and every 30-second pass enqueues a task whose only
+   * possible outcome is a permanent failure (audit M4).
+   */
+  resolveAdapter: (sourceId: string) => Promise<JobSourceAdapter | null>;
 }
 
 function positive(value: number, name: string): number {
@@ -94,12 +111,26 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * then a periodic pass with SCHEDULE. A missed window produces exactly one catch-up run, never
  * one per skipped interval, and the active-only dedupe key keeps at most one collection queued
  * per source (SRS 7.5).
+ *
+ * Due-ness alone does not say a source *should* be collected. A source with no registered adapter
+ * stays due forever, because the attempt that would move the clock is the run that can never
+ * happen, so the registry is asked before the queue is written and the source is reported as the
+ * configuration error it is (audit M4).
  */
 export class SourceScheduler {
   private readonly options: ResolvedOptions;
   private started = false;
   private controller?: AbortController;
   private loopPromise?: Promise<void>;
+  /**
+   * Per-source configuration errors already logged. Neither heals on its own — an approval is
+   * registered in code and a schedule is fixed in the row — so repeating it every 30 seconds
+   * would only bury the operator's log under one known-broken source.
+   *
+   * ponytail: the memory is the only record, so a restart re-reports once; persist the finding on
+   * the source row if it must survive restarts without a log search.
+   */
+  private readonly reportedConfigErrors = new Set<string>();
 
   constructor(
     private readonly deps: SourceSchedulerDeps,
@@ -109,9 +140,22 @@ export class SourceScheduler {
     this.options = resolveOptions(options);
   }
 
+  /** Logs the error and returns true when this pass was the first to see this source's problem. */
+  private reportConfigError(
+    key: string,
+    message: string,
+    meta: { sourceId: string; name: string; [detail: string]: unknown },
+  ): boolean {
+    if (this.reportedConfigErrors.has(key)) return false;
+    this.reportedConfigErrors.add(key);
+    this.logger.error(message, meta);
+    return true;
+  }
+
   /**
-   * One pass: recover abandoned runs, then enqueue a collection for every due source.
-   * `runOnce(now, STARTUP)` is the startup catch-up pass.
+   * One pass: recover abandoned runs, then enqueue a collection for every due source the
+   * registry can actually build an adapter for. `runOnce(now, STARTUP)` is the startup
+   * catch-up pass.
    */
   async runOnce(
     now: Date,
@@ -128,17 +172,34 @@ export class SourceScheduler {
     const enqueued: string[] = [];
     const enqueuedIds = new Set<string>();
     const invalidSchedules: string[] = [];
+    const unconfiguredSourceIds: string[] = [];
 
-    const enqueueCollection = async (sourceId: string): Promise<void> => {
-      const payload: SourceCollectionTaskPayload = { sourceId, trigger };
+    const enqueueCollection = async (source: SchedulableSource): Promise<void> => {
+      // Ask the registry before the queue. A source with no adapter still produces a task, and
+      // that task can only fail permanently; because no run is ever created, due-ness never
+      // advances and every pass re-offered the same impossible work (audit M4). The resolve is a
+      // primary-key read, so asking on every pass costs less than the task rows it prevents.
+      if ((await this.deps.resolveAdapter(source.id)) === null) {
+        if (
+          this.reportConfigError(
+            `unconfigured-adapter:${source.id}`,
+            'no adapter is configured for source; it will never be collected',
+            { sourceId: source.id, name: source.name },
+          )
+        ) {
+          unconfiguredSourceIds.push(source.id);
+        }
+        return;
+      }
+      const payload: SourceCollectionTaskPayload = { sourceId: source.id, trigger };
       const result = await this.deps.tasks.enqueueOrConflict({
         type: SOURCE_COLLECTION_TASK_TYPE,
         payload,
-        dedupeKey: sourceCollectionDedupeKey(sourceId),
+        dedupeKey: sourceCollectionDedupeKey(source.id),
       });
-      if (result.created && !enqueuedIds.has(sourceId)) {
-        enqueuedIds.add(sourceId);
-        enqueued.push(sourceId);
+      if (result.created && !enqueuedIds.has(source.id)) {
+        enqueuedIds.add(source.id);
+        enqueued.push(source.id);
       }
     };
 
@@ -147,10 +208,11 @@ export class SourceScheduler {
     // interval - a crash near a scheduled run would silently skip a whole cycle (H3).
     // Enqueue the recovery immediately. The active-only dedupe key makes this idempotent:
     // if the crashed task was deferred and is already waiting, nothing new is created.
-    const schedulable = new Set(sources.map((source) => source.id));
+    const schedulable = new Map(sources.map((source) => [source.id, source]));
     for (const run of reaped) {
-      if (!schedulable.has(run.sourceId)) continue; // disabled or removed: nothing to collect
-      await enqueueCollection(run.sourceId);
+      const source = schedulable.get(run.sourceId);
+      if (source === undefined) continue; // disabled or removed: nothing to collect
+      await enqueueCollection(source);
     }
 
     for (const source of sources) {
@@ -158,19 +220,22 @@ export class SourceScheduler {
 
       const intervalMs = parseScheduleInterval(source.schedule);
       if (intervalMs === null) {
-        invalidSchedules.push(source.id);
-        this.logger.error('source has an unparseable schedule; it will never be collected', {
-          sourceId: source.id,
-          name: source.name,
-          schedule: source.schedule,
-        });
+        if (
+          this.reportConfigError(
+            `unparseable-schedule:${source.id}`,
+            'source has an unparseable schedule; it will never be collected',
+            { sourceId: source.id, name: source.name, schedule: source.schedule },
+          )
+        ) {
+          invalidSchedules.push(source.id);
+        }
         continue;
       }
 
       const dueAt = source.lastAttemptAt === null ? 0 : source.lastAttemptAt.getTime() + intervalMs;
       if (dueAt > now.getTime()) continue;
 
-      await enqueueCollection(source.id);
+      await enqueueCollection(source);
     }
 
     // Silence, the failure this pass is the only place that can see (SRS 7.8). Health is written
@@ -208,7 +273,13 @@ export class SourceScheduler {
       });
     }
 
-    return { enqueued, invalidSchedules, reapedRuns: reaped.length, silentSourceIds };
+    return {
+      enqueued,
+      invalidSchedules,
+      reapedRuns: reaped.length,
+      silentSourceIds,
+      unconfiguredSourceIds,
+    };
   }
 
   /** Run the startup catch-up pass, then a periodic pass until `stop()`. */

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { SourceResultExpectation } from '@domain/types';
 import { HealthStatus, SourceRunStatus, SourceRunTrigger, WorkTaskStatus } from '@domain/enums';
 import { silentWorkerLogger, type WorkerLogger } from '@ports/worker-logger';
-import { SourceScheduler } from '@application/scheduling';
+import { SourceScheduler, type SourceSchedulerDeps } from '@application/scheduling';
 import {
   RunSourceCollection,
   SOURCE_COLLECTION_TASK_TYPE,
@@ -47,9 +47,19 @@ const NOW = new Date();
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
 
-function makeScheduler(logger: WorkerLogger = silentWorkerLogger): SourceScheduler {
+/**
+ * The scheduler only asks the registry "is there an adapter?", so a fake one that never collects
+ * is enough. Every source resolves unless a test says otherwise.
+ */
+const resolveAnyAdapter: SourceSchedulerDeps['resolveAdapter'] = async (sourceId) =>
+  new FakeSourceAdapter(makeFakeConfig({ sourceId }), []);
+
+function makeScheduler(
+  logger: WorkerLogger = silentWorkerLogger,
+  resolveAdapter: SourceSchedulerDeps['resolveAdapter'] = resolveAnyAdapter,
+): SourceScheduler {
   return new SourceScheduler(
-    { sources: sourceRepo, sourceRuns, tasks: taskRepo },
+    { sources: sourceRepo, sourceRuns, tasks: taskRepo, resolveAdapter },
     { staleRunSeconds: STALE_SECONDS },
     logger,
   );
@@ -185,6 +195,63 @@ describe('SourceScheduler skip rules', () => {
     const reported = entries.find((entry) => entry.message.includes('unparseable schedule'));
     expect(reported?.level).toBe('error');
     expect(reported?.meta).toMatchObject({ sourceId, schedule: 'every 6 hours' });
+  });
+
+  it('reports a broken schedule once, not on every pass', async () => {
+    // The same flood the adapter gate closes: due-ness never advances, so the pass keeps meeting
+    // the same broken row every 30 seconds.
+    const sourceId = await createSource('loud', { schedule: 'every 6 hours' });
+    const { logger, entries } = recordingLogger();
+    const scheduler = makeScheduler(logger);
+
+    const first = await scheduler.runOnce(NOW);
+    const second = await scheduler.runOnce(NOW);
+
+    expect(first.invalidSchedules).toEqual([sourceId]);
+    expect(second.invalidSchedules).toEqual([]);
+    expect(entries.filter((entry) => entry.message.includes('unparseable schedule'))).toHaveLength(
+      1,
+    );
+  });
+
+  it('never queues a source whose adapter cannot resolve (audit M4)', async () => {
+    const sourceId = await createSource('unapproved');
+    const { logger, entries } = recordingLogger();
+    const scheduler = makeScheduler(logger, async () => null);
+
+    const result = await scheduler.runOnce(NOW);
+
+    expect(result.enqueued).toEqual([]);
+    expect(result.unconfiguredSourceIds).toEqual([sourceId]);
+    expect(await activeTasks(sourceId)).toHaveLength(0);
+    // Nothing reached the queue, so nothing could fail permanently: the source has no run either.
+    expect(await prisma.sourceRun.count({ where: { sourceId } })).toBe(0);
+
+    const reported = entries.find((entry) => entry.message.includes('no adapter is configured'));
+    expect(reported?.level).toBe('error');
+    expect(reported?.meta).toMatchObject({ sourceId, name: 'unapproved' });
+
+    // The source stays due forever - no run ever advances its clock - so the second pass must be
+    // silent while still naming the source, or one unapproved row fills the log every 30 seconds.
+    const second = await scheduler.runOnce(NOW);
+    expect(second.unconfiguredSourceIds).toEqual([]);
+    expect(entries).toHaveLength(1);
+  });
+
+  it('queues a source whose adapter resolves, and keeps asking the registry per source', async () => {
+    const approved = await createSource('approved');
+    const unapproved = await createSource('also-unapproved');
+    const asked: string[] = [];
+
+    const result = await makeScheduler(silentWorkerLogger, async (sourceId) => {
+      asked.push(sourceId);
+      return sourceId === approved ? resolveAnyAdapter(sourceId) : null;
+    }).runOnce(NOW);
+
+    expect(result.enqueued).toEqual([approved]);
+    expect(result.unconfiguredSourceIds).toEqual([unapproved]);
+    expect(asked).toHaveLength(2); // a lookup, not a queue of tasks that can only fail
+    expect(await activeTasks(unapproved)).toHaveLength(0);
   });
 });
 

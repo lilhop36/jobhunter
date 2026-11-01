@@ -195,7 +195,7 @@ export function createWorkerRuntime(
   );
 
   const scheduler = new SourceScheduler(
-    { sources: jobSources, sourceRuns, tasks },
+    { sources: jobSources, sourceRuns, tasks, resolveAdapter },
     { intervalMs: config.schedulerIntervalMs, staleRunSeconds: config.staleRunSeconds },
     logger,
   );

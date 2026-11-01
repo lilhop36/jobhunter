@@ -54,9 +54,12 @@ a source that is allowed to run at all. A disabled source therefore always repor
 **Approval is not a runtime flag.** Per Appendix E, approval is the existence of an adapter.
 The API does not store, query, or infer it:
 - no `approved` column, no migration, no API-level approval state;
-- an unapproved source (no adapter) that is somehow collected fails permanently at adapter
-  resolution with `no adapter is configured for source <id>`, visible in the run's
-  `errorSummary`;
+- an unapproved source (no adapter) is not queued at all: the scheduler asks the adapter
+  registry before it writes a collection task and names the source as a configuration error
+  (audit M4). A collection started anyway — a manual run, or a task queued by a process that
+  predates the gate — fails permanently at adapter resolution with
+  `no adapter is configured for source <id>`. Neither path opens a run, so nothing lands in
+  run history; the enforcement is the queue gate and the error, not a row to query;
 - `JobSource.accessPolicy` remains the *recorded* approved access mechanism (Appendix E). It
   is not published by the API and is not an authorization input.
 
@@ -83,8 +86,9 @@ the claim latency and is visible in run history. A future ADR may add a
 - A disabled source cannot be collected by schedule or by a manual run.
 - A manual run of a disabled source is refused synchronously, with the standard error
   envelope, and enqueues no work task.
-- Approval behaviour is unchanged; the "no adapter" permanent failure remains the only
-  approval enforcement.
+- Approval has one enforcer: the registry. The scheduler refuses to queue a source it cannot
+  resolve (ADR-0004, amended 2026-11-01) and the handler still fails permanently if a
+  collection starts anyway.
 - No schema change and no migration.
 
 ## Verification

@@ -29,8 +29,11 @@ deliberately left open:
 
 1. Look the source up by id (`JobSourceRepository.findById`).
 2. Match the row's **name** against the registrations; a source with no matching
-   registration resolves null, which the collection handler reports as the existing
-   permanent failure ("no adapter is configured for source \<id\>").
+   registration resolves null. The scheduler asks the same resolver before it queues a
+   collection and reports the source as a configuration error (amended 2026-11-01, audit M4),
+   so the permanent failure the collection handler raises
+   ("no adapter is configured for source \<id\>") is now reached only by a manual run or a task
+   queued before the gate.
 3. Build the adapter from the registration's `config` declarations plus the row's id.
 
 The declarations live **in code, in the registration**, mirroring the approved record.
@@ -53,8 +56,12 @@ residual). Neither blocks the registry.
 - `WorkerRuntimeDeps.resolveAdapter` is optional: production gets the registry resolver,
   tests keep injecting the fake adapter, and nothing else changes.
 - A mismatch between a row's name and its registration is the operational signal, not a
-  second database flag: the collection fails permanently with the explicit "no adapter"
-  error and the run records it.
+  second database flag: the scheduler refuses to queue the source and says so once per
+  process, and a collection that is started anyway (manual run, a task queued by an older
+  process) fails permanently with the explicit "no adapter" error. Neither writes a run row
+  or a health state — nothing was attempted, and `UNKNOWN` is the honest answer (audit M4).
+- `SourceSchedulerDeps` carries `resolveAdapter`, and the worker hands it the same resolver it
+  hands the collection handler, so there is one registry and one question asked of it.
 - `JobSource.accessPolicy` stays inert; it records the approved access mechanism for review
   and is not consulted at runtime.
 
@@ -64,4 +71,7 @@ residual). Neither blocks the registry.
   adapter built from the row's id and the registration's declarations; unregistered name →
   null; unknown id → null; default is `PRODUCTION_ADAPTERS`; an empty registry never
   queries.
+- `tests/integration/source-scheduler.spec.ts` covers the gate: an unresolvable source is never
+  queued, is reported once across passes, and leaves no task row and no run; a mixed registry
+  still enqueues the source that does resolve (audit M4).
 - Full suite and `tsc --noEmit` run after the change (see the increment report).

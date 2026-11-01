@@ -527,6 +527,37 @@ run means the source is always due; the scheduler ignores the enqueue result
 **Fix:** persist an attempt/failure timestamp on `JobSource`, or exclude unresolvable sources from
 `listSchedulable` and surface them as a configuration error.
 
+**Resolved 2026-11-01 by the second branch: the queue is never offered work the registry cannot
+run.** `SourceScheduler` is given the same `resolveAdapter` the collection handler runs
+(`apps/worker/runtime.ts:198`) and asks it inside `enqueueCollection`, before `enqueueOrConflict`,
+on both the due path and the post-reap recovery path
+(`src/application/scheduling/source-scheduler.ts:177-197`). A source with no registered adapter
+produces no task row and no failed attempt; it is named in the pass result as
+`unconfiguredSourceIds` and logged as the configuration error it is — the shape an unparseable
+schedule already used. The registry is consulted only when a collection is due, so the added cost is
+one primary-key read per source per interval. The handler's `PermanentWorkTaskError`
+(`source-collection-handler.ts:108`) stays: a manual run or a task queued by an older process still
+has to say why it cannot run.
+
+"health stays `UNKNOWN`" is left exactly as it is, on purpose. Health is written by a run and no run
+happened; dating `lastErrorAt` or setting `FAILING` would record an event that did not occur, and the
+silence classifier already refuses a verdict for a source that has never succeeded (SRS 7.8). For
+this finding the operator's signal is the error and the pass result, not an unevidenced health state.
+
+The change also closes the flood sitting next to it: an unparseable schedule repeated its error line
+on every 30-second pass for the same reason — due-ness never advances, because no attempt is ever
+recorded — so both findings now report once per process through `reportConfigError`. In-memory is
+the only record, so a restart re-reports; that is the documented `ponytail:` limit, and persisting
+the finding on the source row is the upgrade if it has to survive restarts without a log search.
+Tests: `tests/integration/source-scheduler.spec.ts` —
+`never queues a source whose adapter cannot resolve (audit M4)` (no task row, no run, one error line,
+second pass silent while the source is still due),
+`queues a source whose adapter resolves, and keeps asking the registry per source` (a mixed
+registry: the approved source enqueues, the unapproved one is reported, one lookup per due source),
+and `reports a broken schedule once, not on every pass`. No migration, and nothing that used to be
+collected is now skipped: all three enabled rows in the live database (`EffoySira`, `Ethiojobs`,
+`JobWebEthiopia`) match a registration, checked read-only on 2026-11-01.
+
 #### M5 — Adapter HTTP handling permits SSRF and masks source failures — **new, verified**
 
 JobWebEthiopia extracts arbitrary `href` values from source HTML (`jobwebethiopia.ts:212`) and
@@ -783,7 +814,9 @@ marked theoretical or downgraded.
 
 ### P2 — hardening and hygiene
 
-10. Adapter SSRF/size caps and HTTP-failure accounting (M5); provenance/identity fixes (M6).
+10. A source with no registered adapter re-enqueued on every pass (M4) — **done 2026-11-01**;
+    adapter SSRF/size caps and HTTP-failure accounting (M5) and provenance/identity fixes (M6)
+    remain open.
 11. CI, lint, Prettier dependency, build/migration step in `verify`, supervision/alerting (M8).
 12. Fastify 5 upgrade and dependency re-audit (M8).
 13. Accessibility labels/error association and test strengthening (M9).
