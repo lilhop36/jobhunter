@@ -9,6 +9,12 @@ export default defineConfig({
     // cases. Running files in parallel would let one file TRUNCATE another's
     // fixtures mid-test, so files must be strictly sequential.
     fileParallelism: false,
+    // Every database file opens with `applyTestMigrations()`, which shells out to
+    // `prisma migrate deploy`. That subprocess took over the 10 s hook default when the
+    // suite ran alongside the live worker, failing two files on a hook alone while all
+    // their tests passed. A slow-but-finite setup is not a defect, so the bound is raised
+    // for hooks only - a test that overruns its own budget still fails.
+    hookTimeout: 120_000,
   },
   resolve: {
     alias: {
