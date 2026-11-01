@@ -24,6 +24,14 @@ const NOW_UTC_SQL = "date_trunc('milliseconds', now() AT TIME ZONE 'UTC')";
 const NOW_UTC = Prisma.raw(NOW_UTC_SQL);
 
 /**
+ * The same database instant as an unconverted `timestamptz`, for the columns that store one
+ * (`lastHeartbeatAt`, `oldestListingPublishedAt`). `NOW_UTC` must *not* be used for those: it
+ * strips the zone, and PostgreSQL would then re-resolve the value in the session's zone on the
+ * way in - the exact shift ENG-022 exists to prevent.
+ */
+const NOW_TZ = Prisma.raw('now()');
+
+/**
  * Partial-index predicate values, spliced from the domain constant so the query
  * layer can never drift from the enum or from the `one_active_run_per_source`
  * migration. Values are code-controlled enum members, not external input.
@@ -43,7 +51,7 @@ const SOURCE_RUN_COLUMNS = Prisma.raw(`
   "jobsDuplicate", "jobsRejected", "undeduplicable", "fallbackIdentities",
   "parseFailures", "httpFailures",
   "unexpectedZeroResults", "catalogueExhausted", "oldestListingPublishedAt",
-  "enrichmentScheduled", "errorSummary"
+  "enrichmentScheduled", "lastHeartbeatAt", "errorSummary"
 `);
 
 /** The partial unique index that enforces FR-003 source exclusivity. */
@@ -70,6 +78,7 @@ interface SourceRunRow {
   catalogueExhausted: boolean;
   oldestListingPublishedAt: Date | string | null;
   enrichmentScheduled: boolean;
+  lastHeartbeatAt: Date | string | null;
   errorSummary: string | null;
 }
 
@@ -108,6 +117,7 @@ function toRecord(row: SourceRunRow): SourceRunRecord {
     oldestListingPublishedAt:
       row.oldestListingPublishedAt === null ? null : toDate(row.oldestListingPublishedAt),
     enrichmentScheduled: row.enrichmentScheduled,
+    lastHeartbeatAt: row.lastHeartbeatAt === null ? null : toDate(row.lastHeartbeatAt),
     errorSummary: row.errorSummary,
   };
 }
@@ -148,12 +158,16 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
   async start(input: StartSourceRunInput): Promise<SourceRunRecord> {
     const trigger = input.trigger ?? SourceRunTrigger.SCHEDULE;
     try {
+      // The run opens with its liveness already stated: creating the row is the worker proving
+      // it is working on it right now, so the sweep never has to fall back to guessing from
+      // `startedAt` for a run started after M2 (audit M2).
       const rows = await this.prisma.$queryRaw<SourceRunRow[]>`
         INSERT INTO "source_runs"
-          ("id", "sourceId", "status", "trigger", "startedAt", "createdAt", "updatedAt")
+          ("id", "sourceId", "status", "trigger", "startedAt", "lastHeartbeatAt",
+           "createdAt", "updatedAt")
         VALUES
           (gen_random_uuid(), ${input.sourceId}::uuid, 'RUNNING'::"SourceRunStatus",
-           ${trigger}::"SourceRunTrigger", ${NOW_UTC}, ${NOW_UTC}, ${NOW_UTC})
+           ${trigger}::"SourceRunTrigger", ${NOW_UTC}, ${NOW_TZ}, ${NOW_UTC}, ${NOW_UTC})
         RETURNING ${SOURCE_RUN_COLUMNS}
       `;
       return toRecord(rows[0]);
@@ -236,6 +250,35 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
     });
   }
 
+  /**
+   * Restate this run's liveness, and answer whether the run still belongs to its worker.
+   *
+   * Fenced on the active statuses exactly like `finalize`, so the same write doubles as the
+   * probe the collection loop consults between records (audit M2): false means the run was
+   * reclaimed or finalized, and the worker that kept writing would be a zombie whose outcome is
+   * discarded anyway. The update is scoped to the run id, so a replacement run for the same
+   * source cannot make a dead run's heartbeat succeed.
+   */
+  async heartbeat(runId: string): Promise<boolean> {
+    const updated = await this.prisma.$executeRaw`
+      UPDATE "source_runs"
+      SET "lastHeartbeatAt" = ${NOW_TZ},
+          "updatedAt" = ${NOW_UTC}
+      WHERE "id" = ${runId}::uuid
+        AND "status" IN (${ACTIVE_RUN_STATUS_LIST})
+    `;
+    return updated === 1;
+  }
+
+  /**
+   * Fail every run that is still active and has been silent for more than `maxDurationSeconds`
+   * on the database clock (ENG-025, redefined by audit M2 to judge inactivity rather than age).
+   *
+   * The comparison mixes two timestamp flavours by design: `startedAt` is the naive `timestamp(3)`
+   * column the table was created with, `lastHeartbeatAt` is a `timestamptz`. `AT TIME ZONE 'UTC'`
+   * is what makes the naive one an instant (ADR-0010 section 2.1); omitting it would read a run
+   * started "now" as three hours old in this session's zone and reap live runs on sight.
+   */
   async reapStaleRuns(maxDurationSeconds: number): Promise<SourceRunRecord[]> {
     assertPositiveSeconds(maxDurationSeconds, 'maxDurationSeconds');
     const rows = await this.prisma.$queryRaw<SourceRunRow[]>`
@@ -248,7 +291,10 @@ export class PrismaSourceRunRepository implements SourceRunRepository {
           "errorSummary" = ${SOURCE_RUN_LEASE_EXPIRED_REASON},
           "updatedAt" = ${NOW_UTC}
       WHERE "status" IN (${ACTIVE_RUN_STATUS_LIST})
-        AND "startedAt" < ${NOW_UTC} - make_interval(secs => ${maxDurationSeconds}::double precision)
+        AND COALESCE(
+              "lastHeartbeatAt",
+              ("startedAt" AT TIME ZONE 'UTC')
+            ) < ${NOW_TZ} - make_interval(secs => ${maxDurationSeconds}::double precision)
       RETURNING ${SOURCE_RUN_COLUMNS}
     `;
     return rows.map(toRecord);

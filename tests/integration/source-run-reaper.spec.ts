@@ -46,12 +46,47 @@ async function createSource(name: string): Promise<string> {
   return source.id;
 }
 
-/** Move a run's start time into the past so staleness can be tested without waiting. */
+/**
+ * Move a run's liveness evidence into the past so abandonment can be tested without waiting.
+ *
+ * Both timestamps move together because that is what a dead worker's row actually looks like.
+ * Since M2 the sweep judges the heartbeat rather than the age, so aging `startedAt` alone would
+ * leave the run looking alive and the reclaim would never happen.
+ */
 async function ageRun(runId: string, seconds: number): Promise<void> {
+  await prisma.$executeRaw`
+    UPDATE "source_runs"
+    SET "startedAt" = ${DB_NOW_UTC} - make_interval(secs => ${seconds}::double precision),
+        "lastHeartbeatAt" = now() - make_interval(secs => ${seconds}::double precision)
+    WHERE "id" = ${runId}::uuid
+  `;
+}
+
+/**
+ * Age only the start time, leaving the heartbeat where the run opened it: a run whose worker is
+ * still working, just slowly. This is the state that M2 exists to distinguish from abandonment.
+ */
+async function ageStartedOnly(runId: string, seconds: number): Promise<void> {
   await prisma.$executeRaw`
     UPDATE "source_runs"
     SET "startedAt" = ${DB_NOW_UTC} - make_interval(secs => ${seconds}::double precision)
     WHERE "id" = ${runId}::uuid
+  `;
+}
+
+/** Make a young run stop reporting, as a worker that died after its first batch would. */
+async function silenceRun(runId: string, seconds: number): Promise<void> {
+  await prisma.$executeRaw`
+    UPDATE "source_runs"
+    SET "lastHeartbeatAt" = now() - make_interval(secs => ${seconds}::double precision)
+    WHERE "id" = ${runId}::uuid
+  `;
+}
+
+/** Strip the liveness signal, leaving only a start time: a row written before the column existed. */
+async function dropHeartbeat(runId: string): Promise<void> {
+  await prisma.$executeRaw`
+    UPDATE "source_runs" SET "lastHeartbeatAt" = NULL WHERE "id" = ${runId}::uuid
   `;
 }
 
@@ -299,6 +334,111 @@ describe('stale run recovery (ENG-025)', () => {
     expect(runs).toHaveLength(2);
     expect(runs.map((row) => row.status)).toEqual(['FAILED', 'SUCCEEDED']);
     expect(runs.filter((row) => row.status === 'RUNNING')).toHaveLength(0);
+  });
+});
+
+describe('run liveness (audit M2)', () => {
+  // The finding was that age was the only evidence available, so a run that legitimately took
+  // longer than the stale window was reclaimed *while it was working*: its source was unlocked,
+  // a replacement run started, and the original's outcome was thrown away at finalize. These
+  // cases pin the two directions of the fix separately - a slow run survives, a silent one dies.
+  it('does not reclaim a run that is old but still reporting', async () => {
+    const run = await repo.start({ sourceId: await createSource('slow-but-live') });
+    await ageStartedOnly(run.id, 120);
+
+    const reaped = await repo.reapStaleRuns(60);
+
+    expect(reaped).toEqual([]);
+    const stored = await repo.findById(run.id);
+    expect(stored?.status).toBe(SourceRunStatus.RUNNING);
+    expect(stored?.lastHeartbeatAt).toBeInstanceOf(Date);
+  });
+
+  it('reclaims a young run that stopped reporting', async () => {
+    const run = await repo.start({ sourceId: await createSource('silent-worker') });
+    await silenceRun(run.id, 120);
+
+    const reaped = await repo.reapStaleRuns(60);
+
+    expect(reaped.map((record) => record.id)).toEqual([run.id]);
+    expect(reaped[0].status).toBe(SourceRunStatus.FAILED);
+    expect(reaped[0].errorSummary).toBe(SOURCE_RUN_LEASE_EXPIRED_REASON);
+  });
+
+  it('heartbeats a run whose start is older than its own stale window, keeping it alive', async () => {
+    const run = await repo.start({ sourceId: await createSource('long-run-with-beats') });
+    await ageStartedOnly(run.id, 600);
+
+    // One report per sweep: the run is 10 minutes old against a 60-second window and survives
+    // every pass, which is the whole point - the bound is on silence, never on duration.
+    for (let pass = 0; pass < 3; pass += 1) {
+      expect(await repo.heartbeat(run.id)).toBe(true);
+      expect(await repo.reapStaleRuns(60)).toEqual([]);
+    }
+    expect((await repo.findById(run.id))?.status).toBe(SourceRunStatus.RUNNING);
+  });
+
+  it('falls back to the start time for a run that never heartbeated', async () => {
+    // A row written before the column exists has no liveness signal of its own, so its start is
+    // the only evidence - the fallback must not turn every legacy run into a permanent lock.
+    const stale = await repo.start({ sourceId: await createSource('legacy-stale') });
+    await dropHeartbeat(stale.id);
+    await ageStartedOnly(stale.id, 120);
+
+    // Positive control: an equally legacy run that is *inside* the window must not be reclaimed.
+    // Without the explicit UTC conversion, the naive `startedAt` is read in this session's zone
+    // and looks hours older than it is, so this row would be reaped too.
+    const recent = await repo.start({ sourceId: await createSource('legacy-recent') });
+    await dropHeartbeat(recent.id);
+    await ageStartedOnly(recent.id, 5);
+
+    const reaped = await repo.reapStaleRuns(60);
+
+    expect(reaped.map((record) => record.id)).toEqual([stale.id]);
+    expect((await repo.findById(recent.id))?.status).toBe(SourceRunStatus.RUNNING);
+  });
+
+  it('stamps liveness from the database clock and reports the run still active', async () => {
+    const run = await repo.start({ sourceId: await createSource('beat') });
+    await silenceRun(run.id, 300);
+
+    expect(await repo.heartbeat(run.id)).toBe(true);
+
+    const stored = await repo.findById(run.id);
+    expect(stored?.lastHeartbeatAt).toBeInstanceOf(Date);
+    expect(stored!.lastHeartbeatAt!.getTime()).toBeGreaterThan(Date.now() - 10_000);
+  });
+
+  it('refuses to heartbeat a run that is no longer active', async () => {
+    const finalizedRun = await repo.start({ sourceId: await createSource('beat-finalized') });
+    await repo.finalize(finalizedRun.id, HEALTHY_RUN, null);
+
+    const reapedRun = await repo.start({ sourceId: await createSource('beat-reaped') });
+    await ageRun(reapedRun.id, 120);
+    await repo.reapStaleRuns(60);
+
+    // A false return is the loop's signal to stop: the run it is writing into is gone, so the
+    // only outcome still available to this worker is the one the reaper already recorded.
+    expect(await repo.heartbeat(finalizedRun.id)).toBe(false);
+    expect(await repo.heartbeat(reapedRun.id)).toBe(false);
+
+    const stored = await repo.findById(reapedRun.id);
+    expect(stored?.status).toBe(SourceRunStatus.FAILED);
+    expect(stored?.errorSummary).toBe(SOURCE_RUN_LEASE_EXPIRED_REASON);
+  });
+
+  it('leaves a different run untouched when one heartbeats', async () => {
+    const [sourceA, sourceB] = await Promise.all([createSource('beat-a'), createSource('beat-b')]);
+    const runA = await repo.start({ sourceId: sourceA });
+    const runB = await repo.start({ sourceId: sourceB });
+    await silenceRun(runB.id, 300);
+    const beforeB = (await repo.findById(runB.id))?.lastHeartbeatAt;
+
+    expect(await repo.heartbeat(runA.id)).toBe(true);
+
+    // Scoped to its own row: a live run cannot keep a dead one's replacement-looking row alive,
+    // and it certainly cannot keep another source's run alive.
+    expect((await repo.findById(runB.id))?.lastHeartbeatAt).toEqual(beforeB);
   });
 });
 

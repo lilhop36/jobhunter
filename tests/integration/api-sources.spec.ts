@@ -62,6 +62,8 @@ describe('API /api/sources endpoints', () => {
       trigger: SourceRunTrigger;
       jobsDiscovered: number;
       jobsAccepted: number;
+      /** Defaults to the start time, as `start()` does; pass null for a pre-M2 legacy row. */
+      lastHeartbeatAt?: Date | null;
     }>;
   }> = {}) {
     const source = await prisma.jobSource.create({
@@ -89,6 +91,7 @@ describe('API /api/sources endpoints', () => {
             status: run.status,
             trigger: run.trigger,
             startedAt,
+            lastHeartbeatAt: run.lastHeartbeatAt === undefined ? startedAt : run.lastHeartbeatAt,
             finishedAt: run.status === 'RUNNING' ? null : new Date(startedAt.getTime() + 1000),
             durationMs: run.status === 'RUNNING' ? null : 1000,
             jobsDiscovered: run.jobsDiscovered,
@@ -386,6 +389,57 @@ describe('API /api/sources endpoints', () => {
       expect(body.latestRun).not.toBeNull();
       expect(body.latestRun?.status).toBe('SUCCEEDED');
       expect(body.latestRun?.jobsDiscovered).toBe(10); // Most recent
+    });
+
+    // Audit M2: an operator deciding whether to wait for an in-flight run needs its last
+    // liveness report, not only its start time. The instant is stored as timestamptz, so the
+    // value that comes back is the one that went in regardless of this session's zone.
+    it('publishes when a source run last reported itself alive', async () => {
+      const heartbeatAt = new Date('2026-01-01T00:04:20.000Z');
+      const source = await createSourceWithRuns({
+        name: 'in-flight-source',
+        runs: [
+          {
+            status: SourceRunStatus.RUNNING,
+            trigger: SourceRunTrigger.MANUAL,
+            jobsDiscovered: 3,
+            jobsAccepted: 1,
+            lastHeartbeatAt: heartbeatAt,
+          },
+        ],
+      });
+
+      const response = await authorized(app, principal, {
+        method: 'GET',
+        url: `/api/sources/${source.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.latestRun?.status).toBe('RUNNING');
+      expect(body.latestRun?.lastHeartbeatAt).toBe(heartbeatAt.toISOString());
+    });
+
+    it('reports no liveness for a run written before the heartbeat column existed', async () => {
+      const source = await createSourceWithRuns({
+        name: 'legacy-source',
+        runs: [
+          {
+            status: SourceRunStatus.RUNNING,
+            trigger: SourceRunTrigger.SCHEDULE,
+            jobsDiscovered: 0,
+            jobsAccepted: 0,
+            lastHeartbeatAt: null,
+          },
+        ],
+      });
+
+      const response = await authorized(app, principal, {
+        method: 'GET',
+        url: `/api/sources/${source.id}`,
+      });
+
+      expect(JSON.parse(response.body).latestRun?.lastHeartbeatAt).toBeNull();
     });
 
     it('returns 404 for unknown source', async () => {

@@ -175,6 +175,7 @@ export function createWorkerRuntime(
         collection,
         staleRunSeconds: config.staleRunSeconds,
         acquisitionTimeoutMs: config.acquisitionTimeoutMs,
+        sourceRunHeartbeatMs: config.sourceRunHeartbeatMs,
         sweep: (sourceId) => sweepLifecycle.sweep(sourceId),
         logger,
       }),

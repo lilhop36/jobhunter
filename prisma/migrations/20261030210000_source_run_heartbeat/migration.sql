@@ -1,0 +1,11 @@
+-- An active collection run has no liveness signal, so the recovery sweep judges it by elapsed
+-- duration only: a run whose persistence legitimately outlives the stale bound is reclaimed while
+-- it is still working, releasing the one-active-run lock and letting a second run collect the same
+-- source (audit M2). The sweep now reaps on *inactivity*, and this is the column it reads.
+--
+-- Nullable with no backfill: NULL means the run never heartbeated, which is every row written
+-- before this change, and for those the start time stays the only evidence of life. Timezone-aware
+-- per ENG-022, unlike the naive `timestamp(3)` columns it is COALESCEd with in the reaper; that
+-- comparison converts the naive side with `AT TIME ZONE 'UTC'` (ADR-0010 §2.1), so the reap
+-- boundary cannot move with the session's zone.
+ALTER TABLE "source_runs" ADD COLUMN "lastHeartbeatAt" timestamptz(3);

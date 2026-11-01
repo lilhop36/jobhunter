@@ -214,6 +214,9 @@ function serializeRun(run: SourceRunSummary) {
     httpFailures: run.httpFailures,
     unexpectedZeroResults: run.unexpectedZeroResults,
     enrichmentScheduled: run.enrichmentScheduled,
+    // Liveness evidence for a run still in flight (audit M2): a `RUNNING` row with a recent
+    // report is a working collection, one with an old report is a worker that went away.
+    lastHeartbeatAt: asIso(run.lastHeartbeatAt),
     errorSummary: run.errorSummary,
   };
 }

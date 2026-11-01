@@ -40,6 +40,7 @@ function toRunSummary(run: SourceRun): SourceRunSummary {
     httpFailures: run.httpFailures,
     unexpectedZeroResults: run.unexpectedZeroResults,
     enrichmentScheduled: run.enrichmentScheduled,
+    lastHeartbeatAt: run.lastHeartbeatAt,
     errorSummary: run.errorSummary,
   };
 }

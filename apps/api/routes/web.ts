@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { SourceRunStatus } from '@domain/enums';
 import { MATCHER_VERSION } from '@domain/matching';
 import { classifySourceSilence } from '@domain/health/source-silence';
 import { NOTIFICATION_ELIGIBILITY_VERSION, NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
@@ -23,7 +24,11 @@ import type {
 } from '@ports/candidate-profile-repository';
 import type { JobCursor, JobDetail, JobReader, JobSummary } from '@ports/job-reader';
 import type { JobMatchRecord, JobMatchRepository, MatchCursor } from '@ports/job-match-repository';
-import type { JobSourceRepository, SourceDetail } from '@ports/job-source-repository';
+import type {
+  JobSourceRepository,
+  SourceDetail,
+  SourceRunSummary,
+} from '@ports/job-source-repository';
 import type { NotificationRecord, NotificationRepository } from '@ports/notification-repository';
 import type { TelegramLinkTokenStore } from '@ports/telegram-linking';
 import { encodeCursor } from '../cursor';
@@ -719,17 +724,46 @@ ${sources.map((source) => {
       : silence.silent
         ? 'silent'
         : 'delivering';
+    const run = source.latestRun;
     return html`<tr>
 <td>${source.name}</td>
 <td>${source.healthStatus}</td>
 <td>${source.lastSuccessfulRunAt === null ? unknownMark() : isoDate(source.lastSuccessfulRunAt)}</td>
-<td>${source.latestRun === null ? unknownMark() : source.latestRun.status}</td>
-<td>${source.latestRun !== null && source.latestRun.unexpectedZeroResults ? 'yes' : 'no'}</td>
+<td>${run === null ? unknownMark() : latestRunCell(run, now)}</td>
+<td>${run !== null && run.unexpectedZeroResults ? 'yes' : 'no'}</td>
 <td title="${silence.reason ?? 'within its declared schedule'}">${delivery}</td>
 </tr>`;
   })}
 </tbody>
 </table>`;
+}
+
+/**
+ * The latest run, with the liveness evidence a run in flight carries (audit M2).
+ *
+ * A `RUNNING` row only means something next to its last report: the recovery sweep reaps a run
+ * that goes silent for the stale window, not one that merely takes a long time. So "RUNNING,
+ * reported 40 s ago" is a collection still working, while "RUNNING, reported 3 h ago" is a
+ * worker that went away and has not been swept yet - two different situations that the status
+ * alone cannot tell apart, and the operator should not have to guess which one they are looking
+ * at. A finished run has no liveness to report, so its cell stays as it was.
+ */
+function latestRunCell(run: SourceRunSummary, now: Date): Html {
+  if (run.status !== SourceRunStatus.RUNNING) return html`${run.status}`;
+  if (run.lastHeartbeatAt === null) return html`${run.status}`;
+  const ageMs = Math.max(0, now.getTime() - run.lastHeartbeatAt.getTime());
+  return html`${run.status} <span title="last reported ${isoDate(run.lastHeartbeatAt)}">(${formatAge(
+    ageMs,
+  )} ago)</span>`;
+}
+
+/** How long ago, in the unit a human reads first. Only ever used for spans of minutes or hours. */
+function formatAge(ageMs: number): string {
+  const seconds = Math.round(ageMs / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.round(minutes / 60)} h`;
 }
 
 /** Fixed SRS 4.6 order, so the breakdown reads the same way as the weights it came from. */

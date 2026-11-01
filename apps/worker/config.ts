@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { resolveSourceRunHeartbeatMs } from '@domain/types';
 
 /**
  * Worker configuration (SRS 7.2 / 7.6, ENG-017).
@@ -23,10 +24,20 @@ export interface WorkerConfig {
   reaperIntervalMs?: number;
   /** How often the scheduler re-evaluates due sources, in milliseconds. */
   schedulerIntervalMs?: number;
-  /** An active collection run older than this many seconds is abandoned (ENG-025). */
+  /**
+   * How long an active collection run may stay *silent* before it is treated as abandoned
+   * (ENG-025). Since audit M2 this is a bound on inactivity, not on duration: a run that reports
+   * itself is never reclaimed however long it takes, so this is the recovery window after a
+   * worker stops reporting, not a run timeout.
+   */
   staleRunSeconds: number;
   /** Upper bound on one source acquisition, in milliseconds (ENG-031). */
   acquisitionTimeoutMs: number;
+  /**
+   * How often a collection run restates that it is still working (audit M2), in milliseconds.
+   * Absent means the use case's own default, which adapts to `staleRunSeconds`.
+   */
+  sourceRunHeartbeatMs?: number;
   /**
    * The Telegram bot credential (SRS 8.3: environment/secret-managed). When it is absent the
    * dispatcher deliberately does not run: there is no "send anyway" path, because a phoney
@@ -96,8 +107,22 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerC
     );
   }
 
-  const heartbeat = optionalPositiveNumber(env, 'WORKER_HEARTBEAT_MS');
-  if (heartbeat !== undefined) {
+  // The stale bound is a bound on *silence* (audit M2), so a run must be able to report inside
+  // it. A beat that cannot occur before the window closes would reclaim a run that is alive and
+  // writing - the exact failure the heartbeat column exists to remove - so this combination is
+  // refused rather than quietly shortened.
+  const sourceRunHeartbeatMs = optionalPositiveNumber(env, 'SOURCE_RUN_HEARTBEAT_MS');
+  if (sourceRunHeartbeatMs !== undefined) {
+    try {
+      resolveSourceRunHeartbeatMs(staleRunSeconds, sourceRunHeartbeatMs);
+    } catch (error) {
+      throw new WorkerConfigError(
+        `SOURCE_RUN_HEARTBEAT_MS: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  const heartbeat = optionalPositiveNumber(env, 'WORKER_HEARTBEAT_MS');  if (heartbeat !== undefined) {
     const leaseSeconds = optionalPositiveNumber(env, 'WORKER_LEASE_SECONDS') ?? 60;
     if (heartbeat >= leaseSeconds * 1000) {
       // Fail here with the variable names rather than letting the worker throw a bare
@@ -119,5 +144,6 @@ export function parseWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerC
     notificationDispatchIntervalMs: optionalPositiveNumber(env, 'NOTIFICATION_DISPATCH_INTERVAL_MS'),
     staleRunSeconds,
     acquisitionTimeoutMs,
+    sourceRunHeartbeatMs,
   };
 }

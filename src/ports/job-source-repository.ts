@@ -76,6 +76,11 @@ export interface SourceRunSummary {
   httpFailures: number;
   unexpectedZeroResults: boolean;
   enrichmentScheduled: boolean;
+  /**
+   * When a run in flight last reported itself working (audit M2); null on a row that predates
+   * the column. Only meaningful for a `RUNNING` run — a terminal one is dated by `finishedAt`.
+   */
+  lastHeartbeatAt: Date | null;
   errorSummary: string | null;
 }
 

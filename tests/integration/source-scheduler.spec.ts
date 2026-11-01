@@ -334,7 +334,10 @@ describe('scheduled collection end to end', () => {
       data: {
         sourceId,
         status: SourceRunStatus.RUNNING,
+        // A worker that died mid-collection stops reporting, so both liveness timestamps sit
+        // where its last beat did (audit M2: the sweep judges silence, not the start time).
         startedAt: new Date(Date.now() - 10 * MINUTE),
+        lastHeartbeatAt: new Date(Date.now() - 10 * MINUTE),
       },
     });
     const task = await taskRepo.enqueue({
@@ -379,10 +382,13 @@ describe('scheduled collection end to end', () => {
       SourceRunStatus.RUNNING,
     );
 
-    // The stale window elapses: the abandoned run is now reclaimable, and the deferred task
-    // becomes due. Nothing in the scheduler or the interval is involved from here on.
+    // The stale window elapses: the abandoned run has been quiet past its safety bound, so it is
+    // reclaimable and the deferred task becomes due. Nothing in the scheduler or the interval is
+    // involved from here on.
     await prisma.$executeRaw`
-      UPDATE "source_runs" SET "startedAt" = (now() AT TIME ZONE 'UTC') - interval '2 hours'
+      UPDATE "source_runs"
+      SET "startedAt" = (now() AT TIME ZONE 'UTC') - interval '2 hours',
+          "lastHeartbeatAt" = now() - interval '2 hours'
       WHERE "id" = ${crashed.id}::uuid
     `;
     await prisma.$executeRaw`

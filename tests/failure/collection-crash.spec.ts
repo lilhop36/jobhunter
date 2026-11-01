@@ -144,13 +144,19 @@ function countJobs(sourceId: string): Promise<number> {
   return prisma.job.count({ where: { sourceId } });
 }
 
-async function isSourceRunStale(runId: string): Promise<boolean> {
-  const rows = await prisma.$queryRaw<Array<{ stale: boolean }>>`
-    SELECT (${Prisma.raw(DB_NOW_UTC)} - "startedAt") > (${COLLECTION_STALE_RUN_SECONDS} * interval '1 second') AS "stale"
+/**
+ * Whether the abandoned run has been quiet past its safety bound - the precondition the recovery
+ * sweep actually judges since audit M2. Mirrors the repository predicate, including the fallback
+ * to the start time for a row that never stamped a heartbeat.
+ */
+async function isSourceRunSilent(runId: string): Promise<boolean> {
+  const rows = await prisma.$queryRaw<Array<{ silent: boolean }>>`
+    SELECT COALESCE("lastHeartbeatAt", ("startedAt" AT TIME ZONE 'UTC'))
+             < now() - (${COLLECTION_STALE_RUN_SECONDS} * interval '1 second') AS "silent"
     FROM "source_runs"
     WHERE "id" = ${runId}::uuid
   `;
-  return rows.length === 1 && rows[0].stale;
+  return rows.length === 1 && rows[0].silent;
 }
 
 async function isTaskLeaseExpired(taskId: string): Promise<boolean> {
@@ -332,9 +338,9 @@ describe('collection crash recovery through the real worker entry point', () => 
       expect(promotedKeys).not.toContain(`sid:${COLLECTION_BLOCKING_IDENTIFIER}`);
 
       // Wait for genuine time-based recovery preconditions, both on the database clock: the
-      // abandoned run exceeds its safety bound, and the dead worker's lease lapses.
-      await waitFor('the abandoned source run to exceed its safety bound', () =>
-        isSourceRunStale(abandoned.runId),
+      // abandoned run has gone quiet past its safety bound, and the dead worker's lease lapses.
+      await waitFor('the abandoned source run to fall silent past its safety bound', () =>
+        isSourceRunSilent(abandoned.runId),
       );
       await waitFor('the abandoned task lease to expire', () => isTaskLeaseExpired(enqueued.id));
 

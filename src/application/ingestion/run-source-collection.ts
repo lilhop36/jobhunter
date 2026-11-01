@@ -14,6 +14,7 @@ import {
 import {
   SourceResultExpectation,
   isUnexpectedZeroResult,
+  resolveSourceRunHeartbeatMs,
   type NormalizedJob,
   type RawJobEvidence,
   type SourceRunRecord,
@@ -79,6 +80,14 @@ import type { WorkerLogger } from '@ports/worker-logger';
  * evidence is already persisted, so the evidence is never lost and the rest of the run
  * continues. Abandoned runs from a crashed worker are recovered by reaping stale runs
  * before the new run starts (ENG-025).
+ *
+ * A run in flight reports itself between records (audit M2): the same write restates its
+ * liveness, so the recovery sweep can tell a slow run from a dead one and never reclaim a
+ * working one for taking longer than the stale window, and the answer tells this loop whether
+ * the run is still its own. A run that was reclaimed stops writing on the spot rather than
+ * finishing as a zombie whose counters, health and coverage claim are discarded at finalize.
+ * A heartbeat that cannot be written is not evidence of death - the worker is plainly still
+ * here - so that beat is logged and the run carries on.
  *
  * ## Source health
  *
@@ -194,6 +203,14 @@ export interface RunSourceCollectionInput {
    * boundary so a non-cooperative adapter cannot hang the attempt forever.
    */
   acquisitionTimeoutMs: number;
+  /**
+   * How often this run restates that it is still working (audit M2), in milliseconds. The run
+   * reports between records and, on each report, learns whether the run is still its own: a run
+   * reclaimed by the recovery sweep stops writing instead of finishing as a zombie whose outcome
+   * is discarded. Omitted means the default, adapted to `staleRunSeconds` - see
+   * `resolveSourceRunHeartbeatMs`.
+   */
+  heartbeatMs?: number;
   /** Defaults to SCHEDULE. */
   trigger?: SourceRunTrigger;
   /**
@@ -235,6 +252,11 @@ export class RunSourceCollection {
         `acquisitionTimeoutMs must be a positive number of milliseconds, received ${input.acquisitionTimeoutMs}`,
       );
     }
+
+    // Resolved before any work, including before opening a run: an interval that cannot fit
+    // inside the stale window would let this very run be reclaimed while it is alive, which is
+    // the failure the heartbeat exists to remove (audit M2).
+    const heartbeatMs = resolveSourceRunHeartbeatMs(input.staleRunSeconds, input.heartbeatMs);
 
     const funnel: CollectionFunnel = {
       collected: 0,
@@ -386,15 +408,57 @@ export class RunSourceCollection {
     const records = collection.records;
     funnel.collected = records.length;
     let abortedAt: number | null = null;
+    // Set when the recovery sweep took this run away mid-loop: the row is already terminal, so
+    // every further record this attempt writes belongs to a run that no longer exists (M2).
+    let reclaimedAt: number | null = null;
     // Records this run could not write at all. Unlike a parse failure, their evidence did not
     // reach `raw_jobs`, so they cannot be counted as retained and must not read as healthy.
     let storageFailures = 0;
+    // The first beat is immediate, not one interval in: acquisition has already consumed part of
+    // the stale window by now, so waiting a whole interval before the first report could let a
+    // legitimately slow acquisition be reclaimed before the run ever proved it was working.
+    let nextBeatAt = Date.now();
 
     for (let index = 0; index < records.length; index += 1) {
       if (externalSignal?.aborted) {
         abortedAt = index;
         break;
       }
+
+      // Liveness (audit M2): between records, the run restates that it is still working and, in
+      // the same fenced write, learns whether the run is still its own. A run that was reclaimed
+      // as abandoned stops here instead of carrying on as a zombie whose outcome is discarded at
+      // finalize - by then, counters, health and the coverage claim are all lost anyway.
+      if (Date.now() >= nextBeatAt) {
+        nextBeatAt = Date.now() + heartbeatMs;
+        let stillOurs: boolean;
+        try {
+          stillOurs = await this.deps.sourceRuns.heartbeat(run.id);
+        } catch (error) {
+          // An unreadable answer is not evidence that the run died - the worker is demonstrably
+          // here, doing this work. The beat is reported as missed and retried next interval;
+          // the fenced finalizer stays the authority on what this attempt may record.
+          stillOurs = true;
+          this.deps.logger.warn('could not restate run liveness; the run continues', {
+            sourceId,
+            runId: run.id,
+            error: describeError(error),
+          });
+        }
+        if (!stillOurs) {
+          reclaimedAt = index;
+          // Worth its own line: everything this attempt records afterwards is discarded, so the
+          // only lasting trace of a reclaimed run is the sweep's LEASE_EXPIRED row plus this.
+          this.deps.logger.warn('run was reclaimed while this worker was still writing; stopping', {
+            sourceId,
+            runId: run.id,
+            recordsWrittenBeforeStopping: index,
+            recordsRemaining: records.length - index,
+          });
+          break;
+        }
+      }
+
       const record = records[index];
 
       // SRS 7.7 step 4: raw evidence is persisted *before* any downstream promotion, so
@@ -511,7 +575,16 @@ export class RunSourceCollection {
     const unexpectedZeroResults = isUnexpectedZeroResult(funnel.collected, expectation);
 
     let status: TerminalRunStatus;
-    if (abortedAt !== null) {
+    if (reclaimedAt !== null) {
+      // The run was already reclaimed as abandoned, so this attempt can record nothing: the row
+      // it belongs to is terminal, and its finalize is fenced. The status describes what this
+      // worker actually did - it stopped part-way - and the note is for the log, not the row.
+      status = SourceRunStatus.PARTIAL;
+      notes.push(
+        `run was reclaimed as abandoned after ${reclaimedAt} of ${records.length} records; ` +
+          'this attempt stopped writing',
+      );
+    } else if (abortedAt !== null) {
       status = SourceRunStatus.PARTIAL;
       notes.push(`aborted after ${abortedAt} of ${records.length} records (worker shutdown)`);
     } else if (unexpectedZeroResults) {
@@ -529,16 +602,19 @@ export class RunSourceCollection {
       status = SourceRunStatus.SUCCEEDED;
     }
 
+    // Neither a shutdown nor a reclaimed run may claim coverage or a source verdict: in both
+    // cases the worker, not the source, decided when the run ended.
+    const endedForTheWorker = abortedAt !== null || reclaimedAt !== null;
+
     return this.finish(run, funnel, {
       status,
       unexpectedZeroResults,
       // Coverage is only claimable when the run finished reading the listing; a run that
       // aborted part-way leaves both the end and the window floor uncertain.
-      catalogueExhausted: collection.catalogueExhausted && abortedAt === null,
-      oldestListingPublishedAt:
-        abortedAt === null ? collection.oldestListingPublishedAt : null,
+      catalogueExhausted: collection.catalogueExhausted && !endedForTheWorker,
+      oldestListingPublishedAt: endedForTheWorker ? null : collection.oldestListingPublishedAt,
       // A run that only ended because the worker shut down is not the source's doing.
-      attributableToSource: abortedAt === null,
+      attributableToSource: !endedForTheWorker,
       errorSummary: notes.length === 0 ? null : bound(notes.join('; ')),
     });
   }

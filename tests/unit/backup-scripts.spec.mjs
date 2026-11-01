@@ -191,7 +191,7 @@ describe('migration ledger comparison', () => {
     expect(migrations.length).toBeGreaterThanOrEqual(15);
     expect(migrations.every((name) => /^\d{14}_/.test(name))).toBe(true);
     expect([...migrations].sort()).toEqual(migrations);
-    expect(migrations.at(-1)).toBe('20261024150000_source_run_listing_coverage_floor_timestamptz');
+    expect(migrations.at(-1)).toBe('20261030210000_source_run_heartbeat');
   });
 
   it('reports a missing, altered or unexpected migration', () => {

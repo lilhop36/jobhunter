@@ -58,6 +58,7 @@ const RUN: SourceRunRecord = {
   catalogueExhausted: true,
   oldestListingPublishedAt: null,
   enrichmentScheduled: false,
+  lastHeartbeatAt: NOW,
   errorSummary: null,
 };
 
@@ -71,6 +72,11 @@ class StubSourceRuns implements SourceRunRepository {
   async finalize(_runId: string, outcome: SourceRunOutcome): Promise<SourceRunRecord> {
     this.lastOutcome = outcome;
     return RUN;
+  }
+
+  /** The run in this suite is always still ours: no reaping is being modelled. */
+  async heartbeat(): Promise<boolean> {
+    return true;
   }
 
   async reapStaleRuns(): Promise<SourceRunRecord[]> {

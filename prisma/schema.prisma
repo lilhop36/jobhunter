@@ -251,6 +251,12 @@ model SourceRun {
   /// observability, like the counters: recorded per run so a `SUCCEEDED` status never
   /// implies the hand-off ran. `false` means the run did not schedule downstream work.
   enrichmentScheduled   Boolean          @default(false)
+  /// Liveness signal for a run still in flight: stamped by the collection loop as it works, and
+  /// the recovery sweep reaps on this being absent or old rather than on elapsed duration alone,
+  /// so a run that is merely slow is not reclaimed while it is alive. NULL means the run never
+  /// heartbeated - every row predates the column - and its start time is then the only evidence.
+  /// Timezone-aware per ENG-022.
+  lastHeartbeatAt       DateTime?        @db.Timestamptz(3)
   errorSummary          String?
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt

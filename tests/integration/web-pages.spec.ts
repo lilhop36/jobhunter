@@ -9,6 +9,8 @@ import {
   RemotePreference,
   SalaryPeriod,
   SkillEvidence,
+  SourceRunStatus,
+  SourceRunTrigger,
 } from '@domain/enums';
 import { MATCHER_VERSION } from '@domain/matching';
 import { NOTIFICATION_THRESHOLDS_V1 } from '@domain/notification';
@@ -291,6 +293,58 @@ describe('GET /dashboard', () => {
     // Both rows still claim HEALTHY: the page shows the ageing next to the observation, it does
     // not rewrite it.
     expect(rowOf('gone-quiet')).toContain('>HEALTHY<');
+  });
+
+  it('distinguishes a run that is alive from a run whose worker went away', async () => {
+    // Audit M2: the recovery sweep now reaps on silence rather than duration, so `RUNNING` on its
+    // own covers both a collection that is merely slow and a worker that died hours ago. The
+    // operator looking at that cell needs the difference, and a row from before the column
+    // existed must not be dressed up with an invented age.
+    const rows: ReadonlyArray<readonly [string, Date | null]> = [
+      // Seventy-five seconds rather than twenty: the page computes the age when it renders, so a
+      // seconds-scale expectation would be measuring how fast the test ran.
+      ['alive-now', new Date(Date.now() - 75 * 1000)],
+      ['went-quiet', new Date(Date.now() - 2 * 60 * 60 * 1000)],
+      ['predates-column', null],
+    ];
+    for (const [name, lastHeartbeatAt] of rows) {
+      const source = await prisma.jobSource.create({
+        data: {
+          name,
+          adapterType: 'FAKE',
+          adapterVersion: '1.0.0',
+          schedule: '30m',
+          healthStatus: HealthStatus.HEALTHY,
+        },
+      });
+      await prisma.sourceRun.create({
+        data: {
+          sourceId: source.id,
+          status: SourceRunStatus.RUNNING,
+          trigger: SourceRunTrigger.MANUAL,
+          startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+          lastHeartbeatAt,
+        },
+      });
+    }
+
+    const response = await get('/dashboard');
+    expect(response.statusCode).toBe(200);
+
+    const rowOf = (name: string): string => {
+      const matched = response.body
+        .split('<tr>')
+        .filter((row) => row.includes(`<td>${name}</td>`));
+      expect(matched).toHaveLength(1);
+      return matched[0];
+    };
+    // The same status, three different situations - and the cell says which one it is showing.
+    expect(rowOf('alive-now')).toContain('RUNNING <span title="last reported');
+    expect(rowOf('alive-now')).toContain('(1 min ago)');
+    expect(rowOf('went-quiet')).toContain('RUNNING <span title="last reported');
+    expect(rowOf('went-quiet')).toContain('(2 h ago)');
+    expect(rowOf('predates-column')).toContain('>RUNNING<');
+    expect(rowOf('predates-column')).not.toContain('ago)');
   });
 });
 

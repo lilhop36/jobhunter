@@ -56,9 +56,10 @@ Node's `--env-file`, so `.env` must exist. Tests load it themselves (`tests/supp
 | `API_ALLOW_EXTERNAL_BIND` / `API_ALLOWED_HOSTS` | API | no | The pair that lets the API bind a non-loopback address and the `Host` names it will answer to |
 | `TELEGRAM_BOT_USERNAME` | API | no | Renders the `t.me` deep link |
 | `TELEGRAM_BOT_TOKEN` | worker, `telegram:resolve` | no at start | Without it the worker runs but does not dispatch |
-| `SOURCE_STALE_RUN_SECONDS` | worker | **yes** | Bound for reaping an abandoned source run; `900` is the value observed working |
+| `SOURCE_STALE_RUN_SECONDS` | worker | **yes** | How long a source run may go **quiet** before the recovery sweep reclaims it as abandoned; `900` is the value observed working |
 | `SOURCE_ACQUISITION_TIMEOUT_MS` | worker | **yes** | Bound for a hanging acquisition; must be shorter than the stale window **and** longer than the slowest real run (`300000`; EffoySira measures 50-70 s, so a smaller bound fails every run) |
 | `WORKER_LEASE_SECONDS`, `WORKER_HEARTBEAT_MS`, `WORKER_POLL_INTERVAL_MS`, `WORKER_REAPER_INTERVAL_MS`, `WORKER_ID` | worker | no | Defaults in `.env.example`; heartbeat must be shorter than the lease |
+| `SOURCE_RUN_HEARTBEAT_MS` | worker | no | How often a collection restates its liveness. Default `min(60000, half the stale window)`; must be shorter than `SOURCE_STALE_RUN_SECONDS` |
 | `SOURCE_SCHEDULER_INTERVAL_MS`, `NOTIFICATION_DISPATCH_INTERVAL_MS` | worker | no | Default 30 s |
 | `LOG_LEVEL` | API | no | Fastify level, default `info` |
 | `AI_PROVIDER` | nothing yet | — | Reserved: documented but currently unread (drift report D17) |
@@ -160,8 +161,12 @@ build: the UI is server-rendered HTML.
    stays applied. If a migration failed midway, Prisma records it in `_prisma_migrations`; restore
    from a verified backup (see
    [`backup-and-restore.md`](docs/engineering/backup-and-restore.md)) and re-apply.
-3. Restarting the worker is safe. On start it reaps expired leases and stale `RUNNING` source runs
-   (`SOURCE_STALE_RUN_SECONDS`) before claiming new work, so a killed process cannot wedge a source.
+3. Restarting the worker is safe. On start it reaps expired leases and `RUNNING` source runs that
+   have gone quiet past `SOURCE_STALE_RUN_SECONDS` before claiming new work, so a killed process
+   cannot wedge a source. A collection restates its liveness as it writes (`SOURCE_RUN_HEARTBEAT_MS`),
+   so the sweep reclaims a worker that died rather than one that is merely slow. The same report
+   doubles as the loop's ownership check: when it comes back "no longer yours", the surviving
+   worker stops writing instead of continuing under a reclaimed run.
    A collection task that meets a run abandoned by the crash defers itself past the stale window
    instead of spending an attempt, and a source whose run was reaped is re-queued immediately rather
    than at its next scheduled interval.

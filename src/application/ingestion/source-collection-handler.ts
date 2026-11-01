@@ -36,9 +36,10 @@ const VALID_TRIGGERS = new Set<string>(Object.values(SourceRunTrigger));
 
 /**
  * Extra wait beyond the stale window before a deferred collection is retried. The window is
- * measured from the abandoned run's `startedAt`, which is at or before the deferred attempt,
- * so the run is reapable when the delay elapses; the margin only covers the poll interval
- * between the task becoming due and a worker claiming it.
+ * measured from the abandoned run's last liveness report, which is at or before the moment this
+ * attempt was deferred (a run that is still reporting is not abandoned, and a worker that stopped
+ * reporting did so no later than now), so the run is reapable when the delay elapses. The margin
+ * only covers the poll interval between the task becoming due and a worker claiming it.
  */
 const STALE_WINDOW_GRACE_SECONDS = 30;
 
@@ -73,6 +74,11 @@ export interface SourceCollectionHandlerOptions {
   acquisitionTimeoutMs: number;
   /** Safety bound for abandoned runs, forwarded to `RunSourceCollection` (ENG-025). */
   staleRunSeconds: number;
+  /**
+   * How often the run in flight restates that it is still working, forwarded to
+   * `RunSourceCollection` (audit M2). Absent means the use case's own default.
+   */
+  sourceRunHeartbeatMs?: number;
   /**
    * Post-collection lifecycle sweep (FR-019). Called only after a run that finished
    * `SUCCEEDED` and made a coverage claim — read the listing to the end, or at least read a
@@ -109,6 +115,7 @@ export function createSourceCollectionHandler(
         trigger,
         staleRunSeconds: options.staleRunSeconds,
         acquisitionTimeoutMs: options.acquisitionTimeoutMs,
+        heartbeatMs: options.sourceRunHeartbeatMs,
         // The source's own approved declaration (Appendix E), not a pipeline default: a source
         // approved as RESULTS_EXPECTED must report an empty listing (AC-018) instead of
         // recording a clean run. Absent means UNKNOWN, which never raises the signal.

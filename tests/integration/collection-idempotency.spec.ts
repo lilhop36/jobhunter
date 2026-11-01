@@ -782,10 +782,16 @@ describe('RunSourceCollection', () => {
   it('recovers a run abandoned by a crashed worker, and the retry stays idempotent', async () => {
     const sourceId = await createSource();
     const abandoned = await sourceRuns.start({ sourceId });
-    // Simulate a worker that died mid-run: still active, but older than the safety bound.
+    // Simulate a worker that died mid-run: still active, and silent for longer than the safety
+    // bound. Both liveness timestamps move together because that is what a dead worker's row
+    // actually looks like - since audit M2 the sweep judges the heartbeat, and a run that is old
+    // but still reporting is exactly the slow worker the heartbeat was added to protect.
     await prisma.sourceRun.update({
       where: { id: abandoned.id },
-      data: { startedAt: new Date(Date.now() - (STALE_SECONDS + 60) * 1000) },
+      data: {
+        startedAt: new Date(Date.now() - (STALE_SECONDS + 60) * 1000),
+        lastHeartbeatAt: new Date(Date.now() - (STALE_SECONDS + 60) * 1000),
+      },
     });
 
     const rows = [makeRawJob({ sourceJobIdentifier: 'h-1', rawTitle: 'Backend Engineer' })];

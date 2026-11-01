@@ -542,8 +542,10 @@ instead, which avoids inventing a health rule.
 
 ### Crash safety
 
-An abandoned run is recovered by reaping runs still active beyond `staleRunSeconds`
-*before* opening the new one (ENG-025, SRS 7.5), which is why that input is required.
+An abandoned run is recovered by reaping runs still active and quiet beyond
+`staleRunSeconds` *before* opening the new one (ENG-025, SRS 7.5), which is why that input is
+required. The window is a bound on silence, not on duration: a collection restates its liveness as
+it writes, so a run that merely takes a long time is not reclaimed while it is alive (audit M2).
 Recovery is also what makes a retried attempt idempotent: identical evidence conflicts on
 the partial indexes and only `lastSeenAt` advances, and a Job keyed by the same identity
 is refreshed rather than duplicated.

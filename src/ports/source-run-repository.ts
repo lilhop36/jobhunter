@@ -84,7 +84,7 @@ export interface SourceRunYieldSample {
 /**
  * Persistence port for collection runs.
  *
- * Fencing contract: `finalize` must only apply to a run that is still active. A
+ * Fencing contract: `finalize` and `heartbeat` must only apply to a run that is still active. A
  * worker whose run was reaped as stale ("zombie") must not be able to overwrite the
  * recorded outcome, so a zero-row update means "I was reaped" and the caller must
  * stop rather than retry.
@@ -113,8 +113,25 @@ export interface SourceRunRepository {
   ): Promise<SourceRunRecord | null>;
 
   /**
-   * Fail every run still active after more than `maxDurationSeconds` on the
-   * database clock, recording SOURCE_RUN_LEASE_EXPIRED_REASON (ENG-025).
+   * Restate that this run is still working: stamp `lastHeartbeatAt` from the database clock.
+   *
+   * This is the fenced write of the heartbeat, and it doubles as the liveness probe the
+   * collection loop consults between records (audit M2). It returns false when the run is no
+   * longer active - already finalized, or reclaimed as abandoned by the sweep - which is how a
+   * worker whose run was taken from it learns to stop writing instead of continuing as a zombie
+   * whose outcome will be discarded. A false return is not retried: the run is gone.
+   */
+  heartbeat(runId: string): Promise<boolean>;
+
+  /**
+   * Fail every run still active that has been *silent* for more than `maxDurationSeconds` on
+   * the database clock, recording SOURCE_RUN_LEASE_EXPIRED_REASON (ENG-025).
+   *
+   * Since M2 the silence is measured from `lastHeartbeatAt`, falling back to `startedAt` only
+   * for a run that never heartbeated (a row predating the column). A run that is alive and
+   * writing is therefore never reclaimed however long it takes, while a run whose worker died
+   * is still reclaimed one window after its last real activity - so this stays a *safety*
+   * bound on inactivity and is never a run timeout.
    *
    * Must run before scheduled catch-up enqueues work (SRS 7.6), otherwise the
    * catch-up collides with a run that is already dead.

@@ -5,9 +5,10 @@
 code, adapters, tests, operator scripts and documentation; plus targeted execution: type checking,
 Prisma migration status, a live API smoke test, `npm audit`, a live source-markup check, and a direct
 probe of the deadline parser. No code, migration or configuration was changed.
-**Status of this document:** findings and recommendations. Nine items were fixed afterwards: P0
-item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery, except its heartbeat
-half), H4 (the refresh merge), H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27,
+**Status of this document:** findings and recommendations. Ten items were fixed afterwards: P0
+item 1 (the drifted schema), M10 (the timestamp type), H3 (crash recovery), H4 (the refresh merge),
+H5 (deadline anchoring) and H6 (the orphaned run) on 2026-10-27; M2 (the source-run liveness signal,
+which also closed the heartbeat half H3 left open) on 2026-10-31;
 H7 (reduced-yield detection) on 2026-10-28, and H2 (the authorization boundary), M7 (the schema-aware
 drill, verified copy, retention and schedule commands) and H7's source-silence half on 2026-10-30 — H7's
 funnel-metric half stays open, H2's TLS half needs an operator certificate, and M7 stays PARTIAL
@@ -195,9 +196,10 @@ asserting `PENDING` with `attempts 0`, then the window elapsed and a second clai
 old run `FAILED` and a new one `SUCCEEDED` with its job accepted. Defer semantics are also pinned at
 the repository (`work-task-queue.spec.ts`) and worker (`work-task-worker.spec.ts`) layers.
 
-**Not fixed here:** the run still has no heartbeat, so liveness is still inferred from `startedAt`
-alone. A run that legitimately exceeds the stale window can still be reaped while alive — M2. This
-change makes the queue survive that; it does not make the run live longer.
+**The heartbeat asked for above landed on 2026-10-31 as M2**, so the window is now measured from a
+run's last report rather than its start: a collection that legitimately outlives
+`SOURCE_STALE_RUN_SECONDS` is no longer reclaimed while it is alive. The queue half is unchanged -
+deferral is still one stale window, now a window of silence.
 
 #### H4 — Re-observation overwrites known canonical facts with UNKNOWN/null — **new, verified**
 
@@ -415,6 +417,30 @@ matching may already have been enqueued before finalization (`:502-506`).
 **Fix:** add `lastHeartbeatAt` updated between record batches and reap by inactivity; or enforce a
 total run deadline below the stale bound. Verify run liveness before each batch.
 
+**Resolved 2026-10-31.** `source_runs` gained `lastHeartbeatAt timestamptz(3)`
+(migration `20261030210000_source_run_heartbeat`). A collection stamps it when the run opens and
+restamps between records every `SOURCE_RUN_HEARTBEAT_MS`, defaulting to `min(60 s, half the stale
+window)`; an explicit interval that could not report inside the window is refused at startup by
+`resolveSourceRunHeartbeatMs`. `reapStaleRuns` judges that instead of `startedAt` —
+`COALESCE("lastHeartbeatAt", ("startedAt" AT TIME ZONE 'UTC')) < now() - stale` — so the fallback to
+age applies only to rows predating the column, and the naive side is converted because this session's
+zone is not UTC (ENG-022). Duration alone is no longer evidence of death.
+The zombie half closes on the same write: `heartbeat()` is fenced to the active statuses and returns
+whether the row is still ours, so the loop learns it lost the lock at the record whose beat failed,
+stops writing, and finalizes as `PARTIAL` with the run's claims withheld — no exhausted-catalogue
+claim, no window floor, `attributableToSource = false` — so a worker disappearing does not mark down
+the source's health. A beat that *throws* deliberately does not stop the loop: an absent answer is
+not evidence of death. H3's deferral arithmetic is untouched, since the window is still the bound a
+recovery waits out, now measured from the last report.
+Operator-visible: `/api/sources*` publishes `lastHeartbeatAt` and the dashboard "Latest run" cell
+renders `RUNNING (40 s ago)` against `RUNNING (3 h ago)` — two situations the status alone conflated.
+Tests: `source-run-liveness.spec.ts` (beats, stops on refusal, withholds claims, survives a throwing
+beat, plus the resolver's bounds); the `run liveness (audit M2)` group in
+`source-run-reaper.spec.ts` (old-but-reporting survives, young-but-silent is reclaimed, the legacy
+NULL fallback with a positive control, DB-clock stamping, single-run scoping); `worker-config.spec.ts`
+for the refusal; `api-sources.spec.ts` and `web-pages.spec.ts` for the published field and the cell;
+and `tests/failure/collection-crash.spec.ts` now waits on silence rather than age.
+
 #### M3 — Outbox rows can be stranded, and dispatch does not revalidate eligibility — **new, verified**
 
 `claimDue` moves up to 20 rows to `PROCESSING`; `renderNotificationMessage` runs outside the
@@ -615,13 +641,13 @@ mixed-type comparison instead.
 
 | Area | State |
 | --- | --- |
-| FR-001..003 sources/scheduling | Implemented; crash recovery fixed 2026-10-27 (H3), run heartbeat still absent (M2) |
+| FR-001..003 sources/scheduling | Implemented; crash recovery fixed 2026-10-27 (H3) and the run liveness signal 2026-10-31 (M2) |
 | FR-005..007 validation/quality | Strong deterministic gates; reduced-yield detection added 2026-10-28 (H7) |
 | FR-008 dedupe | Within-source strong; cross-source absent (D8) |
 | FR-009/014 skills & confidence | Blocked by missing `JobSkill` (D4) |
 | FR-012..016 matching | Implemented and explainable; skills weight permanently unknown |
 | FR-017..018 notifications/feedback | Durable delivery; feedback API exists; AC-017 UI/buttons absent (D13) |
-| FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but ordering assumption and races remain (M1/M2/M6) |
+| FR-019 lifecycle | ACTIVE/EXPIRED/REMOVED implemented; `NOT_FOUND` absent; coverage rules sound but the ordering assumption and races remain (M1/M6); the run-liveness race closed 2026-10-31 (M2) |
 | FR-020 health | Yield drift 2026-10-28 and source silence 2026-10-30 (H7): both §7.8 abnormal-behaviour cases now warn the operator; funnel metrics still open |
 | FR-021 backup | Scripts + schema-aware drill; copy/retention/schedule commands exist but no encrypted off-machine copy or installed task (M7) |
 | SRS 8.1/8.2 auth/ownership | Met 2026-10-30 (H2, ADR-0011); TLS for an externally bound API still absent |
@@ -664,8 +690,8 @@ marked theoretical or downgraded.
    `c093e97`; the second migration converts the floor to `timestamptz(3)` (M10). The remaining P0
    items below are still open.
 2. **Fix crash recovery (H3)** — do not burn work-task attempts on a fresh `SourceRunActiveError`,
-   and re-enqueue sources whose runs were reaped. **Done 2026-10-27** for the queue; the run
-   heartbeat that would also close M2 is still open.
+   and re-enqueue sources whose runs were reaped. **Done 2026-10-27** for the queue, and
+   **2026-10-31** for the run heartbeat (M2) that completes it.
 3. **Fix the EffoySira timestamp (H6)** — `collectedAt: now`, validate the date, finalize on
    per-record failure. **Done 2026-10-27**, including the loop guard that was the real cause.
 4. **Fix refresh merge (H4)** and **deadline anchoring (H5)** with regression tests.
@@ -685,7 +711,8 @@ marked theoretical or downgraded.
    scheduler and derived on every read surface). Both §7.8 drift-detection cases now warn the
    operator; D20 stays PARTIAL for the rest of §7.8 — the pipeline funnel view and the notification
    metrics roll-up (L8).
-7. **Lifecycle CAS + restore-on-observation (M1)** and **source-run heartbeat (M2)**.
+7. **Lifecycle CAS + restore-on-observation (M1)**, and **source-run heartbeat (M2)** —
+   **Done 2026-10-31**; M1 is the remaining half.
 8. **Outbox recovery/revalidation and shutdown order (M3)**.
 9. **Backup schedule + migration-aware drill (M7)**. **Done 2026-10-30 for the drill and the
    commands** — the drill compares the migration ledger and answers the scheduler's query,
