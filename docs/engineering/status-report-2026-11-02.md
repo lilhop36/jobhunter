@@ -15,10 +15,11 @@ The audit said the system was "not safe to operate as-is" for four reasons: the 
 the code, there was no authorization boundary, a crash could disable a source for hours, and two
 data-integrity rules were being violated in the direction the engineering instructions forbid.
 
-**All four are closed.** Along with them, every high and medium finding except three is closed:
-M6 (job identity and provenance retention), M8 (release gate, supervision, dependency hygiene) and
-M9 (accessibility labels). The ten low findings are untouched except L11, a test-suite bug that was
-fixed the day it appeared.
+**All four are closed.** Along with them, every high and medium finding is closed except four: M6 (job
+identity and provenance retention), M8 (release gate, supervision, dependency hygiene), M9
+(accessibility labels) and the part of M7 that only you can do — installing the backup schedule and
+keeping an encrypted copy off the machine. The ten low findings are untouched except L11, a test-suite
+bug that was fixed the day it appeared, and L12, a hazard in how I run the suite, recorded today.
 
 The pipeline is running against the real sources right now and producing sane numbers: the three
 collections started at 17:21 today all succeeded, and none of them hit an HTTP error.
@@ -37,7 +38,7 @@ can do, because they are choices about your machine and your network, not code.
 | Commits | 143 total; 30 of them since the audit |
 | Working tree | clean |
 | Database | live `jobhunter` at 16/16 migrations, "up to date" |
-| Test suite | 83 spec files; the last full run was green except the final summary (see section 7) |
+| Test suite | 84 spec files / 1099 tests — `npm run verify` green (type check + full suite) at 22:51 on 2026-11-02 |
 | Jobs stored | 163 — EffoySira 79, Ethiojobs 72, JobWebEthiopia 12 |
 | Raw captures | 168 rows in `raw_jobs` (append-only evidence, never overwritten) |
 | Matches | 300 scored job/candidate pairs |
@@ -79,7 +80,7 @@ the code and nodded.
 | M7 | Backups were scripts, not a capability | code done 2026-10-30; the schedule task and the encrypted off-machine copy are yours |
 | M8 | No CI, no lint gate, no supervision; Fastify 4 with 2 high audit findings | not started; needs your decision on CI |
 | M9 | Some form controls have no accessible name; the a11y test overstates coverage | not started |
-| L1–L10 | Cursor validation → 500 instead of 400; unbounded session `Map`; the API process is handed the Telegram token; a CSRF claim in an ADR that nothing implements; stale docs; no DB `CHECK` constraints; relative-URL canonicalisation; funnel metrics stop before matched/notified; coverage retirement flaps; `NOT_FOUND` never produced | not started (scheduled after M6) |
+| L1–L10, L12 | Cursor validation → 500 instead of 400; unbounded session `Map`; the API process is handed the Telegram token; a CSRF claim in an ADR that nothing implements; stale docs; no DB `CHECK` constraints; relative-URL canonicalisation; funnel metrics stop before matched/notified; coverage retirement flaps; `NOT_FOUND` never produced. L12 is new today: two test suites sharing one database truncate each other's fixtures | not started (scheduled after M6); L12 is documented with the operating rule, and the lock that would enforce it is deliberately not built yet |
 | H8 / D-series | Requirement gaps that are product decisions: `JobSkill` (D4), cross-source dedupe (D8), AC-017 buttons (D13), AC-020 precision (D21), funnel/notification metrics (D20), `NOT_FOUND` (D9) | deliberately not "fixed" — each needs your call |
 
 ### Two things we chose not to fix
@@ -172,29 +173,31 @@ Step 2's migration gets applied to `jobhunter` only after a backup and a restore
 ## 7. What is verified, and what is not
 
 **Verified by tests that exist and pass.** Every closed finding above has a regression test named for
-it — the audit records which. Type check (`tsc --noEmit`) is clean. Targeted runs during this cycle:
-94 unit tests green across the three adapters plus the HTTP policy and the collection handler; 38
-integration tests green across collection idempotency and source health.
+it — the audit records which. The full gate ran clean for M5: `npm run verify` (disk preflight,
+`tsc --noEmit`, then the whole suite) exited 0 with **84 files / 1099 tests passed**, 14 minutes.
 
 **Verified against the live system.** Migrations up to date on `jobhunter`; `/dashboard` and
 `/api/sources` returning 200; the three sources collecting with the new HTTP policy (section 5); the
 sign-in flow proven in a real browser rather than only in-process; run counters read back from the
 database.
 
-**Not verified — and you should know which box each of these is in.** The last full `npm run verify`
-was still running when this report was written, so I am not claiming a whole-suite green for M5 yet;
-the earlier attempt was invalidated because I resumed editing while it ran, and I've relaunched it.
-TLS on an externally bound API is not implemented at all. The backup schedule task is not installed,
-and there is no encrypted off-machine copy — the scripts exist and the restore drill passes locally,
-but that proves the *code*, not your *recovery*. No CI, no lint gate. No load or soak testing, no
-multi-worker stress, no Telegram end-to-end delivery test.
+**Not verified — and you should know which box each of these is in.** TLS on an externally bound API
+is not implemented at all. The backup schedule task is not installed, and there is no encrypted
+off-machine copy — the scripts exist and the restore drill passes locally, but that proves the *code*,
+not your *recovery*. No CI, no lint gate. No load or soak testing, no multi-worker stress, no
+Telegram end-to-end delivery test.
 
 **Environment caveats that will bite you.** The verify command refuses to run under 500 MB of free
 disk, and this machine was at 22 MB during this cycle; it needed 4 GB freed to get through the suite.
 The worker shares the machine while the suite runs, which is what made the `prisma migrate deploy`
-hook time out in the first place (L11). And on this host, Node's `fetch` ignores `HTTP_PROXY`/
-`HTTPS_PROXY` unless the worker starts with `NODE_USE_ENV_PROXY=1` — without it every collection fails
-with `TypeError: fetch failed`, which is exactly what the 8 failed runs in the history are.
+hook time out in the first place (L11). **Run one suite at a time:** every integration file truncates
+the single shared `jobhunter_test`, so a second concurrent suite deletes the first one's fixtures
+mid-test and the result looks like four real product failures — a foreign-key violation on
+`source_runs`, a 404 for a source that exists, "No Job found". That happened to me on this cycle, and
+the same tests passed standalone minutes later; the hazard is now recorded as L12. And on this host,
+Node's `fetch` ignores `HTTP_PROXY`/`HTTPS_PROXY` unless the worker starts with `NODE_USE_ENV_PROXY=1`
+— without it every collection fails with `TypeError: fetch failed`, which is exactly what the 8 failed
+runs in the history are.
 
 ---
 
@@ -210,7 +213,7 @@ directory for the encrypted copy, and decide whether M8 gets a CI/lint gate.
 
 ---
 
-*Skipped / not checked: the full `npm run verify` for M5 had not reported when this was written, so no
-whole-suite pass is claimed here; the JobWebEthiopia low yield and the notification-threshold
-observation are read from live run rows, not from a design document; and L1–L10 statuses are copied
-from the audit register rather than re-verified against current code.*
+*Skipped / not checked: the L12 collision was diagnosed from the run log and a clean standalone
+re-run, not from a reproduction of the two suites racing on purpose; the JobWebEthiopia low yield and
+the notification-threshold observation are read from live run rows, not from a design document; and
+L1–L10 statuses are copied from the audit register rather than re-verified against current code.*

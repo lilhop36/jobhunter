@@ -768,6 +768,7 @@ mixed-type comparison instead.
 | L9 | Coverage retires after a single missed informative run; intermittent truncation will flap | documented in `lifecycle-policy.ts:41-43` |
 | L10 | `NOT_FOUND` is never produced; consumers cannot distinguish "source says gone" from "deadline passed" | known D9 |
 | L11 | Two suite files failed `npm run verify` on a `beforeAll` **hook** timeout (Vitest's 10 s default) while every test inside them passed: `applyTestMigrations()` shells out to `prisma migrate deploy`, and that CLI exceeds 10 s when the live worker shares the machine | Observed 2026-11-01 (`process-lifecycle.spec.ts`, `job-match-repository.spec.ts` — 22/22 green standalone, exit 0). **Fixed the same day** with `hookTimeout: 120_000` in `vitest.config.ts`; per-test budgets are untouched, so a genuinely slow test still fails. |
+| L12 | Two suites running at once corrupt each other, and the failures look like product defects | Observed 2026-11-02: a second `npm run verify` was launched while the first was still running, and the early files reported `23503` on `source_runs_sourceId_fkey`, a 404 for an existing source, and `No Job found` — 2 files / 4 tests failed, then all 61 passed standalone minutes later. `fileParallelism: false` only serialises files *within* a run; every integration file's `beforeEach` calls `truncateAll()` on the one shared `jobhunter_test`, so a concurrent run truncates the other's fixtures mid-test. `ponytail:` no lock prevents a second suite, revisit when there is a CI runner or a second operator; until then the rule is one suite at a time, and an early-file failure in a long suite is checked for a competitor before it is treated as a regression. |
 
 ---
 
@@ -896,7 +897,10 @@ marked theoretical or downgraded.
 14. Decide the ENG-022 timestamp convention before applying the pending migration (M10).
     **Done 2026-10-27** — ENG-022 won; see the resolution note under M10.
 15. Low items L1–L10, starting with cursor validation and docs corrections. L11, the test-suite
-    hook budget, surfaced during the M1 verification on 2026-11-01 and was fixed the same day.
+    hook budget, surfaced during the M1 verification on 2026-11-01 and was fixed the same day. L12,
+    two suites sharing `jobhunter_test`, surfaced during the M5 verification on 2026-11-02: the four
+    failures it caused were reproduced as green standalone, so no product code is implicated, but the
+    suite must be run one at a time until something enforces that.
 
 The known requirement gaps (D4, D8, D13, D21) are product decisions, not audit fixes; they should
 remain visible in the drift report and be scheduled before claiming SRS conformance.
