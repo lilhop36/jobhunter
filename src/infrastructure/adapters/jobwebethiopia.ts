@@ -241,10 +241,15 @@ export function createJobWebEthiopiaAdapter(
 
     // Every request after the first waits `delayMs`, which is the site's Crawl-delay.
     let requests = 0;
+    // A page the source answered with an error status is a source failure, not a parse miss
+    // (audit M5). The 404/410 probe below is the expected end of the catalogue, so it is not here.
+    let httpFailures = 0;
     async function politeGet(url: string): Promise<string | null> {
       if (requests > 0) await delay(delayMs);
       requests += 1;
-      return http.getText(url, signal);
+      const outcome = await http.get(url, signal);
+      if (outcome.kind === 'http') httpFailures += 1;
+      return outcome.kind === 'ok' ? outcome.body : null;
     }
 
     // Discovery: newest postings first; the budget bounds the run, dedupe is downstream.
@@ -404,6 +409,7 @@ export function createJobWebEthiopiaAdapter(
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
       oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      httpFailures,
     };
   }
 

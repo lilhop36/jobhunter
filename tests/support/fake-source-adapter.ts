@@ -89,17 +89,21 @@ export class FakeSourceAdapter implements JobSourceAdapter {
    * Only meaningful with `catalogueExhausted = false`: a full read needs no window.
    */
   private readonly oldestListingPublishedAt: Date | null;
+  /** Pages the fake pretends the source answered with an error status. Default `0`. */
+  private readonly httpFailures: number;
 
   constructor(
     config: SourceAdapterConfig = makeFakeConfig(),
     rows: RawJobEvidence[] = [],
     catalogueExhausted = true,
     oldestListingPublishedAt: Date | null = null,
+    httpFailures = 0,
   ) {
     this.config = config;
     this.rows = rows;
     this.exhaustive = catalogueExhausted;
     this.oldestListingPublishedAt = oldestListingPublishedAt;
+    this.httpFailures = httpFailures;
   }
 
   async collect(_context: CollectionContext): Promise<CollectionResult> {
@@ -107,6 +111,7 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       records: this.rows.map((row) => ({ ...row })),
       catalogueExhausted: this.exhaustive,
       oldestListingPublishedAt: this.oldestListingPublishedAt,
+      httpFailures: this.httpFailures,
     };
   }
 

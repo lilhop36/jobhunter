@@ -196,6 +196,16 @@ export function createEffoySiraAdapter(
     // pass can no longer place an unobserved posting outside the window it saw.
     let windowKnown = true;
     let oldestPublishedAt: Date | null = null;
+    // A page the source answered with an error status is a source failure, not a parse miss
+    // (audit M5). The 404/410 the end-of-catalogue probe expects is not counted here.
+    let httpFailures = 0;
+
+    /** The page's text, or null when it could not be read; error statuses are counted. */
+    async function readPage(url: string): Promise<string | null> {
+      const outcome = await http.get(url, signal);
+      if (outcome.kind === 'http') httpFailures += 1;
+      return outcome.kind === 'ok' ? outcome.body : null;
+    }
 
     /**
      * A missing `rel="next"` is not proof of the end: a theme change or a soft-404 shell
@@ -219,7 +229,7 @@ export function createEffoySiraAdapter(
       if (signal?.aborted) break;
       const url =
         page === 1 ? `${BASE}/category/job/` : `${BASE}/category/job/page/${page}/`;
-      const html = await http.getText(url, signal);
+      const html = await readPage(url);
       if (html === null) break;
       const re = /<h2 class="entry-title"><a href="(https:\/\/effoysira\.com\/[^"]+)"/g;
       let m: RegExpExecArray | null;
@@ -242,7 +252,7 @@ export function createEffoySiraAdapter(
 
     for (const postUrl of postUrls) {
       if (signal?.aborted) break;
-      const html = await http.getText(postUrl, signal);
+      const html = await readPage(postUrl);
       if (html === null) {
         // The posting was listed but could not be read: the record it would have refreshed
         // stays unobserved, so this pass cannot claim it saw everything.
@@ -306,6 +316,7 @@ export function createEffoySiraAdapter(
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
       oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      httpFailures,
     };
   }
 

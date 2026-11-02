@@ -120,6 +120,8 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      // The listing answered 503: a source failure, not a parse miss (audit M5).
+      httpFailures: 1,
     });
   });
 

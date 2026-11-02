@@ -313,6 +313,8 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      // The listing answered 503: a source failure, not a parse miss (audit M5).
+      httpFailures: 1,
     });
   });
 
@@ -352,7 +354,11 @@ describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {
       delay: async () => {},
     });
 
-    await expect(adapter.collect(context())).resolves.toMatchObject({ catalogueExhausted: true });
+    // The 404 past the last page is the evidence the catalogue ended, so it is not a failure (M5).
+    await expect(adapter.collect(context())).resolves.toMatchObject({
+      catalogueExhausted: true,
+      httpFailures: 0,
+    });
   });
 
   it('reports coverage when the cap is reached exactly at the page end', async () => {
@@ -478,6 +484,8 @@ describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {
 
     const result = await adapter.collect(context());
     expect(result.oldestListingPublishedAt).toBeNull();
+    // and the run says why: the posting page answered 500 (audit M5).
+    expect(result.httpFailures).toBe(1);
   });
 
   it('does not report coverage from an unreachable listing', async () => {
@@ -490,6 +498,8 @@ describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      // The listing answered 503: a source failure, not a parse miss (audit M5).
+      httpFailures: 1,
     });
   });
 });

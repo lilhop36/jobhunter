@@ -117,6 +117,16 @@ export interface CollectionResult {
   records: RawJobEvidence[];
   catalogueExhausted: boolean;
   oldestListingPublishedAt: Date | null;
+  /**
+   * Pages the source answered with an HTTP error status (403, 429, 500 …).
+   *
+   * This is a source-health signal, not a parse miss: a listing that answers 403 produced no
+   * records for a reason that has nothing to do with the adapter's reading of a page it did get.
+   * Counting it is what lets SRS 7.8's HTTP-failure metric say "the source is failing" instead of
+   * "the source published nothing" (audit M5). The 404/410 that proves the end of the catalogue is
+   * expected evidence of a healthy source and is deliberately not counted here.
+   */
+  httpFailures: number;
 }
 
 /**

@@ -262,9 +262,14 @@ export function createEthiojobsAdapter(
     // entry without a parseable date voids the claim: it might be the oldest one read.
     let windowKnown = true;
     let oldestPublishedAt: Date | null = null;
+    // A page the source answered with an error status is a source failure, not a parse miss
+    // (audit M5).
+    let httpFailures = 0;
     for (let page = 1; page <= maxListingPages; page++) {
       if (signal?.aborted) break;
-      const html = await http.getText(listingUrl(page), signal);
+      const outcome = await http.get(listingUrl(page), signal);
+      if (outcome.kind === 'http') httpFailures += 1;
+      const html = outcome.kind === 'ok' ? outcome.body : null;
       if (html === null) break;
       const listing = extractListingPage(html);
       if (listing === null) break;
@@ -360,6 +365,7 @@ export function createEthiojobsAdapter(
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
       oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      httpFailures,
     };
   }
 

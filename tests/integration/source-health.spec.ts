@@ -64,7 +64,12 @@ class ReapingAdapter extends FakeSourceAdapter {
       where: { id: context.sourceRunId },
       data: { status: SourceRunStatus.FAILED, finishedAt: NOW, errorSummary: 'lease expired' },
     });
-    return { records: [], catalogueExhausted: false, oldestListingPublishedAt: null };
+    return {
+      records: [],
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+      httpFailures: 0,
+    };
   }
 }
 

@@ -338,6 +338,7 @@ export class RunSourceCollection {
               records: [],
               catalogueExhausted: false,
               oldestListingPublishedAt: null,
+              httpFailures: 0,
             } satisfies CollectionResult;
           }
           return value;
@@ -354,6 +355,7 @@ export class RunSourceCollection {
               records: [],
               catalogueExhausted: false,
               oldestListingPublishedAt: null,
+              httpFailures: 0,
             } satisfies CollectionResult;
           }
           throw error;
@@ -407,6 +409,10 @@ export class RunSourceCollection {
 
     const records = collection.records;
     funnel.collected = records.length;
+    // What the source answered with an error status is the source failing, counted once here
+    // rather than inferred from the records that are missing (audit M5, SRS 7.8). A thrown or
+    // timed-out acquisition never reaches this line: it is counted as one failure where it ends.
+    funnel.httpFailures = collection.httpFailures;
     let abortedAt: number | null = null;
     // Set when the recovery sweep took this run away mid-loop: the row is already terminal, so
     // every further record this attempt writes belongs to a run that no longer exists (M2).
@@ -574,6 +580,12 @@ export class RunSourceCollection {
 
     const unexpectedZeroResults = isUnexpectedZeroResult(funnel.collected, expectation);
 
+    // Name the cause wherever it shows up: a run that got zero records because the listing
+    // answered 403 must not read as "the source published nothing" (audit M5).
+    if (funnel.httpFailures > 0) {
+      notes.push(`${funnel.httpFailures} source page(s) answered with an HTTP error status`);
+    }
+
     let status: TerminalRunStatus;
     if (reclaimedAt !== null) {
       // The run was already reclaimed as abandoned, so this attempt can record nothing: the row
@@ -593,6 +605,11 @@ export class RunSourceCollection {
     } else if (funnel.parseFailures > 0) {
       // Partial: the run completed but some records could not be read. Their raw
       // evidence is preserved, so this is a data-quality signal, not a failure.
+      status = SourceRunStatus.PARTIAL;
+    } else if (funnel.httpFailures > 0) {
+      // Partial: what the run did read is written, but the source refused part of it with an
+      // error status. A SUCCEEDED row next to a non-zero HTTP-failure count is the understatement
+      // audit M5 recorded, and PARTIAL is the status health can evidence (it reads as DEGRADED).
       status = SourceRunStatus.PARTIAL;
     } else if (storageFailures > 0) {
       // Partial: the acquisition was readable but some of it could not be written. Never

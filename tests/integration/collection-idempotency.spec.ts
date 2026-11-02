@@ -601,6 +601,26 @@ describe('RunSourceCollection', () => {
     expect(await countEvidence(sourceId)).toBe(0);
   });
 
+  it('counts the pages the source refused as HTTP failures, not as missing records (audit M5)', async () => {
+    const sourceId = await createSource();
+    // One readable record and two pages the source answered with an error status: before M5 the
+    // run read as a success with fewer records, and the failures were invisible.
+    const adapter = new FakeSourceAdapter(
+      makeFakeConfig({ sourceId }),
+      [makeRawJob({ sourceJobIdentifier: 'f-1', rawTitle: 'Backend Engineer', collectedAt: NOW })],
+      true,
+      null,
+      2,
+    );
+
+    const result = await collectOnce(adapter);
+
+    expect(result.funnel).toMatchObject({ collected: 1, unique: 1, httpFailures: 2 });
+    expect(result.status).toBe(SourceRunStatus.PARTIAL);
+    expect(result.run?.httpFailures).toBe(2);
+    expect(result.run?.errorSummary).toContain('HTTP error status');
+  });
+
   it('stops cleanly on abort without claiming a source failure', async () => {
     const sourceId = await createSource();
     const controller = new AbortController();

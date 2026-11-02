@@ -13,7 +13,8 @@ restore-on-observation) on 2026-11-01;
 H7 (reduced-yield detection) on 2026-10-28, and H2 (the authorization boundary), M7 (the schema-aware
 drill, verified copy, retention and schedule commands) and H7's source-silence half on 2026-10-30 — H7's
 funnel-metric half stays open, H2's TLS half needs an operator certificate, and M7 stays PARTIAL
-until an encrypted off-machine copy is recorded. Each is recorded on the finding itself. Every other
+until an encrypted off-machine copy is recorded; and M3 (whose two declined halves are recorded on
+the finding), M4 and M5 on 2026-11-01 and 2026-11-02. Each is recorded on the finding itself. Every other
 finding stands as written, and the evidence below describes the tree as the audit found it.
 
 The audit used four independent review tracks (security/API, reliability/concurrency,
@@ -558,7 +559,7 @@ and `reports a broken schedule once, not on every pass`. No migration, and nothi
 collected is now skipped: all three enabled rows in the live database (`EffoySira`, `Ethiojobs`,
 `JobWebEthiopia`) match a registration, checked read-only on 2026-11-01.
 
-#### M5 — Adapter HTTP handling permits SSRF and masks source failures — **new, verified**
+#### M5 — Adapter HTTP handling permits SSRF and masks source failures — **resolved 2026-11-02**
 
 JobWebEthiopia extracts arbitrary `href` values from source HTML (`jobwebethiopia.ts:212`) and
 fetches them (`:317`) through a helper that follows redirects and calls `res.text()` with no size
@@ -571,7 +572,7 @@ record-level parse misses and understate source health.
 base and reject unresolved ones; use `redirect: 'manual'` with revalidation; cap response bytes;
 return typed status and count non-2xx as HTTP failures.
 
-**Resolved 2026-11-02 for the request-policy half; the non-2xx accounting is open (see below).**
+**Resolved 2026-11-02, in two halves. The request policy first:**
 The four rules now live in one place, `src/infrastructure/adapters/source-http.ts`, and all three
 adapters go through it instead of their own `fetch` + `res.text()` helper:
 
@@ -610,11 +611,38 @@ shapes, a five-hop loop, both size-cap paths and `resolveAllowedLink` resolution
 that a `169.254.169.254` card is never requested, produces no record, and voids both coverage
 claims. The three adapter specs and the policy spec are green unchanged apart from the new cases.
 
-Still open in M5 (the second half of the finding): the three helpers collapse non-2xx to `null`, so
+The half that was still open when this was written: the three helpers collapse non-2xx to `null`, so
 `funnel.httpFailures` (`run-source-collection.ts:367,394`) is only ever 0 or 1 and a 403/429/500
 listing reads as a record-level parse miss. The typed statuses now exist in `SourceHttpOutcome`;
-surfacing them needs a count on `CollectionResult` merged into the funnel, which is the remaining
-work.
+surfacing them needs a count on `CollectionResult` merged into the funnel.
+
+**The second half closed the same day: `CollectionResult.httpFailures` (`src/ports/source-adapter.ts`)
+is the count, and the funnel reads it.** Each adapter's own page read now looks at the outcome
+instead of discarding it — `politeGet` in JobWebEthiopia, `readPage` in EffoySira, the listing loop in
+Ethiojobs — and adds one for every page the source answered with an error status.
+`run-source-collection.ts:412` copies that into `funnel.httpFailures` on the path that used to leave
+it at 0, and a run whose source refused part of it is now `PARTIAL`, next to an `errorSummary` line
+naming the count — the same rule `parseFailures` and `storageFailures` already followed, for the same
+reason: a `SUCCEEDED` row next to a non-zero failure count is the understatement this finding was
+about. Health then reads `PARTIAL` as `DEGRADED` through the existing policy
+(`src/domain/health/source-health-policy.ts:108`), so a source that starts answering 403 stops
+looking healthy on its own record rather than on a guess.
+
+Two boundaries keep the count honest. The 404/410 the end-of-catalogue probe expects is *evidence*,
+not a failure, so the probe goes through `http.get` directly and is never counted — otherwise every
+healthy full read would report a failure and the back catalogue would look sick. A thrown or
+timed-out acquisition still counts exactly one failure where it ends (`:367,:394`), and those paths
+return before the merge, so the two never double-count. A response that is oversized or off-policy is
+not an HTTP failure either: the source answered fine, and those cases already void the FR-019 claims
+and cost the run its records.
+
+Tests: `counts the pages the source refused as HTTP failures, not as missing records (audit M5)` in
+`tests/integration/collection-idempotency.spec.ts` (one readable record plus two refused pages →
+funnel 2, run `PARTIAL`, `httpFailures` 2 persisted, summary names it), and in the adapter specs the
+503-listing cases now assert `httpFailures: 1`, the 500 posting-page cases assert `1`, and the
+successful end-of-catalogue probe asserts `0`.
+
+M5 is closed.
 
 #### M6 — Provenance and identity edge cases — **new, verified**
 
@@ -860,8 +888,8 @@ marked theoretical or downgraded.
 ### P2 — hardening and hygiene
 
 10. A source with no registered adapter re-enqueued on every pass (M4) — **done 2026-11-01**;
-    adapter SSRF/size caps (M5 first half) — **done 2026-11-02**; M5's HTTP-failure accounting and
-    the provenance/identity fixes (M6) remain open.
+    adapter SSRF/size caps and HTTP-failure accounting (M5) — **done 2026-11-02**; the
+    provenance/identity fixes (M6) remain open.
 11. CI, lint, Prettier dependency, build/migration step in `verify`, supervision/alerting (M8).
 12. Fastify 5 upgrade and dependency re-audit (M8).
 13. Accessibility labels/error association and test strengthening (M9).
