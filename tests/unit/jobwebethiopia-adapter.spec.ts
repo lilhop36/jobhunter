@@ -315,6 +315,34 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       oldestListingPublishedAt: null,
     });
   });
+
+  it('refuses a listing card whose link leaves the source host (audit M5)', async () => {
+    const offHost = 'https://169.254.169.254/latest/meta-data/';
+    const fetched: string[] = [];
+    const router = fetchRouter({
+      [LISTING]: listingHtml(card(TM_URL, 'Secretary'), card(offHost, 'Read Me')),
+      [TM_URL]: TM_DETAIL,
+    });
+    const adapter = createJobWebEthiopiaAdapter(
+      config({ options: { delayMs: 0, maxListingPages: 1, maxPosts: 10 } }),
+      {
+        fetchImpl: (async (input: string | URL, init?: RequestInit) => {
+          fetched.push(String(input));
+          return router(input, init);
+        }) as unknown as typeof fetch,
+        delay: async () => {},
+      },
+    );
+
+    const result = await adapter.collect(context());
+
+    // An href inside a page is untrusted input, not a request target: the link is never fetched.
+    expect(fetched).toEqual([LISTING, `${BASE}/jobs/page/2/`, TM_URL]);
+    expect(result.records.map((row) => row.sourceUrl)).toEqual([TM_URL]);
+    // The posting it would have been stays unobserved, so the pass claims no coverage or window.
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.oldestListingPublishedAt).toBeNull();
+  });
 });
 
 describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {

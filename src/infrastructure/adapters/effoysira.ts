@@ -9,6 +9,7 @@ import type {
 } from '@ports/source-adapter';
 import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
 import { normalizeRawEvidence } from './normalize-evidence';
+import { createSourceHttp } from './source-http';
 
 /**
  * EffoySira (effoysira.com) — the first production source adapter (SRS §7.2, Appendix E;
@@ -31,6 +32,9 @@ import { normalizeRawEvidence } from './normalize-evidence';
  */
 
 const BASE = 'https://effoysira.com';
+
+/** The one host this source's pages and links may live on (audit M5; see `./source-http`). */
+const HOST = new URL(BASE).hostname;
 
 const USER_AGENT = 'JobHunter/1.0 (personal job matcher; polite crawler)';
 
@@ -168,15 +172,9 @@ export function createEffoySiraAdapter(
   }
 
   // ── HTTP (polite: fixed UA, delay between requests, abort-aware) ────────────
-
-  async function get(url: string, signal?: AbortSignal): Promise<string | null> {
-    const res = await fetchImpl(url, {
-      signal,
-      headers: { 'User-Agent': USER_AGENT },
-    });
-    if (!res.ok) return null;
-    return res.text();
-  }
+  // Scheme, host, redirect hops and response size are the shared policy (audit M5); this is the
+  // source's own view of it: a page's text, or null when it could not be read.
+  const http = createSourceHttp({ fetchImpl, allowedHost: HOST, userAgent: USER_AGENT });
 
   // ── port implementation ─────────────────────────────────────────────────────
 
@@ -206,11 +204,8 @@ export function createEffoySiraAdapter(
      */
     async function pastListingEnd(page: number): Promise<boolean> {
       try {
-        const res = await fetchImpl(`${BASE}/category/job/page/${page}/`, {
-          signal,
-          headers: { 'User-Agent': USER_AGENT },
-        });
-        return res.status === 404 || res.status === 410;
+        const outcome = await http.get(`${BASE}/category/job/page/${page}/`, signal);
+        return outcome.kind === 'http' && (outcome.status === 404 || outcome.status === 410);
       } catch {
         return false;
       }
@@ -224,7 +219,7 @@ export function createEffoySiraAdapter(
       if (signal?.aborted) break;
       const url =
         page === 1 ? `${BASE}/category/job/` : `${BASE}/category/job/page/${page}/`;
-      const html = await get(url, signal);
+      const html = await http.getText(url, signal);
       if (html === null) break;
       const re = /<h2 class="entry-title"><a href="(https:\/\/effoysira\.com\/[^"]+)"/g;
       let m: RegExpExecArray | null;
@@ -247,7 +242,7 @@ export function createEffoySiraAdapter(
 
     for (const postUrl of postUrls) {
       if (signal?.aborted) break;
-      const html = await get(postUrl, signal);
+      const html = await http.getText(postUrl, signal);
       if (html === null) {
         // The posting was listed but could not be read: the record it would have refreshed
         // stays unobserved, so this pass cannot claim it saw everything.
@@ -324,7 +319,7 @@ export function createEffoySiraAdapter(
   async function healthCheck(context: HealthCheckContext): Promise<HealthResult> {
     let html: string | null;
     try {
-      html = await get(`${BASE}/category/job/`, context.signal);
+      html = await http.getText(`${BASE}/category/job/`, context.signal);
     } catch (error) {
       return {
         status: HealthStatus.FAILING,

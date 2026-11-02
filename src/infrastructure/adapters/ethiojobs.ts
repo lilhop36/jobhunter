@@ -11,6 +11,7 @@ import type { ApplicationTarget, HealthResult, NormalizedJob, RawJobEvidence } f
 import { isValidApplicationEmail } from '@domain/normalizers/application-target';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
 import { normalizeRawEvidence, type DeclaredRecordEvidence } from './normalize-evidence';
+import { createSourceHttp } from './source-http';
 
 /**
  * Ethiojobs (ethiojobs.net) — the second production source adapter (SRS 7.2, Appendix E;
@@ -34,6 +35,9 @@ import { normalizeRawEvidence, type DeclaredRecordEvidence } from './normalize-e
  */
 
 const BASE = 'https://ethiojobs.net';
+
+/** The one host this source's pages and links may live on (audit M5; see `./source-http`). */
+const HOST = new URL(BASE).hostname;
 
 const USER_AGENT = 'JobHunter/1.0 (personal job matcher; polite crawler)';
 
@@ -229,15 +233,9 @@ export function createEthiojobsAdapter(
   }
 
   // ── HTTP (polite: fixed UA, delay between requests, abort-aware) ────────────
-
-  async function get(url: string, signal?: AbortSignal): Promise<string | null> {
-    const res = await fetchImpl(url, {
-      signal,
-      headers: { 'User-Agent': USER_AGENT },
-    });
-    if (!res.ok) return null;
-    return res.text();
-  }
+  // Scheme, host, redirect hops and response size are the shared policy (audit M5); this is the
+  // source's own view of it: a page's text, or null when it could not be read.
+  const http = createSourceHttp({ fetchImpl, allowedHost: HOST, userAgent: USER_AGENT });
 
   function listingUrl(page: number): string {
     return page === 1 ? `${BASE}/jobs` : `${BASE}/jobs?page=${page}`;
@@ -266,7 +264,7 @@ export function createEthiojobsAdapter(
     let oldestPublishedAt: Date | null = null;
     for (let page = 1; page <= maxListingPages; page++) {
       if (signal?.aborted) break;
-      const html = await get(listingUrl(page), signal);
+      const html = await http.getText(listingUrl(page), signal);
       if (html === null) break;
       const listing = extractListingPage(html);
       if (listing === null) break;
@@ -387,7 +385,7 @@ export function createEthiojobsAdapter(
   async function healthCheck(context: HealthCheckContext): Promise<HealthResult> {
     let html: string | null;
     try {
-      html = await get(listingUrl(1), context.signal);
+      html = await http.getText(listingUrl(1), context.signal);
     } catch (error) {
       return {
         status: HealthStatus.FAILING,

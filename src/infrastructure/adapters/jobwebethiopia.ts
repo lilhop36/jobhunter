@@ -9,6 +9,7 @@ import type {
 } from '@ports/source-adapter';
 import type { HealthResult, NormalizedJob, RawJobEvidence } from '@domain/types';
 import { normalizeRawEvidence } from './normalize-evidence';
+import { createSourceHttp, resolveAllowedLink } from './source-http';
 
 /**
  * JobWebEthiopia (jobwebethiopia.com) — the third production source adapter (SRS §7.2,
@@ -38,6 +39,9 @@ import { normalizeRawEvidence } from './normalize-evidence';
  */
 
 const BASE = 'https://jobwebethiopia.com';
+
+/** The one host this source's pages and links may live on (audit M5; see `./source-http`). */
+const HOST = new URL(BASE).hostname;
 
 const USER_AGENT = 'JobHunter/1.0 (personal job matcher; polite crawler)';
 
@@ -220,15 +224,9 @@ export function createJobWebEthiopiaAdapter(
   }
 
   // ── HTTP (polite: fixed UA, 30 s between requests, abort-aware) ─────────────
-
-  async function get(url: string, signal?: AbortSignal): Promise<string | null> {
-    const res = await fetchImpl(url, {
-      signal,
-      headers: { 'User-Agent': USER_AGENT },
-    });
-    if (!res.ok) return null;
-    return res.text();
-  }
+  // Scheme, host, redirect hops and response size are the shared policy (audit M5); what is left
+  // here is the source's own view of a request: the page's text, or null when it could not be read.
+  const http = createSourceHttp({ fetchImpl, allowedHost: HOST, userAgent: USER_AGENT });
 
   // ── port implementation ─────────────────────────────────────────────────────
 
@@ -246,7 +244,7 @@ export function createJobWebEthiopiaAdapter(
     async function politeGet(url: string): Promise<string | null> {
       if (requests > 0) await delay(delayMs);
       requests += 1;
-      return get(url, signal);
+      return http.getText(url, signal);
     }
 
     // Discovery: newest postings first; the budget bounds the run, dedupe is downstream.
@@ -274,8 +272,8 @@ export function createJobWebEthiopiaAdapter(
       if (requests > 0) await delay(delayMs);
       requests += 1;
       try {
-        const res = await fetchImpl(url, { signal, headers: { 'User-Agent': USER_AGENT } });
-        return res.status === 404 || res.status === 410;
+        const outcome = await http.get(url, signal);
+        return outcome.kind === 'http' && (outcome.status === 404 || outcome.status === 410);
       } catch {
         return false;
       }
@@ -291,7 +289,14 @@ export function createJobWebEthiopiaAdapter(
       let match: RegExpExecArray | null;
       while ((match = re.exec(html)) !== null) {
         if (cards.length >= maxPosts) break;
-        const url = match[1];
+        // A link inside a page is untrusted input: it is resolved against the page that carried
+        // it and read only if it stays on the source's own host (audit M5). A card that leaves is
+        // a posting this pass did not read, so it voids the coverage claim instead of vanishing.
+        const url = resolveAllowedLink(match[1], listingUrl(page), HOST);
+        if (url === null) {
+          unreadablePostings += 1;
+          continue;
+        }
         if (seen.has(url)) continue;
         seen.add(url);
         cards.push({ url, title: extractText(match[2]) });
@@ -412,7 +417,7 @@ export function createJobWebEthiopiaAdapter(
   async function healthCheck(context: HealthCheckContext): Promise<HealthResult> {
     let html: string | null;
     try {
-      html = await get(listingUrl(1), context.signal);
+      html = await http.getText(listingUrl(1), context.signal);
     } catch (error) {
       return {
         status: HealthStatus.FAILING,

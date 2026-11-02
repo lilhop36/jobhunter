@@ -571,6 +571,51 @@ record-level parse misses and understate source health.
 base and reject unresolved ones; use `redirect: 'manual'` with revalidation; cap response bytes;
 return typed status and count non-2xx as HTTP failures.
 
+**Resolved 2026-11-02 for the request-policy half; the non-2xx accounting is open (see below).**
+The four rules now live in one place, `src/infrastructure/adapters/source-http.ts`, and all three
+adapters go through it instead of their own `fetch` + `res.text()` helper:
+
+- `createSourceHttp` fetches https-only, to exactly the source's own host
+  (`source-http.ts:90`), with `redirect: 'manual'` (`:139`) and the source's polite User-Agent.
+  Every redirect hop is re-resolved and re-validated before it is requested, so a `Location` that
+  leaves the host ends the read instead of being followed (`:141-155`), and a chain is bounded to
+  five hops.
+- `resolveAllowedLink` (`:59`) is what an extracted `href` becomes: resolved against the page that
+  carried it (so the site's own relative links still work), fragment dropped, and refused unless the
+  result is https on the source host. JobWebEthiopia's card loop uses it (`jobwebethiopia.ts:295`),
+  which is the one place a page could name a target the crawler was never meant to reach. EffoySira
+  and Ethiojobs extract no links — their post URLs were already pinned to the host and their
+  listing URLs are built from a constant — so for those two the gain is the redirect and size policy.
+- The body is capped while it is read, not after: a declared `content-length` over the cap is
+  refused without consuming the body, and a stream is cancelled as soon as it passes the cap
+  (`readCapped`, `:97-126`). The cap is 2 MiB against pages measured live at 185–247 KB.
+- A card that will not resolve is not silently dropped. It counts as an unreadable posting
+  (`jobwebethiopia.ts:296-299`), which voids the FR-019 coverage and window claims: the pass can no
+  longer assert it read everything the listing held.
+
+The outcomes are typed (`SourceHttpOutcome`, `:28`) — `ok` / `http(status)` / `offpolicy(detail)` /
+`oversized(bytes)` — and transport errors and aborts are still thrown rather than swallowed, so an
+unreachable source ends the run exactly as before. `getText` is the adapter-facing shape (body or
+null) and `get` is used where the *status* is the answer, i.e. the 404/410 end-of-catalogue probe.
+
+Residual, recorded in the module header: the allowlist is a *hostname* check, so a host that
+resolves to an internal address still passes. Closing that needs DNS-pinning (or an egress proxy),
+which is infrastructure the single-worker deployment does not have; the finding is listed as
+partially mitigated for that reason, not closed.
+
+Tests: `tests/unit/source-http.spec.ts` (15) covers the request policy, the four hostile redirect
+shapes, a five-hop loop, both size-cap paths and `resolveAllowedLink` resolution/refusal;
+`tests/unit/jobwebethiopia-adapter.spec.ts` —
+`refuses a listing card whose link leaves the source host (audit M5)` proves at the adapter level
+that a `169.254.169.254` card is never requested, produces no record, and voids both coverage
+claims. The three adapter specs and the policy spec are green unchanged apart from the new cases.
+
+Still open in M5 (the second half of the finding): the three helpers collapse non-2xx to `null`, so
+`funnel.httpFailures` (`run-source-collection.ts:367,394`) is only ever 0 or 1 and a 403/429/500
+listing reads as a record-level parse miss. The typed statuses now exist in `SourceHttpOutcome`;
+surfacing them needs a count on `CollectionResult` merged into the funnel, which is the remaining
+work.
+
 #### M6 — Provenance and identity edge cases — **new, verified**
 
 - `rawContentHash` excludes `rawPayload` (`src/domain/normalizers/job-identity.ts:114-127`). An
@@ -815,8 +860,8 @@ marked theoretical or downgraded.
 ### P2 — hardening and hygiene
 
 10. A source with no registered adapter re-enqueued on every pass (M4) — **done 2026-11-01**;
-    adapter SSRF/size caps and HTTP-failure accounting (M5) and provenance/identity fixes (M6)
-    remain open.
+    adapter SSRF/size caps (M5 first half) — **done 2026-11-02**; M5's HTTP-failure accounting and
+    the provenance/identity fixes (M6) remain open.
 11. CI, lint, Prettier dependency, build/migration step in `verify`, supervision/alerting (M8).
 12. Fastify 5 upgrade and dependency re-audit (M8).
 13. Accessibility labels/error association and test strengthening (M9).
