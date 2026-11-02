@@ -135,18 +135,28 @@ Descriptions are edited in place, and an edited posting must not become a new jo
 
 ### Fingerprint v1
 
-- **Version tag:** every value is prefixed `v1:<kind>:` where `kind` is `raw`,
+- **Version tag:** every value is prefixed `<version>:<kind>:` where `kind` is `raw`,
   `content` or `identity`. A future change to inputs, normalization or algorithm bumps
   the version, so old and new values are never compared as if equivalent and a
   re-fingerprint can be targeted by version. The `kind` segment means the three
   fingerprints answering different questions cannot collide with each other either.
   Example: `v1:content:9f2c…`.
+- **A bump can be per-kind.** The raw capture moved to `v2:raw:` when `rawPayload` joined
+  its inputs (audit M6): a capture whose publisher-declared structured fields changed *is*
+  a different capture, and reusing the old row let a Job assert a fact its linked evidence
+  did not contain. `content` and `identity` stayed at `v1` because their inputs did not
+  change, so every stored value of those kinds remains valid. The cost of the raw bump is
+  one extra raw row per posting on its next sighting — append-only history, which is what
+  this ADR allows; rewriting a stored payload is what it forbids.
 - **Algorithm:** SHA-256 over a UTF-8 encoded string, hex-encoded. Deliberately not a
   short non-cryptographic hash: the previous `contentFingerprint` was a 32-bit
   Java-style `String.hashCode`, which collides with ~50% probability by roughly 77k
   distinct values. Used as a uniqueness key that is silent data loss.
 - **Normalization (applied to every field):** Unicode NFKC; `\r\n` and `\r` → `\n`;
-  all whitespace runs collapsed to a single space; trimmed; lowercased.
+  all whitespace runs collapsed to a single space; trimmed; lowercased. The raw capture's
+  `rawPayload` segment is the exception: it is normalized as an opaque identifier (case
+  preserved, keys sorted so serialization order does not matter, list order kept), because
+  it carries source-assigned ids and two payloads differing only in case are two captures.
 - **Encoding:** each present field is emitted as a **length-prefixed, tagged** segment
   (`<tag><length>:<value>`) and segments are joined with `\u0000`. This makes field
   boundaries unambiguous — `("Acme Corp", "Ltd")` and `("Acme", "Corp Ltd")` no longer

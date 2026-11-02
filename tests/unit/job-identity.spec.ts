@@ -1,5 +1,6 @@
 import {
   FINGERPRINT_VERSION,
+  RAW_FINGERPRINT_VERSION,
   contentFingerprintV1,
   rawContentHash,
   resolveSourceRecordIdentity,
@@ -30,8 +31,42 @@ describe('rawContentHash', () => {
   it('carries the version and kind, and is a full SHA-256 digest', () => {
     const hash = rawContentHash({ rawTitle: 'x' });
     // A 32-bit hash would be short and base36. This guards the regression.
-    expect(hash.startsWith(`${FINGERPRINT_VERSION}:raw:`)).toBe(true);
+    expect(hash.startsWith(`${RAW_FINGERPRINT_VERSION}:raw:`)).toBe(true);
     expect(digestOf(hash)).toMatch(HEX64);
+  });
+
+  // Audit M6: the structured fields a publisher declares are part of what was captured, so a
+  // payload change must be a new capture instead of a reused raw row behind an updated Job.
+  it('changes when the declared payload changes', () => {
+    const before = rawContentHash({ rawTitle: 'x', rawPayload: { applicationMethod: 'EMAIL' } });
+    const after = rawContentHash({ rawTitle: 'x', rawPayload: { applicationMethod: 'ATS' } });
+    expect(before).not.toBe(after);
+  });
+
+  it('does not depend on the order of payload keys', () => {
+    const a = rawContentHash({ rawTitle: 'x', rawPayload: { a: '1', b: '2' } });
+    const b = rawContentHash({ rawTitle: 'x', rawPayload: { b: '2', a: '1' } });
+    expect(a).toBe(b);
+  });
+
+  it('does depend on the order of payload lists', () => {
+    // A publisher's category order is part of what it published; sorting it would invent equality
+    // between two different records.
+    const a = rawContentHash({ rawTitle: 'x', rawPayload: ['engineer', 'finance'] });
+    const b = rawContentHash({ rawTitle: 'x', rawPayload: ['finance', 'engineer'] });
+    expect(a).not.toBe(b);
+  });
+
+  it('treats no payload differently from an empty one', () => {
+    expect(rawContentHash({ rawTitle: 'x' })).not.toBe(rawContentHash({ rawTitle: 'x', rawPayload: {} }));
+  });
+
+  it('keeps payload values case-sensitive', () => {
+    // Payloads carry source-assigned ids; folding case would call two captures one capture and
+    // discard the newer payload as a re-observation.
+    const a = rawContentHash({ rawTitle: 'x', rawPayload: { opaqueInternalId: 'Ab1' } });
+    const b = rawContentHash({ rawTitle: 'x', rawPayload: { opaqueInternalId: 'ab1' } });
+    expect(a).not.toBe(b);
   });
 
   it('normalises whitespace, line endings and case', () => {

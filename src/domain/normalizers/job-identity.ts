@@ -13,13 +13,27 @@ import { urlIdentityValue } from './url-normalizer';
  * Only the last is an identity, and it is never derived from content alone unless no
  * better basis exists.
  *
- * Every value is prefixed `v1:<kind>:`, so values produced by a different algorithm,
+ * Every value is prefixed `<version>:<kind>:`, so values produced by a different algorithm,
  * different normalisation, or answering a different question are never compared as if
- * equivalent.
+ * equivalent. All kinds are `v1` except the raw capture, at `v2` - see `RAW_FINGERPRINT_VERSION`.
  */
 
 /** Bump when inputs, normalisation or algorithm change, so a re-fingerprint can target a version. */
 export const FINGERPRINT_VERSION = 'v1';
+
+/**
+ * The raw-capture kind has its own version, higher than the shared one.
+ *
+ * `rawPayload` joined the hash (audit M6): the structured fields a publisher declares are part of
+ * what was captured, so a capture whose payload changed is a different capture. Stored `v1:raw:`
+ * rows must stay distinguishable from rows hashed under the new inputs rather than be matched as
+ * if equivalent, and a re-observation is append-only - so the migration cost is one extra raw row
+ * per posting on its next sighting, never a rewrite of what was already stored.
+ *
+ * Deliberately scoped to this kind: content and identity fingerprints keep `FINGERPRINT_VERSION`,
+ * because their inputs did not change and their stored values remain valid.
+ */
+export const RAW_FINGERPRINT_VERSION = 'v2';
 
 export type FingerprintKind = 'raw' | 'content' | 'identity';
 
@@ -31,6 +45,11 @@ export interface RawContentFingerprintInput {
   rawDescription?: string | null;
   rawPublishedDateText?: string | null;
   rawSalaryText?: string | null;
+  /**
+   * The structured fields the publisher declared, verbatim as captured. Absent (null) contributes
+   * nothing; present, it must match for two captures to be the same capture.
+   */
+  rawPayload?: unknown;
 }
 
 export interface JobContentFingerprintInput {
@@ -80,22 +99,53 @@ function normalizeOpaqueField(value: string | null | undefined): string | null {
 }
 
 /**
+ * Text for a structured payload, or null when the adapter declared none.
+ *
+ * Object keys are sorted so the same data serialized in a different order is the same capture;
+ * array order is preserved, because re-ordering a publisher's list would make two genuinely
+ * different records look equal. Values are kept as the source gave them - this is evidence, not a
+ * place to normalise meaning.
+ */
+function payloadText(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .map((key) => [key, canonicalize(record[key])]),
+    );
+  }
+  return value;
+}
+
+/**
  * Build a fingerprint from tagged fields joined with NUL.
  *
  * Tags make field boundaries unambiguous - `{"Acme Corp", "Ltd"}` and
  * `{"Acme", "Corp Ltd"}` no longer encode identically - and a missing field emits no
  * segment while an empty field emits `tag=`, so UNKNOWN stays distinguishable from an
  * empty value.
+ *
+ * A segment marked opaque is normalised as an identifier (case preserved) rather than as
+ * display text: two payloads that differ only in the case of a source-assigned id are two
+ * captures, and folding them would discard the newer one as a re-observation.
  */
 function fingerprintFromSegments(
   kind: FingerprintKind,
-  segments: ReadonlyArray<readonly [string, string | null | undefined]>,
+  version: string,
+  segments: ReadonlyArray<readonly [string, string | null | undefined, boolean?]>,
   normalise: (value: string | null | undefined) => string | null,
 ): { value: string; nonEmptyFieldCount: number } {
   const encoded: string[] = [];
   let nonEmptyFieldCount = 0;
-  for (const [tag, value] of segments) {
-    const normalized = normalise(value);
+  for (const [tag, value, opaque] of segments) {
+    const normalized = opaque ? normalizeOpaqueField(value) : normalise(value);
     if (normalized === null) continue;
     // Length-prefixed: the segment is self-delimiting, so no captured value can forge
     // a field boundary, even if it contains a tag name, '=' or the NUL separator.
@@ -105,7 +155,7 @@ function fingerprintFromSegments(
   }
   const digest = createHash('sha256').update(encoded.join('\u0000'), 'utf8').digest('hex');
   return {
-    value: `${FINGERPRINT_VERSION}:${kind}:${digest}`,
+    value: `${version}:${kind}:${digest}`,
     nonEmptyFieldCount,
   };
 }
@@ -114,6 +164,7 @@ function fingerprintFromSegments(
 export function rawContentHash(input: RawContentFingerprintInput): string {
   return fingerprintFromSegments(
     'raw',
+    RAW_FINGERPRINT_VERSION,
     [
       ['t', input.rawTitle],
       ['c', input.rawCompany],
@@ -122,6 +173,7 @@ export function rawContentHash(input: RawContentFingerprintInput): string {
       ['s', input.rawSalaryText],
       ['p', input.rawPublishedDateText],
       ['u', input.sourceUrl],
+      ['x', payloadText(input.rawPayload), true],
     ],
     normalizeTextField,
   ).value;
@@ -136,6 +188,7 @@ export function rawContentHash(input: RawContentFingerprintInput): string {
 export function contentFingerprintV1(input: JobContentFingerprintInput): string {
   return fingerprintFromSegments(
     'content',
+    FINGERPRINT_VERSION,
     [
       ['t', input.title],
       ['c', input.company],
@@ -214,6 +267,7 @@ function identityTextField(value: string | null | undefined): string | null {
 function identityFallbackFingerprint(input: SourceRecordIdentityInput): string | null {
   const { value, nonEmptyFieldCount } = fingerprintFromSegments(
     'identity',
+    FINGERPRINT_VERSION,
     [
       ['t', input.title],
       ['c', input.company],

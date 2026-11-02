@@ -483,6 +483,10 @@ export class RunSourceCollection {
             rawDescription: record.rawDescription,
             rawPublishedDateText: record.rawPublishedDateText,
             rawSalaryText: record.rawSalaryText,
+            // The payload is stored on the row, so it has to be part of the identity of the
+            // capture: otherwise a changed declared field (an expiry, an application method)
+            // reuses the old raw row while the Job moves to the new facts (audit M6).
+            rawPayload: record.rawPayload,
           }),
         });
       } catch (error) {
