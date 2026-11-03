@@ -226,6 +226,7 @@ ${adSlot}
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       // The listing answered with an error status: a source failure, not a parse miss (M5).
       httpFailures: 1,
     });
@@ -340,6 +341,28 @@ describe('EffoySira adapter — catalogue coverage (FR-019)', () => {
     const result = await adapter.collect(context());
     expect(result.catalogueExhausted).toBe(false);
     expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-09T00:00:00.000Z'));
+    expect(result.listingNotNewestFirst).toBe(false);
+  });
+
+  it('voids the window claim when the listing is not served newest-first', async () => {
+    // The second post read is newer than the first, so this pass did not read the listing's
+    // newest prefix: a posting newer than its floor may sit on a page it never requested. The
+    // claim is voided and the reason recorded, instead of the sweep retiring that posting
+    // (audit M6).
+    const adapter = createEffoySiraAdapter(config({ options: { maxListingPages: 1 } }), {
+      fetchImpl: fetchRouter({
+        'https://effoysira.com/category/job/': listingPage([POST_1, POST_2], { hasNext: true }),
+        [POST_1]: postPage({ published: '2026-10-09T12:00:00+00:00' }),
+        [POST_2]: postPage({ published: '2026-10-17T09:57:17+00:00' }),
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.records).toHaveLength(2);
+    expect(result.oldestListingPublishedAt).toBeNull();
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.listingNotNewestFirst).toBe(true);
   });
 
   it('makes no window claim when a post it read carries no parseable date', async () => {
@@ -387,6 +410,7 @@ describe('EffoySira adapter — catalogue coverage (FR-019)', () => {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       // The listing answered with an error status: a source failure, not a parse miss (M5).
       httpFailures: 1,
     });

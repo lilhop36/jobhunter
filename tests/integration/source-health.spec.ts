@@ -68,6 +68,7 @@ class ReapingAdapter extends FakeSourceAdapter {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       httpFailures: 0,
     };
   }

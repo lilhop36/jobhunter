@@ -111,12 +111,21 @@ export interface HealthCheckContext {
  * publication date among the listing entries it read. A record published strictly after
  * this floor was inside the window the pass saw; entries at or before it may lie beyond the
  * pages read (published dates are date-only, so the floor date itself is excluded). `null`
- * means no window claim: an entry was unreadable or undated, or the pass was aborted.
+ * means no window claim: an entry was unreadable or undated, the listing came out of order,
+ * or the pass was aborted.
  */
 export interface CollectionResult {
   records: RawJobEvidence[];
   catalogueExhausted: boolean;
   oldestListingPublishedAt: Date | null;
+  /**
+   * True when this pass read listing entries whose publication dates did not decrease, which
+   * is what the window claim above assumes (audit M6). Reporting it is why the claim was
+   * voided, rather than leaving `oldestListingPublishedAt: null` to be guessed at from a
+   * source that merely stopped dating its postings. Both claims are void either way; this
+   * only says which of them broke.
+   */
+  listingNotNewestFirst: boolean;
   /**
    * Pages the source answered with an HTTP error status (403, 429, 500 …).
    *

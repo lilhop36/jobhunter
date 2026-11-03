@@ -41,9 +41,11 @@ found no clause that blocks this collection.
   `lastmod` values are regenerated uniformly on every sitemap build (verified 2026-10-22:
   every entry carried the same generation timestamp), so recency is not derivable from the
   sitemap and the adapter does not use it.
-- **Page shape varies by page number:** page 1 embeds `props.pageProps.jobs` as a plain
-  array; page N embeds it as `{ data: [...], meta: {...} }` (verified live 2026-10-22).
-  The parser accepts both.
+- **Page shape varies by page number:** live (2026-10-23), *every* page — including page 1 —
+  embeds `props.pageProps.jobs` as `{ data: [...], meta: { pageNumber, itemsPerPage, lastPage, total } }`
+  (`lastPage: 101`, `total: 1206`). Older captures embed it as a plain array on page 1; the
+  parser accepts both, and pagination metadata is only trusted when `meta.pageNumber` matches
+  the requested page. The adapter never lets a later page shrink the declared `lastPage`.
 - **Listing entry fields observed live (2026-10-22):** `slug`, `title`, `description`
   (full HTML), `state` (region text: "Addis Ababa", "Oromia", "Tigray", "Central Ethiopia
   Regional State", …), `date_published` (ISO), `date_expiry` (ISO — a real expiry date,

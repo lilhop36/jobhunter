@@ -122,6 +122,7 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       // The listing answered 503: a source failure, not a parse miss (audit M5).
       httpFailures: 1,
     });
@@ -198,12 +199,14 @@ describe('Ethiojobs adapter — catalogue coverage (FR-019)', () => {
   });
 
   it('reports the oldest publication date across the pages it read', async () => {
-    const olderEntry = LISTING_PAGE_1.replace('2026-10-22T08:48:44.235Z', '2026-10-20T08:48:44.235Z');
-    const cappedPage2 = LISTING_PAGE_2.replace('"lastPage":2', '"lastPage":101');
+    // The older posting is on the later page, which is what a newest-first listing looks like.
+    const olderPage2 = LISTING_PAGE_2
+      .replace('2026-10-22T07:19:05.000000Z', '2026-10-20T07:19:05.000000Z')
+      .replace('"lastPage":2', '"lastPage":101');
     const adapter = createEthiojobsAdapter(config(), {
       fetchImpl: fetchRouter({
-        'https://ethiojobs.net/jobs': olderEntry,
-        'https://ethiojobs.net/jobs?page=2': cappedPage2,
+        'https://ethiojobs.net/jobs': LISTING_PAGE_1,
+        'https://ethiojobs.net/jobs?page=2': olderPage2,
       }),
       delay: async () => {},
     });
@@ -211,6 +214,30 @@ describe('Ethiojobs adapter — catalogue coverage (FR-019)', () => {
     const result = await adapter.collect(context());
     expect(result.catalogueExhausted).toBe(false);
     expect(result.oldestListingPublishedAt).toEqual(new Date('2026-10-20T00:00:00.000Z'));
+    expect(result.listingNotNewestFirst).toBe(false);
+  });
+
+  it('voids the window claim when the listing is not served newest-first', async () => {
+    // A posting on page 2 that is newer than the last entry of page 1 means the pages the run
+    // did NOT read can hold postings newer than the floor — which is exactly the case the
+    // lifecycle sweep would retire by mistake. The claim is voided, and says why (audit M6).
+    const outOfOrderPage2 = LISTING_PAGE_2.replace(
+      '2026-10-22T07:19:05.000000Z',
+      '2026-10-23T07:19:05.000000Z',
+    );
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://ethiojobs.net/jobs': LISTING_PAGE_1,
+        'https://ethiojobs.net/jobs?page=2': outOfOrderPage2,
+      }),
+      delay: async () => {},
+    });
+
+    const result = await adapter.collect(context());
+    expect(result.records).toHaveLength(3);
+    expect(result.oldestListingPublishedAt).toBeNull();
+    expect(result.catalogueExhausted).toBe(false);
+    expect(result.listingNotNewestFirst).toBe(true);
   });
 
   it('makes no window claim when an entry it read carries no date', async () => {

@@ -1,5 +1,6 @@
 import { ApplicationMethod, HealthStatus } from '@domain/enums';
 import { parseDate } from '@domain/normalizers/calendar';
+import { emptyListingWindow, observeListingEntry } from '@domain/lifecycle/listing-window';
 import type {
   CollectionContext,
   CollectionResult,
@@ -270,9 +271,10 @@ export function createEthiojobsAdapter(
     // Window claim (FR-019): the oldest `date_published` among the entries this run read.
     // Pages are served newest-first, so those entries are the listing's newest prefix; an
     // unobserved Job published strictly after this floor was inside the part the run saw. An
-    // entry without a parseable date voids the claim: it might be the oldest one read.
-    let windowKnown = true;
-    let oldestPublishedAt: Date | null = null;
+    // entry without a parseable date voids the claim: it might be the oldest one read. An
+    // entry *newer* than the one before it voids it too - the newest-first assumption is the
+    // claim's basis, so it is checked rather than trusted (audit M6).
+    const window = emptyListingWindow();
     // A page the source answered with an error status is a source failure, not a parse miss
     // (audit M5).
     let httpFailures = 0;
@@ -308,18 +310,14 @@ export function createEthiojobsAdapter(
         const publishedDateText = asString(entry.date_published);
 
         if (publishedDateText === null) {
-          windowKnown = false;
+          observeListingEntry(window, null);
         } else {
           const parsed = parseDate({
             text: publishedDateText,
             sourceCalendarHint: config.declaredCalendar,
             declaredDateFormat: config.declaredDateFormat,
           });
-          if (parsed.publishedAt === null) {
-            windowKnown = false;
-          } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
-            oldestPublishedAt = parsed.publishedAt;
-          }
+          observeListingEntry(window, parsed.publishedAt);
         }
 
         evidence.push({
@@ -372,12 +370,13 @@ export function createEthiojobsAdapter(
     }
 
     // A page budget that stopped before the end still makes a window claim when every entry
-    // read was dated; an abort or an unidentifiable entry voids it.
-    const claimable = unreadableEntries === 0 && !signal?.aborted && windowKnown;
+    // read was dated and in order; an abort or an unidentifiable entry voids it.
+    const claimable = unreadableEntries === 0 && !signal?.aborted && window.claimable;
     return {
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
-      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      oldestListingPublishedAt: claimable ? window.oldestPublishedAt : null,
+      listingNotNewestFirst: window.listingNotNewestFirst,
       httpFailures,
     };
   }

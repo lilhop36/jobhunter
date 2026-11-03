@@ -91,6 +91,8 @@ export class FakeSourceAdapter implements JobSourceAdapter {
   private readonly oldestListingPublishedAt: Date | null;
   /** Pages the fake pretends the source answered with an error status. Default `0`. */
   private readonly httpFailures: number;
+  /** Default `false`: the fake reports its rows in newest-first order. */
+  private readonly listingNotNewestFirst: boolean;
 
   constructor(
     config: SourceAdapterConfig = makeFakeConfig(),
@@ -98,12 +100,14 @@ export class FakeSourceAdapter implements JobSourceAdapter {
     catalogueExhausted = true,
     oldestListingPublishedAt: Date | null = null,
     httpFailures = 0,
+    listingNotNewestFirst = false,
   ) {
     this.config = config;
     this.rows = rows;
     this.exhaustive = catalogueExhausted;
     this.oldestListingPublishedAt = oldestListingPublishedAt;
     this.httpFailures = httpFailures;
+    this.listingNotNewestFirst = listingNotNewestFirst;
   }
 
   async collect(_context: CollectionContext): Promise<CollectionResult> {
@@ -111,6 +115,7 @@ export class FakeSourceAdapter implements JobSourceAdapter {
       records: this.rows.map((row) => ({ ...row })),
       catalogueExhausted: this.exhaustive,
       oldestListingPublishedAt: this.oldestListingPublishedAt,
+      listingNotNewestFirst: this.listingNotNewestFirst,
       httpFailures: this.httpFailures,
     };
   }

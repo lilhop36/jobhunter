@@ -338,6 +338,7 @@ export class RunSourceCollection {
               records: [],
               catalogueExhausted: false,
               oldestListingPublishedAt: null,
+              listingNotNewestFirst: false,
               httpFailures: 0,
             } satisfies CollectionResult;
           }
@@ -355,6 +356,7 @@ export class RunSourceCollection {
               records: [],
               catalogueExhausted: false,
               oldestListingPublishedAt: null,
+              listingNotNewestFirst: false,
               httpFailures: 0,
             } satisfies CollectionResult;
           }
@@ -588,6 +590,13 @@ export class RunSourceCollection {
     // answered 403 must not read as "the source published nothing" (audit M5).
     if (funnel.httpFailures > 0) {
       notes.push(`${funnel.httpFailures} source page(s) answered with an HTTP error status`);
+    }
+    // A listing served out of publication order voids this run's window claim: what it read is
+    // no longer the newest prefix, so an unobserved posting newer than the floor could simply
+    // have been further down the page. Recorded, because a null floor alone cannot be told apart
+    // from a source that stopped dating its postings (audit M6).
+    if (collection.listingNotNewestFirst) {
+      notes.push('coverage window voided: the listing was not served newest-first');
     }
 
     let status: TerminalRunStatus;

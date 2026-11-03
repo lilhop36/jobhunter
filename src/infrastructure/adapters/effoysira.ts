@@ -1,5 +1,6 @@
 import { HealthStatus } from '@domain/enums';
 import { parseDate } from '@domain/normalizers/calendar';
+import { emptyListingWindow, observeListingEntry } from '@domain/lifecycle/listing-window';
 import type {
   CollectionContext,
   CollectionResult,
@@ -193,9 +194,10 @@ export function createEffoySiraAdapter(
     let unreadablePostings = 0;
     // Window claim (FR-019): the oldest publication date among the posts this pass read.
     // A post with no parseable date, or one that could not be read, voids the claim: the
-    // pass can no longer place an unobserved posting outside the window it saw.
-    let windowKnown = true;
-    let oldestPublishedAt: Date | null = null;
+    // pass can no longer place an unobserved posting outside the window it saw. So does a post
+    // read *newer* than the one before it - the claim assumes the listing is newest-first, and
+    // that is checked per run rather than trusted (audit M6).
+    const window = emptyListingWindow();
     // A page the source answered with an error status is a source failure, not a parse miss
     // (audit M5). The 404/410 the end-of-catalogue probe expects is not counted here.
     let httpFailures = 0;
@@ -264,18 +266,14 @@ export function createEffoySiraAdapter(
       const contentHtml = extractContent(html);
       const publishedTime = extractPublishedTime(html);
       if (publishedTime === null) {
-        windowKnown = false;
+        observeListingEntry(window, null);
       } else {
         const parsed = parseDate({
           text: publishedTime,
           sourceCalendarHint: config.declaredCalendar,
           declaredDateFormat: config.declaredDateFormat,
         });
-        if (parsed.publishedAt === null) {
-          windowKnown = false;
-        } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
-          oldestPublishedAt = parsed.publishedAt;
-        }
+        observeListingEntry(window, parsed.publishedAt);
       }
       const locationLine = contentHtml === null ? null : extractLocation(contentHtml);
       const salaryLine = contentHtml === null ? null : extractSalaryText(contentHtml);
@@ -311,11 +309,12 @@ export function createEffoySiraAdapter(
       await delay(delayMs);
     }
 
-    const claimable = unreadablePostings === 0 && !signal?.aborted && windowKnown;
+    const claimable = unreadablePostings === 0 && !signal?.aborted && window.claimable;
     return {
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
-      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      oldestListingPublishedAt: claimable ? window.oldestPublishedAt : null,
+      listingNotNewestFirst: window.listingNotNewestFirst,
       httpFailures,
     };
   }

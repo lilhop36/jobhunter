@@ -255,6 +255,7 @@ class LyingAdapter implements JobSourceAdapter {
       records: this.rows.map((row) => ({ ...row })),
       catalogueExhausted: true,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       httpFailures: 0,
     };
   }

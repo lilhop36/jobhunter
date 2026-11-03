@@ -313,6 +313,7 @@ describe('JobWebEthiopia adapter â€” collect (fixture HTML, no network)', (
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       // The listing answered 503: a source failure, not a parse miss (audit M5).
       httpFailures: 1,
     });
@@ -498,6 +499,7 @@ describe('JobWebEthiopia adapter — catalogue coverage (FR-019)', () => {
       records: [],
       catalogueExhausted: false,
       oldestListingPublishedAt: null,
+      listingNotNewestFirst: false,
       // The listing answered 503: a source failure, not a parse miss (audit M5).
       httpFailures: 1,
     });

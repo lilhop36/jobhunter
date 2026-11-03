@@ -159,6 +159,16 @@ current database shows what the first wired sweep would do:
 | Ethiojobs | 24 | 24 | 0 |
 | JobWebEthiopia | 6 | 6 | 0 |
 
+**Progress (2026-11-03):** wired. `JobSourceAdapter.collect` now returns `CollectionResult { records, catalogueExhausted }`;
+a `source_runs.catalogueExhausted` column (migration `20261024120000`) persists it; `listLifecycleCandidates`
+requires `catalogueExhausted = true`; the handler calls `SweepSourceLifecycle` only after a
+`SUCCEEDED` run with `catalogueExhausted = true`. Coverage is conservative (full listing read plus
+every listed posting successfully read; next-page 404/410 probe for WordPress sources; Ethiojobs
+uses `meta.lastPage` with `meta.pageNumber` matching). **Status: still inert in production** —
+no current budget reads a listing to its end (EffoySira ≈ 7 pages, Ethiojobs 101, JobWeb 11 vs
+`maxPosts` 6), so `catalogueExhausted` stays false and the sweep never fires. Raising budgets is an
+owner decision (politeness: 30 s crawl delay per request). H-1/H-2/H-3 fixed; M-1/M-2/M-3 fixed.
+
 Those 44 EffoySira jobs are older postings that fell outside the two-page window; they are
 still published. Retiring them would convert "not looked at" into "gone" — exactly the
 missing-evidence-as-negative-evidence failure ENG-001 forbids, and it would also cancel any

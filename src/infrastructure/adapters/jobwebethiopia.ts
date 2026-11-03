@@ -1,5 +1,6 @@
 import { HealthStatus } from '@domain/enums';
 import { parseDate } from '@domain/normalizers/calendar';
+import { emptyListingWindow, observeListingEntry } from '@domain/lifecycle/listing-window';
 import type {
   CollectionContext,
   CollectionResult,
@@ -264,9 +265,10 @@ export function createJobWebEthiopiaAdapter(
     // listing is served newest-first, so those posts are its newest prefix; an unobserved
     // posting published strictly after this floor was inside the part the run saw. A posting
     // that could not be read or carries no parseable date voids the claim, because the pass
-    // can then no longer place an unobserved posting outside the window it saw.
-    let windowKnown = true;
-    let oldestPublishedAt: Date | null = null;
+    // can then no longer place an unobserved posting outside the window it saw. So does one
+    // read *newer* than the posting before it: newest-first is the claim's basis, so it is
+    // checked per run rather than trusted (audit M6).
+    const window = emptyListingWindow();
 
     /**
      * A missing `rel="next"` is not proof of the end: a theme change or a soft-404 shell
@@ -355,18 +357,14 @@ export function createJobWebEthiopiaAdapter(
 
       const publishedDateText = extractPublishedDateText(page);
       if (publishedDateText === null) {
-        windowKnown = false;
+        observeListingEntry(window, null);
       } else {
         const parsed = parseDate({
           text: publishedDateText,
           sourceCalendarHint: config.declaredCalendar,
           declaredDateFormat: config.declaredDateFormat,
         });
-        if (parsed.publishedAt === null) {
-          windowKnown = false;
-        } else if (oldestPublishedAt === null || parsed.publishedAt < oldestPublishedAt) {
-          oldestPublishedAt = parsed.publishedAt;
-        }
+        observeListingEntry(window, parsed.publishedAt);
       }
 
       evidence.push({
@@ -403,12 +401,14 @@ export function createJobWebEthiopiaAdapter(
     }
 
     // A run cut short by its budget or by an unreachable page still makes a window claim if
-    // every posting it did read was dated; only an abort or an unreadable posting voids it.
-    const claimable = unreadablePostings === 0 && !signal?.aborted && windowKnown;
+    // every posting it did read was dated and in order; only an abort or an unreadable
+    // posting voids it.
+    const claimable = unreadablePostings === 0 && !signal?.aborted && window.claimable;
     return {
       records: evidence,
       catalogueExhausted: reachedListingEnd && claimable,
-      oldestListingPublishedAt: claimable ? oldestPublishedAt : null,
+      oldestListingPublishedAt: claimable ? window.oldestPublishedAt : null,
+      listingNotNewestFirst: window.listingNotNewestFirst,
       httpFailures,
     };
   }
