@@ -1,9 +1,9 @@
 # JobHunter — project status and remediation report
 
-**Date:** 2026-11-02 (evening)
+**Date:** written 2026-11-02 evening, updated 2026-11-03 10:40 (after the M6 live identity rename)
 **For:** the owner/operator (not an engineering onboarding document)
-**Covers:** the full-system audit of 2026-10-25 and everything remediated since, through commit
-`8a0246e`, plus the M6 work in flight right now (section 6)
+**Covers:** the full-system audit of 2026-10-25 and everything remediated since, including the M6
+identity rename applied to the live database this morning (section 6)
 **Type:** a status + remediation report — an Explanation of *why* the system is where it is, with a
 Reference register of *what* is closed. It deliberately excludes how-to material; operating steps live
 in [backup-and-restore.md](./backup-and-restore.md).
@@ -39,13 +39,14 @@ can do, because they are choices about your machine and your network, not code.
 
 | | |
 | --- | --- |
-| Commits | 146 total; 33 of them since the audit |
-| Working tree | one change in progress while this report was written: the M6 identifier rename (section 6) |
-| Database | live `jobhunter` at 16/16 migrations, "up to date" |
-| Test suite | 84 spec files / 1099 tests — `npm run verify` green (type check + full suite) at 22:51 on 2026-11-02 |
-| Jobs stored | 163 — EffoySira 79, Ethiojobs 72, JobWebEthiopia 12 |
-| Raw captures | 168 rows in `raw_jobs` (append-only evidence, never overwritten) |
-| Matches | 300 scored job/candidate pairs |
+| Commits | 148 total; 35 of them since the audit |
+| Working tree | clean; the M6 window-ordering guard is the next piece (section 6, item 3) |
+| Database | live `jobhunter` at 17/17 migrations, including this morning's identity rename |
+| Test suite | 84 spec files / 1099 tests — `npm run verify` green (type check + full suite) on 2026-11-02 |
+| Jobs stored | 186 — EffoySira 79, Ethiojobs 95, JobWebEthiopia 12 |
+| Raw captures | 216 rows in `raw_jobs` (append-only evidence, never overwritten; 48 of them are
+captures made after the payload joined the raw hash) |
+| Matches | 324 scored job/candidate pairs |
 | Notifications | 1 outbox row — the eligibility gates are still rarely met, see section 5 |
 | Sources | 3 approved adapters, all collecting on schedule |
 | Identity | 1 user, login by one-time local code (no password, no `?userId=` link) |
@@ -80,7 +81,7 @@ the code and nodded.
 
 | Ref | What it is | Status |
 | --- | --- | --- |
-| M6 | Provenance retention and identity-key stability | one of three halves landed today; see section 6 |
+| M6 | Provenance retention and identity-key stability | two of three halves closed — the payload is part of the capture hash and the Ethiojobs identity rename is live and proven; the window-ordering guard is open (section 6) |
 | M7 | Backups were scripts, not a capability | code done 2026-10-30; the schedule task and the encrypted off-machine copy are yours |
 | M8 | No CI, no lint gate, no supervision; Fastify 4 with 2 high audit findings | not started; needs your decision on CI |
 | M9 | Some form controls have no accessible name; the a11y test overstates coverage | not started |
@@ -120,23 +121,43 @@ carry a heartbeat, so a live run isn't reaped and a dead one can't keep writing.
 
 ## 5. Live behaviour under the fixes
 
-Runs started 2026-11-02, read from the live database:
+Runs read from the live database (the 2026-11-03 pair is after the M6 identity rename, so its duplicate
+count is the continuity proof; see section 6):
 
 | Source | Started | Status | Discovered | Duplicates | HTTP failures | Coverage floor |
 | --- | --- | --- | --- | --- | --- | --- |
-| EffoySira | 17:21 | SUCCEEDED | 18 | 1 | 0 | 2026-10-30 |
-| Ethiojobs | 17:21 | SUCCEEDED | 24 | 0 | 0 | 2026-11-02 |
-| JobWebEthiopia | 17:22 | SUCCEEDED | 6 | 6 | 0 | 2026-10-29 |
+| EffoySira | 2026-11-02 17:21 | SUCCEEDED | 18 | 1 | 0 | 2026-10-30 |
+| Ethiojobs | 2026-11-02 17:21 | SUCCEEDED | 24 | 0 | 0 | 2026-11-02 |
+| JobWebEthiopia | 2026-11-02 17:22 | SUCCEEDED | 6 | 6 | 0 | 2026-10-29 |
+| EffoySira | 2026-11-03 07:30 | SUCCEEDED | 18 | 18 | 0 | 2026-10-30 |
+| Ethiojobs | 2026-11-03 07:31 | SUCCEEDED | 24 | 1 | 0 | 2026-11-02 |
+| JobWebEthiopia | 2026-11-03 07:31 | SUCCEEDED | 6 | 6 | 0 | 2026-10-29 |
 
 All three sources no longer make a `catalogueExhausted` claim at their page budget — they make a
 window claim floored at the oldest posting date they actually read. That is the "Windowed coverage"
 decision, and it is what stops the lifecycle sweep from retiring a job the run simply never reached.
 
+This morning also showed the health detection doing its job, unsolicited. The worker had not run since
+17:25 yesterday — nothing was collecting for 14 hours — and when it was started again the first thing it
+did was log all three sources as gone silent, by name, with the declared interval and the last
+successful run time in the message:
+
+```
+[worker:warn] source has gone silent {"name":"Ethiojobs",
+  "reason":"no successful collection for 14.1 h — the source declares a 6.0 h schedule
+           and 2 whole intervals have passed without one",
+  "lastSuccessfulRunAt":"2026-11-02T17:22:04.131Z"}
+```
+
+That is H7's second half working on real downtime rather than in a test. It also means the thing to
+watch is not the sources but the worker process: if it is not running, the only signal you get is this
+one, and only when it comes back.
+
 Two observations worth your attention:
 
 - **JobWebEthiopia yields 6 postings and today's were all already known.** Its 2-page budget is the
   reason. If you want that source to cover more ground, the budget is the knob, not the code.
-- **Only one notification exists against 300 matches.** The gates are minScore 60 *and* minConfidence
+- **Only one notification exists against 324 matches.** The gates are minScore 60 *and* minConfidence
   45, and the sample scores seen so far were 72/confidence 33 and 50/confidence 47 — one high, one
   wide, neither through both doors. That is the system behaving as specified, not a bug, but if the
   intent was "alert me sometimes", the thresholds need your review.
@@ -164,15 +185,19 @@ Where it stands, in the three reviewable pieces it was planned as:
    stored for them is invalidated. Consequence, accepted on purpose: one extra raw row per existing
    posting on its next sighting. That is append-only history, which the identity ADR allows; rewriting
    a stored payload is what it forbids.
-2. **Written and validated, not yet applied.** The Ethiojobs adapter now declares the slug's leading id
-   segment as its identifier, with a forward-only migration renaming what is already stored. Checked
-   read-only against the live database first: 72 distinct identifiers map to 72 distinct segments, none
-   shared, none empty. The migration was then exercised against the disposable test database — the
-   rename is correct, a row belonging to another source is left alone, re-running it changes nothing,
-   and if two postings ever did map to the same segment it raises "refusing to rename" instead of
-   half-applying. Applying it to `jobhunter` waits for a backup and a restore check, because the
-   identity keys it rewrites are what the match and notification history hangs off.
-3. **Not started.** The coverage-window guard: the rule assumes a listing is served newest-first, so if
+2. **Applied to the live database, and proven.** The Ethiojobs adapter now declares the slug's leading
+   id segment as its identifier, and the forward-only migration
+   `20261102120000_ethiojobs_identifier_id_segment` renamed what was already stored: 72 identity keys
+   and 72 raw identifiers, no row lost (163 jobs, 300 matches and 1 outbox row before and after; 72
+   distinct keys after, zero slug-shaped keys left, zero jobs sharing a URL). You approved that write
+   after a fresh backup (`backups/jobhunter-20261103T071950Z.dump`) and a restore drill on it (17
+   tables, 730 rows, disposable restore DB dropped). Then a real collection ran against the new code:
+   one posting that existed before the rename was **re-observed as the same job** — updated, not
+   duplicated — and the 23 it accepted were genuinely new, which is the continuity proof the whole fix
+   was for. Before the migration was exercised on the live database it was exercised on the disposable
+   one: correct rename, another source's row untouched, re-running is a no-op, and a hypothetical
+   collision raises "refusing to rename" instead of half-applying.
+3. **Open.** The coverage-window guard: the rule assumes a listing is served newest-first, so if
    a later-read posting turns out *newer* than an earlier-read one, the run's window claim should be
    voided and the reason recorded, rather than the sweep quietly retiring jobs it never reached.
 
@@ -186,9 +211,12 @@ it — the audit records which. The full gate ran clean for M5: `npm run verify`
 
 That whole-suite gate covers everything through commit `da3d734`. The M6 pieces that came after it have
 targeted proof only — type check clean, 19 Ethiojobs adapter tests, 80 tests over the identity
-normalizer and the two raw-evidence repositories, 35 ingestion-adjacent tests, plus the migration
-exercised against the disposable database as section 6 describes. The run that gates M6 end to end is
-still owed, and I am not calling it done before that.
+normalizer and the two raw-evidence repositories, 35 ingestion-adjacent tests — plus the migration
+rehearsed end to end on the disposable database (section 6) and applied to `jobhunter` this morning
+under `prisma migrate deploy`, with the invariants read back afterwards: 163 jobs, 300 matches and 1
+outbox row unchanged, 72 distinct Ethiojobs identity keys, zero slug-shaped keys left, zero jobs sharing
+a URL, and a real collection that re-observed a pre-rename posting as the same job. The whole-suite run
+that gates M6 is still owed, and I am not calling it done before that.
 
 **Verified against the live system.** Migrations up to date on `jobhunter`; `/dashboard` and
 `/api/sources` returning 200; the three sources collecting with the new HTTP policy (section 5); the
@@ -217,10 +245,10 @@ runs in the history are.
 
 ## 8. What's next in this cycle
 
-Roughly in order: finish M6 (three commits, migration applied only after a backup check), then M9
+Roughly in order: the last piece of M6 — the guard that voids a run's coverage claim when its listing
+turns out not to be newest-first — then a full `npm run verify` over both M6 commits, then M9
 accessibility labels and error association, then the low items starting with cursor validation and the
-`TELEGRAM_BOT_TOKEN` leak into the API process, then a final full verification with the docs
-reconciled.
+`TELEGRAM_BOT_TOKEN` leak into the API process, then a final verification with the docs reconciled.
 
 Your side, whenever you get a chance: install the backup schedule task, choose an off-machine
 directory for the encrypted copy, and decide whether M8 gets a CI/lint gate.
@@ -228,8 +256,8 @@ directory for the encrypted copy, and decide whether M8 gets a CI/lint gate.
 ---
 
 *Skipped / not checked: the L12 collision was diagnosed from the run log and a clean standalone
-re-run, not from a reproduction of the two suites racing on purpose; the M6 rename has been exercised
-only against the disposable database — the live `jobhunter` rows still carry the old identifiers until
-its migration is applied after a backup check; the JobWebEthiopia low yield and the
+re-run, not from a reproduction of the two suites racing on purpose; the M6 rename is live on
+`jobhunter`, but its continuity proof is one re-observed Ethiojobs posting plus zero same-URL forks —
+not a long observation, and not a whole-suite run; the JobWebEthiopia low yield and the
 notification-threshold observation are read from live run rows, not from a design document; and L1–L10
 statuses are copied from the audit register rather than re-verified against current code.*

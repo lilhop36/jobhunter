@@ -672,16 +672,22 @@ posting on its next sighting - append-only history, never a rewrite of a stored 
 five new `rawContentHash` cases in `tests/unit/job-identity.spec.ts` (payload change, key order, list
 order, absent-vs-empty, case sensitivity).
 
-**Second half written, not yet applied:** the Ethiojobs adapter declares the slug's leading id segment
-(`idSegment()`), and `20261102120000_ethiojobs_identifier_id_segment` renames the stored
+**Second half closed, applied to the live database 2026-11-03:** the Ethiojobs adapter declares the
+slug's leading id segment (`idSegment()`), and
+`20261102120000_ethiojobs_identifier_id_segment` renamed the stored
 `raw_jobs.sourceJobIdentifier` and `jobs.identityKey` to match. That rename is the dangerous part of
-M6, and it is treated as such: `sid:` outranks `url:` in identity resolution, so without the migration
-the next collection would fork every one of the 72 live Ethiojobs identities, create duplicate Jobs and
-leave the sweep to retire the originals with their match and notification history. Checked collision-free
-read-only first (72 identifiers to 72 distinct segments, none shared, none empty), then exercised on the
-disposable database: correct rename, another source's row untouched, re-running is a no-op, and a
-hypothetical collision raises `refusing to rename` rather than half-applying. Applying it to `jobhunter`
-is gated on a backup and restore check.
+M6, and it was treated as such: `sid:` outranks `url:` in identity resolution, so without the migration
+the next collection would have forked every one of the 72 live Ethiojobs identities, created duplicate
+Jobs and left the sweep to retire the originals with their match and notification history. Ordered
+safety, in sequence: read-only pre-check (72 identifiers to 72 distinct segments, none shared, none
+empty); a fresh `npm run backup` archive; `npm run backup:drill` on it (17 tables, 730 rows, restore DB
+dropped); the migration exercised on the disposable database (rename correct, another source's row
+untouched, re-running is a no-op, a collision raises `refusing to rename`); owner approval for the live
+write, taken while no worker or API was attached; then `migrate deploy` and re-check (163 jobs, 300
+matches, 1 outbox row before and after; 72 distinct keys, 0 slug-shaped keys, 0 jobs sharing a
+canonical URL). The following real collection is the continuity proof: the one previously-stored posting
+it re-read was **updated, not duplicated** (`updatedAt` today, `createdAt` 2026-11-02), and the 23 it
+accepted were new postings.
 
 **Third half open:** the monotonic-ordering guard on the FR-019 window claim (a later-read posting that
 turn out newer than an earlier-read one should void the claim and record why, not leave a live job
