@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -186,12 +186,25 @@ describe('backup retention', () => {
 });
 
 describe('migration ledger comparison', () => {
-  it('reads this checkout’s migrations in order', () => {
+  it('reads this checkout’s migrations in order, with nothing malformed or duplicated', () => {
+    const dir = join(process.cwd(), 'prisma', 'migrations');
     const migrations = readRepositoryMigrations(process.cwd());
-    expect(migrations.length).toBeGreaterThanOrEqual(15);
-    expect(migrations.every((name) => /^\d{14}_/.test(name))).toBe(true);
+
+    // `readRepositoryMigrations` filters by name, so a malformed directory would be dropped
+    // silently. Check the directory itself: every subdirectory must be a migration.
+    const directories = readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+    expect(directories.filter((name) => !/^\d{14}_/.test(name))).toEqual([]);
+
+    // Every migration must carry the SQL Prisma applies, and names must be unique and ordered.
+    expect(migrations.every((name) => existsSync(join(dir, name, 'migration.sql')))).toBe(true);
+    expect(new Set(migrations).size).toBe(migrations.length);
     expect([...migrations].sort()).toEqual(migrations);
-    expect(migrations.at(-1)).toBe('20261030210000_source_run_heartbeat');
+
+    // The newest migration is deliberately not pinned: every new migration would break the
+    // pin, and the assertion it was standing in for (a complete, ordered ledger) is above.
+    expect(migrations.length).toBeGreaterThanOrEqual(15);
   });
 
   it('reports a missing, altered or unexpected migration', () => {
