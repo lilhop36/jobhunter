@@ -621,6 +621,44 @@ describe('RunSourceCollection', () => {
     expect(result.run?.errorSummary).toContain('HTTP error status');
   });
 
+  it('persists the window floor a capped newest-first run can still claim', async () => {
+    const sourceId = await createSource();
+    const floor = new Date('2026-10-29T00:00:00.000Z');
+    // Capped (not the whole catalogue) but ordered: everything published after the floor
+    // was read, which is the narrower claim the lifecycle sweep is allowed to use.
+    const adapter = new FakeSourceAdapter(
+      makeFakeConfig({ sourceId }),
+      [makeRawJob({ sourceJobIdentifier: 'w-1', rawTitle: 'Driver', collectedAt: NOW })],
+      false,
+      floor,
+    );
+
+    const result = await collectOnce(adapter);
+
+    expect(result.run?.oldestListingPublishedAt).toEqual(floor);
+    expect(result.run?.errorSummary ?? '').not.toContain('not served newest-first');
+  });
+
+  it('voids the window floor and names the reason when the listing is not newest-first (audit M6)', async () => {
+    const sourceId = await createSource();
+    // The adapter proposes a floor and reports the ordering violation in the same result:
+    // the run must persist no floor, because a posting newer than it could have been on a
+    // page the run never read (audit M6).
+    const adapter = new FakeSourceAdapter(
+      makeFakeConfig({ sourceId }),
+      [makeRawJob({ sourceJobIdentifier: 'w-2', rawTitle: 'Nurse', collectedAt: NOW })],
+      false,
+      new Date('2026-10-29T00:00:00.000Z'),
+      0,
+      true,
+    );
+
+    const result = await collectOnce(adapter);
+
+    expect(result.run?.oldestListingPublishedAt).toBeNull();
+    expect(result.run?.errorSummary).toContain('not served newest-first');
+  });
+
   it('stops cleanly on abort without claiming a source failure', async () => {
     const sourceId = await createSource();
     const controller = new AbortController();

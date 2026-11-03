@@ -642,7 +642,13 @@ export class RunSourceCollection {
       // Coverage is only claimable when the run finished reading the listing; a run that
       // aborted part-way leaves both the end and the window floor uncertain.
       catalogueExhausted: collection.catalogueExhausted && !endedForTheWorker,
-      oldestListingPublishedAt: endedForTheWorker ? null : collection.oldestListingPublishedAt,
+      // A voided ordering claim cannot keep a floor, whatever the adapter returned: the
+      // floor is what licenses retirement, so it is enforced here rather than trusted
+      // (audit M6). Absent evidence is not negative evidence.
+      oldestListingPublishedAt:
+        endedForTheWorker || collection.listingNotNewestFirst
+          ? null
+          : collection.oldestListingPublishedAt,
       // A run that only ended because the worker shut down is not the source's doing.
       attributableToSource: !endedForTheWorker,
       errorSummary: notes.length === 0 ? null : bound(notes.join('; ')),
