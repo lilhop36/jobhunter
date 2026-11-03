@@ -80,9 +80,11 @@ describe('Ethiojobs adapter — collect (fixture HTML, no network)', () => {
 
     expect(evidence).toHaveLength(3);
     const first = evidence[0];
-    // Slug is the stable external identifier.
-    expect(first.sourceJobIdentifier).toBe('2qdbkevrhp-senior-accountant');
+    // The slug's leading id segment, never the title text after it (audit M6): a publisher
+    // retitling a posting must not fork its identity.
+    expect(first.sourceJobIdentifier).toBe('2qdbkevrhp');
     expect(first.sourceUrl).toBe('https://ethiojobs.net/job/2qdbkevrhp-senior-accountant');
+    expect(evidence[1]?.sourceJobIdentifier).toBe('t8jxf0tin5');
     expect(first.rawTitle).toBe('Senior Accountant');
     expect(first.rawCompany).toBe('Alpha Clinic');
     expect(first.rawLocation).toBe('Addis Ababa');

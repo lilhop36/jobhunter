@@ -4,7 +4,9 @@
 - **Status:** APPROVED
 - **Access mechanism:** STATIC_HTML
 - **Robots and terms review:** robots.txt (2026-10-22) allows everything except `/auth/*`, `/api/*`, `/users/*`, `/companies/functions*` (an explicit `Allow: /` for `*` plus bot-specific allowances); the adapter therefore reads only `sitemap-jobs.xml`-listed `/jobs` listing pages and `/job/*` posting pages and never calls the disallowed `{*}`/api paths. Terms of Service (https://ethiojobs.net/terms-of-service) reviewed 2026-10-22 by the product owner: no clause blocking collection of listing/posting content with attribution and polite rate limits; verdict allowed.
-- **Stable job identifier field:** the posting slug (`/job/<id>-<slug>`, e.g. `t8jXf0TiN5-driver-bishoftu`); the leading id segment is a stable external identifier (ADR-0001 id-bearing captures)
+- **Stable job identifier field:** the **leading id segment** of the posting slug (`/job/<id>-<title-slug>`,
+  e.g. `t8jXf0TiN5` from `t8jXf0TiN5-driver-bishoftu`); the text after it is the title, which the
+  publisher edits, so it is not part of the identity (ADR-0001 id-bearing captures, audit M6)
 - **Declared calendar:** GREGORIAN
 - **Declared currency:** none (no salary fields are published in structured data; in-text salary, when present, is plain text without a stated currency)
 - **Canonical URL identity trusted:** yes
@@ -25,6 +27,15 @@ found no clause that blocks this collection.
 
 ## Notes
 
+- **Identifier migration (2026-11-02, audit M6):** captures made before this change filed the *whole
+  slug* as `sourceJobIdentifier`, so every job's identity key was `sid:<id>-<title-slug>`. The
+  forward-only migration `20261102120000_ethiojobs_identifier_id_segment` renames the stored identifier
+  and identity keys to the leading segment, because `sid:` outranks the URL and an un-migrated rename
+  would fork all 72 identities, duplicate the jobs and let the sweep retire the originals with their
+  match and notification history. Checked collision-free against the live rows before it was written
+  (72 identifiers → 72 distinct segments, none shared, none empty), and exercised on the disposable
+  database: correct rename, other sources untouched, re-running changes nothing, a hypothetical
+  collision raises instead of half-applying.
 - **Discovery:** the `/jobs` listing (`/jobs?page=N`), newest first, 12 per page
   (`meta.lastPage` 94, total ≈1125 on 2026-10-22). `sitemap-jobs.xml` exists but its
   `lastmod` values are regenerated uniformly on every sitemap build (verified 2026-10-22:

@@ -1,8 +1,12 @@
 # JobHunter — project status and remediation report
 
-**Date:** 2026-11-02
+**Date:** 2026-11-02 (evening)
 **For:** the owner/operator (not an engineering onboarding document)
-**Covers:** the full-system audit of 2026-10-25 and everything remediated since, through commit `f39ba83`
+**Covers:** the full-system audit of 2026-10-25 and everything remediated since, through commit
+`8a0246e`, plus the M6 work in flight right now (section 6)
+**Type:** a status + remediation report — an Explanation of *why* the system is where it is, with a
+Reference register of *what* is closed. It deliberately excludes how-to material; operating steps live
+in [backup-and-restore.md](./backup-and-restore.md).
 **Detail lives in:** [full-system-audit-2026-10-25.md](./full-system-audit-2026-10-25.md) (findings and evidence),
 [srs-implementation-drift-2026-10-23.md](./srs-implementation-drift-2026-10-23.md) (requirement gaps),
 the ADRs in [architecture/decisions](../architecture/decisions).
@@ -35,8 +39,8 @@ can do, because they are choices about your machine and your network, not code.
 
 | | |
 | --- | --- |
-| Commits | 143 total; 30 of them since the audit |
-| Working tree | clean |
+| Commits | 146 total; 33 of them since the audit |
+| Working tree | one change in progress while this report was written: the M6 identifier rename (section 6) |
 | Database | live `jobhunter` at 16/16 migrations, "up to date" |
 | Test suite | 84 spec files / 1099 tests — `npm run verify` green (type check + full suite) at 22:51 on 2026-11-02 |
 | Jobs stored | 163 — EffoySira 79, Ethiojobs 72, JobWebEthiopia 12 |
@@ -76,7 +80,7 @@ the code and nodded.
 
 | Ref | What it is | Status |
 | --- | --- | --- |
-| M6 | Provenance retention and identity-key stability | in progress, planned in 3 commits; see section 6 |
+| M6 | Provenance retention and identity-key stability | one of three halves landed today; see section 6 |
 | M7 | Backups were scripts, not a capability | code done 2026-10-30; the schedule task and the encrypted off-machine copy are yours |
 | M8 | No CI, no lint gate, no supervision; Fastify 4 with 2 high audit findings | not started; needs your decision on CI |
 | M9 | Some form controls have no accessible name; the a11y test overstates coverage | not started |
@@ -152,21 +156,25 @@ adapter to use the stable id segment without also rewriting the stored keys woul
 posting a new identity: 72 duplicate jobs, and the sweep retiring the originals — with their match and
 notification history. That is why this is a planned migration and not a two-line edit.
 
-The plan, in three reviewable commits:
+Where it stands, in the three reviewable pieces it was planned as:
 
-1. `rawContentHash` gains a canonicalised `rawPayload` segment, with a version bump scoped to the raw
-   kind only, so content and identity fingerprints stay `v1`. Consequence: one extra raw row per
-   existing posting on its next sighting. That is append-only history, which is allowed; rewriting a
-   stored payload is not.
-2. The Ethiojobs identifier switches to the slug's leading id segment, together with a forward-only
-   migration over the stored identifier and identity keys. Checked read-only against the live
-   database first: 72 distinct identifiers → 72 distinct leading segments, none shared, none empty, so
-   the rename is deterministic and collision-free today.
-3. A guard on the coverage window: the rule assumes listings are newest-first. If a later-read
-   posting turns out newer than an earlier-read one, the run's window claim is voided and the reason
-   is recorded, instead of the system quietly retiring jobs it never saw.
-
-Step 2's migration gets applied to `jobhunter` only after a backup and a restore check.
+1. **Landed** (`8a0246e`). `rawContentHash` now includes a canonicalised `rawPayload` segment — object
+   keys sorted, list order kept, case preserved because payloads carry source-assigned ids — and only
+   the raw kind moved to `v2:raw:`. Content and identity fingerprints stay `v1`, so nothing already
+   stored for them is invalidated. Consequence, accepted on purpose: one extra raw row per existing
+   posting on its next sighting. That is append-only history, which the identity ADR allows; rewriting
+   a stored payload is what it forbids.
+2. **Written and validated, not yet applied.** The Ethiojobs adapter now declares the slug's leading id
+   segment as its identifier, with a forward-only migration renaming what is already stored. Checked
+   read-only against the live database first: 72 distinct identifiers map to 72 distinct segments, none
+   shared, none empty. The migration was then exercised against the disposable test database — the
+   rename is correct, a row belonging to another source is left alone, re-running it changes nothing,
+   and if two postings ever did map to the same segment it raises "refusing to rename" instead of
+   half-applying. Applying it to `jobhunter` waits for a backup and a restore check, because the
+   identity keys it rewrites are what the match and notification history hangs off.
+3. **Not started.** The coverage-window guard: the rule assumes a listing is served newest-first, so if
+   a later-read posting turns out *newer* than an earlier-read one, the run's window claim should be
+   voided and the reason recorded, rather than the sweep quietly retiring jobs it never reached.
 
 ---
 
@@ -175,6 +183,12 @@ Step 2's migration gets applied to `jobhunter` only after a backup and a restore
 **Verified by tests that exist and pass.** Every closed finding above has a regression test named for
 it — the audit records which. The full gate ran clean for M5: `npm run verify` (disk preflight,
 `tsc --noEmit`, then the whole suite) exited 0 with **84 files / 1099 tests passed**, 14 minutes.
+
+That whole-suite gate covers everything through commit `da3d734`. The M6 pieces that came after it have
+targeted proof only — type check clean, 19 Ethiojobs adapter tests, 80 tests over the identity
+normalizer and the two raw-evidence repositories, 35 ingestion-adjacent tests, plus the migration
+exercised against the disposable database as section 6 describes. The run that gates M6 end to end is
+still owed, and I am not calling it done before that.
 
 **Verified against the live system.** Migrations up to date on `jobhunter`; `/dashboard` and
 `/api/sources` returning 200; the three sources collecting with the new HTTP policy (section 5); the
@@ -214,6 +228,8 @@ directory for the encrypted copy, and decide whether M8 gets a CI/lint gate.
 ---
 
 *Skipped / not checked: the L12 collision was diagnosed from the run log and a clean standalone
-re-run, not from a reproduction of the two suites racing on purpose; the JobWebEthiopia low yield and
-the notification-threshold observation are read from live run rows, not from a design document; and
-L1–L10 statuses are copied from the audit register rather than re-verified against current code.*
+re-run, not from a reproduction of the two suites racing on purpose; the M6 rename has been exercised
+only against the disposable database — the live `jobhunter` rows still carry the old identifiers until
+its migration is applied after a backup check; the JobWebEthiopia low yield and the
+notification-threshold observation are read from live run rows, not from a design document; and L1–L10
+statuses are copied from the audit register rather than re-verified against current code.*

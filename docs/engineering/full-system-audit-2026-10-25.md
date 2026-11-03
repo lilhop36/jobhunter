@@ -644,7 +644,7 @@ successful end-of-catalogue probe asserts `0`.
 
 M5 is closed.
 
-#### M6 — Provenance and identity edge cases — **new, verified**
+#### M6 — Provenance and identity edge cases — **in remediation 2026-11-02**
 
 - `rawContentHash` excludes `rawPayload` (`src/domain/normalizers/job-identity.ts:114-127`). An
   Ethiojobs change to `applicationMethod`, `applicationEmail`, `dateExpiry` or `careerPageLink`
@@ -660,8 +660,32 @@ M5 is closed.
   claimed window and be retired. Verify monotonic ordering per source or bound the floor to the last
   fully-read page.
 - EffoySira retains no raw payload (`effoysira.ts:295-297`, deliberate), so its extracted fields
-  cannot be re-verified after the page changes; `collectedAt` is publication time, not observation
-  time (`:298`).
+  cannot be re-verified after the page changes. (*The second half of this bullet was accurate at audit
+  time and is now closed: `collectedAt` is the observation time since the H6 fix, with a test pinning
+  it.*)
+
+**Remediation, 2026-11-02. First half closed** (`8a0246e`): `rawContentHash` takes `rawPayload` as a
+canonicalized segment (object keys sorted, list order kept, case preserved - payload values carry
+source-assigned ids), and the raw kind alone moves to `v2:raw:`; content and identity fingerprints stay
+`v1`, so no stored value of those kinds is invalidated. The accepted cost is one extra raw row per
+posting on its next sighting - append-only history, never a rewrite of a stored payload. Tests: the
+five new `rawContentHash` cases in `tests/unit/job-identity.spec.ts` (payload change, key order, list
+order, absent-vs-empty, case sensitivity).
+
+**Second half written, not yet applied:** the Ethiojobs adapter declares the slug's leading id segment
+(`idSegment()`), and `20261102120000_ethiojobs_identifier_id_segment` renames the stored
+`raw_jobs.sourceJobIdentifier` and `jobs.identityKey` to match. That rename is the dangerous part of
+M6, and it is treated as such: `sid:` outranks `url:` in identity resolution, so without the migration
+the next collection would fork every one of the 72 live Ethiojobs identities, create duplicate Jobs and
+leave the sweep to retire the originals with their match and notification history. Checked collision-free
+read-only first (72 identifiers to 72 distinct segments, none shared, none empty), then exercised on the
+disposable database: correct rename, another source's row untouched, re-running is a no-op, and a
+hypothetical collision raises `refusing to rename` rather than half-applying. Applying it to `jobhunter`
+is gated on a backup and restore check.
+
+**Third half open:** the monotonic-ordering guard on the FR-019 window claim (a later-read posting that
+turn out newer than an earlier-read one should void the claim and record why, not leave a live job
+inside a window it was never in).
 
 #### M7 — Backup and disaster recovery are scripts, not an operating capability — **known (D19), partially resolved 2026-10-30**
 
@@ -890,7 +914,8 @@ marked theoretical or downgraded.
 
 10. A source with no registered adapter re-enqueued on every pass (M4) — **done 2026-11-01**;
     adapter SSRF/size caps and HTTP-failure accounting (M5) — **done 2026-11-02**; the
-    provenance/identity fixes (M6) remain open.
+    provenance/identity fixes (M6) are in remediation — payload-in-hash done, the Ethiojobs identifier
+    rename written and gated on a backup check, the window-ordering guard open.
 11. CI, lint, Prettier dependency, build/migration step in `verify`, supervision/alerting (M8).
 12. Fastify 5 upgrade and dependency re-audit (M8).
 13. Accessibility labels/error association and test strengthening (M9).

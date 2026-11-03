@@ -41,6 +41,17 @@ const HOST = new URL(BASE).hostname;
 
 const USER_AGENT = 'JobHunter/1.0 (personal job matcher; polite crawler)';
 
+/**
+ * The stable id inside a posting slug: `t8jXf0TiN5-driver-bishoftu` -> `t8jXf0TiN5`.
+ *
+ * A slug with no separator is returned whole rather than guessed at, so an unexpected shape
+ * degrades to the old behaviour instead of truncating an identifier and colliding two postings.
+ */
+function idSegment(slug: string): string {
+  const separator = slug.indexOf('-');
+  return separator > 0 ? slug.slice(0, separator) : slug;
+}
+
 export function createEthiojobsAdapter(
   config: SourceAdapterConfig,
   deps: {
@@ -312,9 +323,11 @@ export function createEthiojobsAdapter(
         }
 
         evidence.push({
-          // The slug's leading id segment is the site's stable external identifier
-          // (record: identifier field = posting slug).
-          sourceJobIdentifier: slug,
+          // The slug is `<id>-<title text>`; only the leading segment is the site's stable
+          // external id (docs/sources/ethiojobs.md). The rest is the title, which the publisher
+          // can edit, and a title-derived identifier forks a Job's identity on a retitle
+          // (audit M6).
+          sourceJobIdentifier: idSegment(slug),
           sourceUrl: `${BASE}/job/${slug}`,
           rawTitle: title,
           rawCompany: company === null || company === undefined ? null : asString(company.name),
