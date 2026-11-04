@@ -3,6 +3,7 @@ import { CalendarType, HealthStatus, SalaryType } from '@domain/enums';
 import { silentWorkerLogger } from '@ports/worker-logger';
 import type { SourceAdapterConfig } from '@ports/source-adapter';
 import { canonicalizeUrl } from '@domain/normalizers/url-normalizer';
+import { hasUsableApplicationPath } from '@domain/normalizers/application-target';
 import { createEthiojobsAdapter } from '@infrastructure/adapters/ethiojobs';
 import { makeFakeConfig } from '../support/fake-source-adapter';
 
@@ -43,7 +44,9 @@ const DECLARED_TARGETS_PAGE = `<!DOCTYPE html><html><body>
 {"id":"c1","title":"Career Link Role","slug":"c1-career-link","state":"Addis Ababa","description":"<p>Great role.</p>","date_expiry":"2026-11-02T23:59:59.000000Z","company":{"name":"Beta"},"application_method":"CAREER_PAGE_LINK","career_page_link":"https://careers.example.com/apply/42?job=42"},
 {"id":"c2","title":"In Person Role","slug":"c2-in-person","state":"Oromia","description":"<p>Apply in person at our office.</p>","company":{"name":"Gamma"},"application_method":"EMAIL","application_email":"jobs@example.com"},
 {"id":"c3","title":"Malformed Email Role","slug":"c3-bad-email","state":"Oromia","description":"<p>Application Deadline: October 30, 2026</p>","date_expiry":"soon","company":{"name":"Delta"},"application_method":"EMAIL","application_email":"not-an-email"},
-{"id":"c4","title":"Both Role","slug":"c4-both","state":"Amhara","description":"<p>Both channels.</p>","company":{"name":"Epsilon"},"application_method":"BOTH","application_email":"both@example.com","career_page_link":"https://careers.example.com/both"}
+{"id":"c4","title":"Both Role","slug":"c4-both","state":"Amhara","description":"<p>Both channels.</p>","company":{"name":"Epsilon"},"application_method":"BOTH","application_email":"both@example.com","career_page_link":"https://careers.example.com/both"},
+{"id":"c5","title":"Platform Role","slug":"c5-ats","state":"Addis Ababa","description":"<p>Tender notice.</p>","company":{"name":"Zeta"},"application_method":"ATS","application_email":null},
+{"id":"c6","title":"Office Visit Role","slug":"c6-in-person","state":"Oromia","description":"<p>Bring your CV to our office.</p>","company":{"name":"Eta"},"application_method":"IN_PERSON","application_email":null}
 ]}}}</script>
 </body></html>`;
 
@@ -306,7 +309,7 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
     expect(job.application.method).toBe('EMAIL');
     expect(job.application.applyEmail).toBe('hr@alpha.com');
     expect(job.provenance.applicationMethod?.conversionMethod).toBe(
-      'APPLICATION_TARGET_DECLARED_V1',
+      'APPLICATION_TARGET_DECLARED_V2',
     );
     expect(job.provenance.applicationMethod?.evidence).toBe('application_method=EMAIL');
     // date_expiry is a declared ISO timestamp; the shared date parser resolves it and the
@@ -373,19 +376,63 @@ describe('Ethiojobs adapter — normalize delegates to domain normalizers (ENG-0
     expect(job.applicationDeadline.deadlineAt?.toISOString()).toBe('2026-10-30T00:00:00.000Z');
   });
 
-  it('leaves a declared ATS record with no link or email as UNKNOWN', async () => {
+  it('maps a declared ATS to SOURCE_ACCOUNT without inventing a target', async () => {
     const adapter = createEthiojobsAdapter(config(), {
       fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': LISTING_PAGE_1 }),
       delay: async () => {},
     });
 
     const { records: evidence } = await adapter.collect(context());
-    // Second entry is "Driver" with application_method ATS and no email in the description.
-    // No usable path is declared, so the honest state is UNKNOWN - not a fabricated target.
+    // Second entry is "Driver" with application_method ATS. The site's own applicant system
+    // means the application happens on the listing the reader is already on, so the method is
+    // SOURCE_ACCOUNT and carries no URL of its own (audit A1).
     const driver = evidence.find((e) => e.rawTitle === 'Driver (Bishoftu / Night Shift)')!;
     const job = await adapter.normalize(driver);
 
-    expect(job.application.method).toBe('UNKNOWN');
+    expect(job.application).toMatchObject({
+      method: 'SOURCE_ACCOUNT',
+      applyUrl: null,
+      applyEmail: null,
+    });
+    expect(job.provenance.applicationMethod?.evidence).toBe('application_method=ATS');
+    // A path exists (the listing), so AC-004 no longer excludes this job from notification.
+    expect(hasUsableApplicationPath(job.application)).toBe(true);
+  });
+
+  it('maps a declared in-person method with no target', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({ 'https://ethiojobs.net/jobs': DECLARED_TARGETS_PAGE }),
+      delay: async () => {},
+    });
+    const { records: evidence } = await adapter.collect(context());
+    const raw = evidence.find((e) => e.rawTitle === 'Office Visit Role')!;
+    const job = await adapter.normalize(raw);
+
+    // The publisher says the application is an office visit. No text extraction is needed and
+    // no address is guessed (audit A2).
+    expect(job.application).toMatchObject({
+      method: 'IN_PERSON',
+      applyUrl: null,
+      applyEmail: null,
+    });
+    expect(hasUsableApplicationPath(job.application)).toBe(true);
+  });
+
+  it('maps a declared platform record on a later page too', async () => {
+    const adapter = createEthiojobsAdapter(config(), {
+      fetchImpl: fetchRouter({
+        'https://ethiojobs.net/jobs': LISTING_PAGE_1,
+        'https://ethiojobs.net/jobs?page=2': LISTING_PAGE_2,
+      }),
+      delay: async () => {},
+    });
+
+    const { records: evidence } = await adapter.collect(context());
+    // Page 2's "Data Collector" also declares ATS; the mapping must not depend on position.
+    const collector = evidence.find((e) => e.rawTitle === 'Data Collector')!;
+    const job = await adapter.normalize(collector);
+
+    expect(job.application.method).toBe('SOURCE_ACCOUNT');
   });
 });
 

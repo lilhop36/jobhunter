@@ -449,4 +449,31 @@ describe('job upsert', () => {
     expect(rows[0].applyEmail).toBeNull();
     expect(rows[0].provenance.applicationMethod?.conversionMethod).toBe(APPLICATION_TARGET_VERSION);
   });
+
+  it('replaces a stored UNKNOWN application method when a later capture states one (audit A1)', async () => {
+    const sourceId = await createSource('job-method-heal');
+    const methodOf = async (jobId: string): Promise<string> => {
+      const rows = await prisma.$queryRawUnsafe<{ applicationMethod: string }[]>(
+        'SELECT "applicationMethod"::text AS "applicationMethod" FROM "jobs" WHERE "id" = $1::uuid',
+        jobId,
+      );
+      return rows[0].applicationMethod;
+    };
+
+    // A capture that read no application signal: UNKNOWN, which is "nothing was read", not a
+    // determination that there is no path.
+    const silent = await normalize({ rawDescription: 'Build things.' });
+    expect(silent.application.method).toBe(ApplicationMethod.UNKNOWN);
+    const { job: stored } = await repo.upsert({ sourceId, identityKey: 'sid:job-1', job: silent });
+    expect(await methodOf(stored.id)).toBe('UNKNOWN');
+
+    // The same posting observed again with a stated method. Because UNKNOWN does not override a
+    // stored statement but a statement does replace a stored UNKNOWN, rows written before a
+    // mapping improvement correct themselves on the next observation rather than staying wrong.
+    const stated = await normalize({ rawDescription: 'Apply in person at our office.' });
+    expect(stated.application.method).toBe(ApplicationMethod.IN_PERSON);
+    await repo.upsert({ sourceId, identityKey: 'sid:job-1', job: stated });
+
+    expect(await methodOf(stored.id)).toBe('IN_PERSON');
+  });
 });

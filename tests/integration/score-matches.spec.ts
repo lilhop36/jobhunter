@@ -378,6 +378,32 @@ describe('notification eligibility inside the scoring run (SRS 3.2, ENG-027)', (
     expect(rows[0].nextAttemptAt.toISOString()).toBe(FIRST_NOW.toISOString());
   });
 
+  it('reserves for a job whose application path is the source itself (audit A1)', async () => {
+    await profiles.saveForUser({ userId, profile: profile() });
+    // Ethiojobs declares its own ATS as SOURCE_ACCOUNT: nothing is stored in applyUrl or
+    // applyEmail because the publisher supplied neither, and the listing is the path. AC-004
+    // accepts that, so this job must leave the run with an outbox row.
+    await prisma.job.update({
+      where: { id: jobIds[0] },
+      data: { applicationMethod: ApplicationMethod.SOURCE_ACCOUNT },
+    });
+
+    const result = await scoring.run({ now: FIRST_NOW });
+
+    expect(result.notificationsReserved).toBe(1);
+    expect(await prisma.notificationOutbox.count()).toBe(1);
+  });
+
+  it('reserves for a job applied for in person (audit A2)', async () => {
+    await profiles.saveForUser({ userId, profile: profile() });
+    await prisma.job.update({
+      where: { id: jobIds[0] },
+      data: { applicationMethod: ApplicationMethod.IN_PERSON },
+    });
+
+    expect((await scoring.run({ now: FIRST_NOW })).notificationsReserved).toBe(1);
+  });
+
   it('does not reserve a second time for an event that was already reserved', async () => {
     await profiles.saveForUser({ userId, profile: profile() });
     await giveApplicationPath(jobIds[0]);

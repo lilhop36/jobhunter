@@ -169,10 +169,19 @@ export function createEthiojobsAdapter(
   /**
    * The application target the publisher declares in its own fields.
    *
-   * Only the methods the site emits are mapped, and only when the field that method needs is
-   * present: a declared `ATS` arrives with neither a link nor an email, so it stays UNKNOWN
-   * rather than inventing a path. `application_form` is never populated in captured records,
-   * so its shape is unknown and it is deliberately not read.
+   * The declared *method* is authoritative; the declared fields only have to satisfy the target
+   * that method needs. That is why `EMAIL` wins over a link on the same record, and why a
+   * `CAREER_PAGE_LINK` with no usable link falls through to text inference rather than being
+   * invented.
+   *
+   * Two codes need no target at all, and both are mapped as the site means them:
+   *   - `ATS` is Ethiojobs' own applicant system, so applying happens inside the platform the
+   *     reader is already on. `SOURCE_ACCOUNT` says exactly that, and its path is the listing
+   *     URL we already hold, so no address is fabricated.
+   *   - `IN_PERSON` needs no address either; the posting tells the reader where to go.
+   *
+   * `application_form` (the payload's `applicationForm`) has never been populated in a captured
+   * record, so its shape is unknown and it is deliberately not read.
    */
   function mapDeclaredApplication(
     method: string | null,
@@ -203,6 +212,22 @@ export function createEthiojobsAdapter(
               applyEmail: null,
               evidence,
             };
+      case 'ATS':
+        // Applying happens inside Ethiojobs' own system: the path is the listing, not a URL the
+        // publisher supplied. Recording a target here would be fabrication.
+        return {
+          method: ApplicationMethod.SOURCE_ACCOUNT,
+          applyUrl: null,
+          applyEmail: null,
+          evidence,
+        };
+      case 'IN_PERSON':
+        return {
+          method: ApplicationMethod.IN_PERSON,
+          applyUrl: null,
+          applyEmail: null,
+          evidence,
+        };
       case 'BOTH':
         // Same precedence as the text extractor: a direct link is the more usable path.
         if (usableUrl !== null) {

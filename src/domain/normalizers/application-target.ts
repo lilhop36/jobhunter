@@ -20,9 +20,10 @@ import { canonicalizeUrl } from './url-normalizer';
  *
  * and is UNKNOWN otherwise. `SOURCE_ACCOUNT` and `INSTRUCTIONS` are valid states the SRS
  * allows, but they are source-specific declarations (does applying require the source's own
- * account?) that shared domain code cannot infer from free text (ENG-016); an adapter will
- * declare them when a real source needs them. `hasUsableApplicationPath` already handles
- * them, so adding them later is an adapter change, not a policy rewrite.
+ * account?) that shared domain code cannot infer from free text (ENG-016); an adapter declares
+ * them when its source says so (Ethiojobs declares its own `ATS` as `SOURCE_ACCOUNT`).
+ * `hasUsableApplicationPath` already handles them, so adding them is an adapter change, not a
+ * policy rewrite.
  *
  * "Application context" is a window around the match containing an apply keyword, so a
  * general contact address ("questions? info@example.com") is not mistaken for the
@@ -43,8 +44,12 @@ export const APPLICATION_TARGET_VERSION = 'APPLICATION_TARGET_V1';
  * outranks text inference. The mapping itself stays in the adapter (ENG-016); this module
  * owns only the validation the mapping must pass, so a malformed declared email cannot
  * become a notifiable path.
+ *
+ * V2: a mapping may now also record a method that needs no target (`SOURCE_ACCOUNT`,
+ * `IN_PERSON`), which V1 could not produce. A stamp reading V1 therefore means the adapter
+ * could only have yielded `EMAIL`, `ONLINE_URL` or `PDF_FORM` from a declared field.
  */
-export const DECLARED_APPLICATION_TARGET_VERSION = 'APPLICATION_TARGET_DECLARED_V1';
+export const DECLARED_APPLICATION_TARGET_VERSION = 'APPLICATION_TARGET_DECLARED_V2';
 
 /** Apply-ish keywords that qualify a nearby URL or email as the application path. */
 const APPLY_CONTEXT = /\b(?:appl(?:y|ication|ications)|send|submit|email|e-mail|cv|resume|cover\s+letter)\b/iu;

@@ -61,6 +61,32 @@ describe('renderNotificationMessage', () => {
     expect(text).toContain('Source: EffoySira');
   });
 
+  it('renders a path that lives on the source as a sentence, not a raw enum', () => {
+    // Ethiojobs declares its own ATS as SOURCE_ACCOUNT (audit A1). There is no URL or address
+    // to show, and the reader needs to know where the application actually happens.
+    const text = renderNotificationMessage(
+      content({
+        application: {
+          method: ApplicationMethod.SOURCE_ACCOUNT,
+          applyUrl: null,
+          applyEmail: null,
+        },
+      }),
+    );
+
+    expect(text).toContain('Apply: on the source site (an account is required)');
+  });
+
+  it('renders an in-person path as a sentence, not a raw enum', () => {
+    const text = renderNotificationMessage(
+      content({
+        application: { method: ApplicationMethod.IN_PERSON, applyUrl: null, applyEmail: null },
+      }),
+    );
+
+    expect(text).toContain('Apply: in person');
+  });
+
   it('renders an unknown field as UNKNOWN, never as a plausible value', () => {
     const text = renderNotificationMessage(content({ title: null, company: null, locationText: null }));
 

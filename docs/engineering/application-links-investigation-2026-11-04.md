@@ -1,7 +1,8 @@
 # Application links: what the pipeline actually stores and shows
 
 **Date:** 2026-11-04
-**Type:** investigation, report-only. No code, SRS or ADR change.
+**Type:** investigation, then a follow-up implementation of A1/A2 (§10). The SRS and ADRs are
+unchanged.
 **Relates to:** FR-006, SRS 7.7 step 7, AC-004, SRS 3.2 (message content), SRS 3.2 match detail,
 D10, D13, AC-017.
 **Evidence base:** committed code at `461e6c9`; one read-only query pass over the dev database
@@ -183,3 +184,34 @@ the same argument ADR-0010 §6 already makes for `NOT_FOUND`.
 | 1 | Is a source-declared `ATS` a usable application path (`SOURCE_ACCOUNT`), with the listing URL as the path? | yes → A1 becomes a small mapped change; no → 27 jobs stay ineligible and the message should say why |
 | 2 | Does FR-006 "verify" mean a syntactic/kind check (part 2 of §6) or a live HTTP probe (needs budget + ADR)? | kind check now, probe later, or probe now |
 | 3 | Should the notification carry the listing URL before D13's buttons exist? | yes as a text line; no until buttons |
+
+## 10. Follow-up: A1 and A2 implemented (2026-11-04)
+
+The owner approved mapping the two declared methods the source already emits, so §5's A1 and A2 are
+closed. No SRS or ADR change: SRS 7.7 lists `SOURCE_ACCOUNT` and `IN_PERSON` as valid methods, and
+`hasUsableApplicationPath` already treated both as usable — the gap was only that no adapter ever
+produced them.
+
+| Change | Detail |
+| --- | --- |
+| `mapDeclaredApplication` | `ATS` → `SOURCE_ACCOUNT` and `IN_PERSON` → `IN_PERSON`, both with no `applyUrl`/`applyEmail`, because the publisher supplies neither and the path is the listing. No address is invented. |
+| Precedence | Unchanged and now documented: the declared *method* is authoritative; a declared field only has to satisfy the target that method needs. That is why an `EMAIL` record still wins over a link on the same record. |
+| `DECLARED_APPLICATION_TARGET_VERSION` | Bumped to `APPLICATION_TARGET_DECLARED_V2`, because a V1 stamp could not have produced either method. Old provenance stays distinguishable. |
+| Healing | No backfill was run and none is needed: `keepWhenUnstated('applicationMethod')` replaces a stored `UNKNOWN` with a stated method on the next observation, so the 32 affected rows correct themselves as the sources are re-read. Pinned by a real-PostgreSQL test. |
+| Tests | Adapter mapping (including a page-2 record, so the mapping cannot depend on position), the notification rendering of both methods, the AC-004 boundary in the scoring run, and the `UNKNOWN` → stated refresh. |
+
+Expected effect on the dev database once the affected postings are observed again: jobs carrying a
+usable application method 155/230 (67%) → 187/230 (81%), with no field written that the source did
+not state. (Scoring and confidence thresholds still decide who is actually notified; this count is
+the AC-004 gate alone.)
+
+Still open and unchanged by this: A3 (no verification / D10), A4 (the message carries no listing URL /
+D13), A5 (a declared field is trusted for meaning), A6 (stale rows elsewhere).
+
+**A7 (new, observed while implementing).** The web job page renders a target-less method as the bare
+enum name (`Application: SOURCE_ACCOUNT`), which is how `IN_PERSON` already read before this change.
+The notification renders a sentence for both, so only the page is affected. It matches that page's
+existing habit of printing `remoteStatus`, `employmentType` and `lifecycleStatus` raw, so it was left
+alone rather than special-cased here; a human-readable label for every enum on that page is one
+decision, not five.
+
