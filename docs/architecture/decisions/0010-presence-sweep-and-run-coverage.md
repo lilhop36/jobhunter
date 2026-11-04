@@ -1,7 +1,7 @@
 # ADR-0010: Presence sweep under bounded listing coverage
 
 - **Status:** Accepted — 2026-10-24 (owner selected windowed coverage; see §5); amended 2026-11-01
-  by the audit's M1 fix (see §8).
+  by the audit's M1 fix (see §8), and 2026-11-04 by the audit's L9 fix (see §9).
 - **Date:** 2026-10-24
 - **Relates to:** FR-019, SRS 4.4 (job lifecycle), AC-018, ENG-001 (no evidence is not negative evidence), ADR-0001 (identity), ADR-0004 (adapter registry)
 - **Depends on:** ADR-0001 accepted; the `source_runs` funnel counters and the adapter registry exist.
@@ -91,8 +91,10 @@ makes is fenced on the status the pass read (§8).
 
 ### 2.4 Policy version
 
-`LIFECYCLE_POLICY_VERSION` is now `LIFECYCLE_V2`; the rule, the evidence shape, and the
-migration from a boolean-only gate are one policy change.
+`LIFECYCLE_POLICY_VERSION` was `LIFECYCLE_V2`; the rule, the evidence shape, and the
+migration from a boolean-only gate were one policy change. **Amended 2026-11-04:** §9 raises the
+miss count and moves the version to `LIFECYCLE_V3`; the evidence shape and coverage rules above
+are unchanged.
 
 ## 3. Consequences
 
@@ -108,9 +110,9 @@ migration from a boolean-only gate are one policy change.
   observed there. The expected first-sweep movement was zero for all three sources.
 - **One nullable column plus one boolean** on `source_runs`, both additive. Pre-existing rows
   make no claim (the safe direction) and are simply not qualifying runs.
-- A source that intermittently truncates its listing will flap (one miss is enough to retire).
-  The `ponytail:` note in the policy records the future fix: a consecutive-miss requirement and
-  a policy-version bump, only once a real source shows that behaviour.
+- A source that intermittently truncates its listing would have flapped under §2.2's single miss:
+  one covered run's silence retired a Job and the next run restored it, discarding its match and
+  notification history each time. §9 replaces that count with consecutive misses.
 
 ## 4. Alternatives rejected
 
@@ -176,4 +178,37 @@ Tests for the amendment: `lifecycle-sweep.spec.ts` (a claim-less run restoring a
 fence refusing to overwrite a status moved underneath the pass; the deadline policy winning a race
 mediated between the pass's read and its write) and `deadline-expiry.spec.ts` (the mirror case, where
 presence retires during the deadline pass).
+
+## 9. Amendment — 2026-11-04: consecutive misses before retirement (audit L9)
+
+Supersedes the miss count in §2.2 (rules 1–2), the version in §2.4, and the flapping consequence in
+§3. Nothing else in §2 changes: which run may speak for a Job, and what its coverage claim means, are
+untouched.
+
+1. **Why.** One covered run's silence retired a Job, and the next run restored it. A source that
+   intermittently truncates a page therefore produced a retirement/restoration cycle on every flap,
+   and each flap discarded that Job's match and notification history — the record the product
+   depends on. The rule also claimed more than the evidence supports: a single observation of
+   absence cannot separate "removed" from "on a page this run's budget cut off", and the coverage
+   window narrows that doubt without removing it.
+2. **Rule.** A Job is retired only when the two most recent runs that could speak for it (§2.2's
+   qualifier) both missed it, and the older of the two covered its publication window.
+   `LIFECYCLE_MISS_THRESHOLD` is 2. The read model selects the newest qualifying run and the one
+   before it from one shared predicate, so runs that never qualified — failed, partial, empty, or
+   capped above the Job's date — are skipped and never accumulate toward removal. A Job observed by
+   either of the two is `ACTIVE`.
+3. **Presence still restores immediately.** The newest qualifying run is read for exactly this
+   reason: a Job removed under the old rule and re-published by the source's only recent collection
+   is restored on that observation, without waiting for a second run.
+4. **Version.** `LIFECYCLE_V3`. The version accompanies every lifecycle move in the log, so a log
+   carrying `V2` was produced by the single-miss rule and its retirements are not comparable.
+
+Consequence: retirement now trails the source by one collection cycle. That is the intended cost of
+not flapping; the window in §2.1 still limits removal to Jobs the runs actually covered.
+
+Tests: `tests/unit/lifecycle-policy.spec.ts` (one miss keeps the Job, two consecutive misses retire
+it, a capture at either run's start counts as observed, no second run means no retirement) and
+`tests/integration/lifecycle-sweep.spec.ts` (one miss kept, two consecutive misses retired, a
+re-observation resetting the count, failed/partial/empty/claim-less runs not counting as misses, and
+the windowed-coverage cases rebuilt on the two-run history).
 
