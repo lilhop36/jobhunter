@@ -20,6 +20,8 @@ const jobs = new PrismaJobRepository(prisma);
 const sweep = new SweepSourceLifecycle({ jobs, logger: silentWorkerLogger });
 
 const RUN_AT = new Date('2026-05-01T00:00:00.000Z');
+/** The collection before RUN_AT: retirement needs two consecutive misses (audit L9). */
+const PREV_RUN_AT = new Date('2026-04-30T00:00:00.000Z');
 const OBSERVED_BEFORE = new Date('2026-04-29T00:00:00.000Z');
 const OBSERVED_AFTER = new Date('2026-05-01T06:00:00.000Z');
 /** The oldest publication date a capped run read; published dates are date-only UTC. */
@@ -85,6 +87,21 @@ async function createRun(
   });
 }
 
+/**
+ * Two consecutive complete reads, both after the Job's last capture: the minimum history that
+ * can retire it under `LIFECYCLE_V3` (audit L9).
+ */
+async function createTwoInformativeRuns(
+  sourceId: string,
+  options: {
+    catalogueExhausted?: boolean;
+    oldestListingPublishedAt?: Date | null;
+  } = {},
+): Promise<void> {
+  await createRun(sourceId, { ...options, startedAt: PREV_RUN_AT });
+  await createRun(sourceId, { ...options, startedAt: RUN_AT });
+}
+
 async function statusOf(jobId: string): Promise<LifecycleStatus | undefined> {
   const job = await prisma.job.findUnique({ where: { id: jobId } });
   return job?.lifecycleStatus as LifecycleStatus | undefined;
@@ -106,7 +123,7 @@ describe('lifecycle sweep - retiring jobs', () => {
   it('retires a job the source stopped publishing', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId);
+    await createTwoInformativeRuns(sourceId);
 
     const result = await sweep.sweep(sourceId);
 
@@ -130,7 +147,10 @@ describe('lifecycle sweep - evidence boundaries', () => {
   it('does not retire from a failed collection', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId, { status: SourceRunStatus.FAILED });
+    // One informative collection has missed the job; if the failure counted as a second miss,
+    // this would retire it.
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
+    await createRun(sourceId, { status: SourceRunStatus.FAILED, startedAt: RUN_AT });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
@@ -139,19 +159,25 @@ describe('lifecycle sweep - evidence boundaries', () => {
   it('does not retire from a partial collection', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId, { status: SourceRunStatus.PARTIAL });
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
+    await createRun(sourceId, { status: SourceRunStatus.PARTIAL, startedAt: RUN_AT });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('does not retire when a capped run made no window claim', async () => {
+  it('does not count a capped run that claimed no window as a miss', async () => {
     // A capped or error-cut run discovered records but saw only part of the listing and
     // recorded no date floor: absence from it says nothing about what the unvisited pages
-    // held (FR-019), so it is not even a qualifying run.
+    // held (FR-019), so it is not even a qualifying run and must not count toward retirement.
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId, { catalogueExhausted: false });
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
+    await createRun(sourceId, {
+      startedAt: RUN_AT,
+      catalogueExhausted: false,
+      oldestListingPublishedAt: null,
+    });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
@@ -160,7 +186,8 @@ describe('lifecycle sweep - evidence boundaries', () => {
   it('does not retire from a successful zero-result run (AC-018)', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId, { jobsDiscovered: 0 });
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
+    await createRun(sourceId, { jobsDiscovered: 0, startedAt: RUN_AT });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
@@ -177,59 +204,82 @@ describe('lifecycle sweep - evidence boundaries', () => {
   it('does not retire a job whose capture is gone', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId);
+    // One informative collection has missed the job, so only the missing capture keeps it.
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
     await prisma.job.update({ where: { id: jobId }, data: { rawJobId: null } });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('uses the newest run, not an earlier informative one', async () => {
+  // Audit L9: a single miss is what made retirement flap. A source that intermittently
+  // truncates a page retired live jobs and restored them on the next run, and each flap
+  // destroyed the job's match and notification history.
+  it('retires only after consecutive informative collections miss the job (audit L9)', async () => {
     const sourceId = await createSource('s1');
-    // Observed during an older informative run, then the source published a newer one.
+    // Observed during an older informative run, then the source stopped publishing it.
     const jobId = await createJob(sourceId, 'gone', new Date('2026-04-01T00:00:00.000Z'));
-    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
+
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+
     await createRun(sourceId, { startedAt: RUN_AT });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(1);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
 
-  it('ignores a newer run that failed when an older informative run exists', async () => {
+  it('counts consecutive misses from the most recent observation', async () => {
     const sourceId = await createSource('s1');
-    // Observed by the informative run below, so the failure that follows proves nothing.
-    const jobId = await createJob(sourceId, 'gone', new Date('2026-04-03T00:00:00.000Z'));
-    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
+    const jobId = await createJob(sourceId, 'gone', new Date('2026-04-01T06:00:00.000Z'));
+    await createRun(sourceId, { startedAt: new Date('2026-04-01T00:00:00.000Z') });
+    await createRun(sourceId, { startedAt: new Date('2026-04-10T00:00:00.000Z') });
+    await createRun(sourceId, { startedAt: new Date('2026-04-20T00:00:00.000Z') });
+
+    // Two consecutive collections after the observation missed it.
+    expect((await sweep.sweep(sourceId)).retired).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+
+    // The source publishes it again, and one later collection misses it: the count starts over
+    // from that observation, so a single miss does not retire the job again.
+    const { rawJobId } = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
+    await prisma.rawJob.update({
+      where: { id: rawJobId! },
+      data: { lastSeenAt: new Date('2026-04-25T06:00:00.000Z') },
+    });
+    await createRun(sourceId, { startedAt: new Date('2026-04-25T00:00:00.000Z') });
+    await createRun(sourceId, { startedAt: new Date('2026-04-30T00:00:00.000Z') });
+
+    expect((await sweep.sweep(sourceId)).restored).toBe(1);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
+    // Two sweeps over real PostgreSQL; the 5 s default is a load-dependent coin flip here.
+  }, 30_000);
+
+  it('does not count a failed collection as a consecutive miss', async () => {
+    const sourceId = await createSource('s1');
+    const jobId = await createJob(sourceId, 'gone', new Date('2026-04-02T00:00:00.000Z'));
+    await createRun(sourceId, { startedAt: new Date('2026-04-01T00:00:00.000Z') });
+    // One qualifying miss, then a failure: if the failure counted, this would be the second.
+    await createRun(sourceId, { startedAt: PREV_RUN_AT });
     await createRun(sourceId, { status: SourceRunStatus.FAILED, startedAt: RUN_AT });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('ignores a newer capped run that claimed no window when an older informative run exists', async () => {
+  it('does not retire when only one informative collection exists', async () => {
     const sourceId = await createSource('s1');
-    const jobId = await createJob(
-      sourceId,
-      'gone',
-      new Date('2026-04-01T00:00:00.000Z'),
-      LifecycleStatus.ACTIVE,
-      new Date('2026-03-01T00:00:00.000Z'),
-    );
-    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
-    await createRun(sourceId, {
-      startedAt: RUN_AT,
-      catalogueExhausted: false,
-      oldestListingPublishedAt: null,
-    });
+    const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
+    await createRun(sourceId, { startedAt: RUN_AT });
 
-    // The newer run says nothing about coverage, so the older complete read still stands.
-    expect((await sweep.sweep(sourceId)).retired).toBe(1);
-    expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
+    expect((await sweep.sweep(sourceId)).retired).toBe(0);
+    expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 });
 
 describe('lifecycle sweep - windowed coverage (capped runs)', () => {
-  it('retires a job published strictly inside the window a capped run read', async () => {
+  it('retires a job published strictly inside the window the capped runs read', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(
       sourceId,
@@ -238,7 +288,7 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
       LifecycleStatus.ACTIVE,
       new Date('2026-04-20T00:00:00.000Z'),
     );
-    await createRun(sourceId, {
+    await createTwoInformativeRuns(sourceId, {
       catalogueExhausted: false,
       oldestListingPublishedAt: WINDOW_FLOOR,
     });
@@ -258,7 +308,7 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
       LifecycleStatus.ACTIVE,
       WINDOW_FLOOR,
     );
-    await createRun(sourceId, {
+    await createTwoInformativeRuns(sourceId, {
       catalogueExhausted: false,
       oldestListingPublishedAt: WINDOW_FLOOR,
     });
@@ -276,20 +326,20 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
       LifecycleStatus.ACTIVE,
       new Date('2026-04-10T00:00:00.000Z'),
     );
-    await createRun(sourceId, {
+    await createTwoInformativeRuns(sourceId, {
       catalogueExhausted: false,
       oldestListingPublishedAt: WINDOW_FLOOR,
     });
 
-    // It may sit on a page the run never read: no evidence either way (ENG-001).
+    // It may sit on a page neither run read: no evidence either way (ENG-001).
     expect((await sweep.sweep(sourceId)).retired).toBe(0);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('does not retire an undated job from a windowed run', async () => {
+  it('does not retire an undated job from windowed runs', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'undated', OBSERVED_BEFORE);
-    await createRun(sourceId, {
+    await createTwoInformativeRuns(sourceId, {
       catalogueExhausted: false,
       oldestListingPublishedAt: WINDOW_FLOOR,
     });
@@ -298,10 +348,10 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('retires an undated job when the run read the whole listing', async () => {
+  it('retires an undated job when the runs read the whole listing', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'undated', OBSERVED_BEFORE);
-    await createRun(sourceId, { catalogueExhausted: true });
+    await createTwoInformativeRuns(sourceId, { catalogueExhausted: true });
 
     expect((await sweep.sweep(sourceId)).retired).toBe(1);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
@@ -326,7 +376,7 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
     expect(await statusOf(jobId)).toBe(LifecycleStatus.ACTIVE);
   });
 
-  it('retires from an older full read when newer capped runs cannot reach the job', async () => {
+  it('retires from older full reads when newer capped runs cannot reach the job', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(
       sourceId,
@@ -335,15 +385,15 @@ describe('lifecycle sweep - windowed coverage (capped runs)', () => {
       LifecycleStatus.ACTIVE,
       new Date('2026-04-10T00:00:00.000Z'),
     );
-    // A complete read, then the source moved to capped runs above this job's date.
-    await createRun(sourceId, { startedAt: new Date('2026-04-02T00:00:00.000Z') });
+    // Two complete reads, then the source moved to capped runs above this job's date.
+    await createTwoInformativeRuns(sourceId, { catalogueExhausted: true });
     await createRun(sourceId, {
-      startedAt: RUN_AT,
+      startedAt: new Date('2026-05-02T00:00:00.000Z'),
       catalogueExhausted: false,
       oldestListingPublishedAt: WINDOW_FLOOR,
     });
 
-    // The newer runs cannot speak for this Job; the older complete read still can.
+    // The newer capped run cannot speak for this Job; the older complete reads still can.
     expect((await sweep.sweep(sourceId)).retired).toBe(1);
     expect(await statusOf(jobId)).toBe(LifecycleStatus.REMOVED);
   });
@@ -388,7 +438,7 @@ describe('lifecycle sweep - restoring and isolating', () => {
     const otherSource = await createSource('s2');
     const sweptJob = await createJob(sweptSource, 'a', OBSERVED_BEFORE);
     const otherJob = await createJob(otherSource, 'b', OBSERVED_BEFORE);
-    await createRun(sweptSource);
+    await createTwoInformativeRuns(sweptSource);
 
     const result = await sweep.sweep(sweptSource);
 
@@ -401,7 +451,7 @@ describe('lifecycle sweep - restoring and isolating', () => {
   it('is a no-op when re-run', async () => {
     const sourceId = await createSource('s1');
     const jobId = await createJob(sourceId, 'gone', OBSERVED_BEFORE);
-    await createRun(sourceId);
+    await createTwoInformativeRuns(sourceId);
 
     expect((await sweep.sweep(sourceId)).retired).toBe(1);
     // Still examined (it is a status this policy owns) but no longer a change.
@@ -437,13 +487,13 @@ describe('lifecycle reconciliation - compare-and-set (audit M1)', () => {
     const sourceId = await createSource('s1');
     const staleJobId = await createJob(sourceId, 'a', OBSERVED_BEFORE);
     const freshJobId = await createJob(sourceId, 'b', OBSERVED_BEFORE);
-    await createRun(sourceId);
+    await createTwoInformativeRuns(sourceId);
 
     const candidates = await jobs.listLifecycleCandidates(sourceId);
     expect(candidates).toHaveLength(2);
-    // Both are ACTIVE and both are absent from a listing the run read to the end, so both are
-    // decided REMOVED. Then one of them moves underneath the pass, as it would under a second
-    // worker or the deadline policy.
+    // Both are ACTIVE and both are absent from consecutive listings that were read to the end,
+    // so both are decided REMOVED. Then one of them moves underneath the pass, as it would
+    // under a second worker or the deadline policy.
     await prisma.job.update({
       where: { id: staleJobId },
       data: { lifecycleStatus: LifecycleStatus.EXPIRED },

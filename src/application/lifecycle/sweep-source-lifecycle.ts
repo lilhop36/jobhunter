@@ -28,9 +28,9 @@ export interface SourceLifecycleSweepResult {
  *
  * What makes a run *informative* is not decided here: the read model only offers, for each Job,
  * a run that can speak for it - one that captured the Job, read the listing to the end, or read
- * down past the Job's publication date. That is why the sweep can run after any successful
- * collection: presence restores on its own evidence, and absence retires only against a run that
- * actually covered the Job (ADR-0010, audit M1).
+ * down past the Job's publication date - and the run before that one. That is why the sweep can
+ * run after any successful collection: presence restores on its own evidence, and absence
+ * retires only against consecutive runs that actually covered the Job (ADR-0010, audit M1, L9).
  *
  * Every move is logged with the evidence and the policy version that decided it. No column
  * stores a lifecycle reason, so the log is the audit trail; this is why the policy returns a
@@ -54,7 +54,8 @@ export class SweepSourceLifecycle {
         currentStatus: candidate.currentStatus,
         lastObservedAt: candidate.lastObservedAt,
         publishedAt: candidate.publishedAt,
-        latestQualifyingRun: candidate.latestQualifyingRun,
+        newestQualifyingRun: candidate.newestQualifyingRun,
+        retirementCutoffRun: candidate.retirementCutoffRun,
       });
       if (decision.status === candidate.currentStatus) continue;
 

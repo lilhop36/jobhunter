@@ -1,6 +1,9 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import { DescriptionQuality, LifecycleStatus, SourceRunStatus } from '@domain/enums';
-import { RECONCILED_LIFECYCLE_STATUSES } from '@domain/lifecycle/lifecycle-policy';
+import {
+  LIFECYCLE_MISS_THRESHOLD,
+  RECONCILED_LIFECYCLE_STATUSES,
+} from '@domain/lifecycle/lifecycle-policy';
 import { DEADLINE_RECONCILED_STATUSES } from '@domain/lifecycle/deadline-policy';
 import {
   DeadlineCandidate,
@@ -136,9 +139,12 @@ interface LifecycleCandidateRow {
   lifecycleStatus: string;
   publishedAt: Date | string | null;
   lastObservedAt: Date | string | null;
-  latestQualifyingRunStartedAt: Date | string | null;
-  latestQualifyingCatalogueExhausted: boolean | null;
-  latestQualifyingOldestListingPublishedAt: Date | string | null;
+  newestQualifyingRunStartedAt: Date | string | null;
+  newestQualifyingCatalogueExhausted: boolean | null;
+  newestQualifyingOldestListingPublishedAt: Date | string | null;
+  cutoffRunStartedAt: Date | string | null;
+  cutoffRunCatalogueExhausted: boolean | null;
+  cutoffRunOldestListingPublishedAt: Date | string | null;
 }
 
 interface DeadlineCandidateRow {
@@ -245,13 +251,17 @@ export class PrismaJobRepository implements JobRepository {
   /**
    * Read model for one source's lifecycle reconciliation (FR-019, SRS 4.4).
    *
-   * The lateral join selects the newest "informative collection" **that can speak for this
-   * Job** as `@domain/lifecycle` defines it: a run that finished `SUCCEEDED`, discovered at
-   * least one record, and either captured the Job (presence is direct evidence), read the
-   * listing to the end (`catalogueExhausted`), or recorded a publication-date floor below the
-   * Job's own date. Choosing per Job rather than taking the newest run overall matters: when a
-   * source moves to capped runs, a newer capped run cannot speak for an old Job, but an
-   * earlier complete read still can. Runs that did none of these never qualify.
+   * Two lateral joins select the newest "informative collection" **that can speak for this
+   * Job** as `@domain/lifecycle` defines it, and the one before it: a run that finished
+   * `SUCCEEDED`, discovered at least one record, and either captured the Job (presence is
+   * direct evidence), read the listing to the end (`catalogueExhausted`), or recorded a
+   * publication-date floor below the Job's own date. Choosing per Job rather than taking the
+   * newest run overall matters: when a source moves to capped runs, a newer capped run cannot
+   * speak for an old Job, but an earlier complete read still can.
+   *
+   * The second run is what retirement is decided against (audit L9): absence from it *and*
+   * from the newer one is two consecutive misses. Runs that could not speak for the Job are
+   * never counted as misses, so a source's silent run does not accumulate toward removal.
    *
    * The policy re-checks the window itself; this filter only narrows what it has to consider.
    * Only the statuses this policy owns are returned, so a Job whose state came from other
@@ -259,59 +269,82 @@ export class PrismaJobRepository implements JobRepository {
    */
   async listLifecycleCandidates(sourceId: string): Promise<LifecycleCandidate[]> {
     const reconciledStatuses = Prisma.join(RECONCILED_LIFECYCLE_STATUSES);
+    // One predicate, both reads: sharing the fragment keeps the two windows from drifting.
+    const qualifying = Prisma.sql`
+      r."sourceId" = j."sourceId"
+      AND r."status"::text = ${SourceRunStatus.SUCCEEDED}
+      AND r."jobsDiscovered" > 0
+      AND (
+        r."catalogueExhausted" = true
+        -- publishedAt is a naive timestamp holding a UTC value, so it is interpreted as
+        -- UTC here rather than left for PostgreSQL to resolve against the session's zone
+        -- (ENG-022). The floor itself is stored as timestamptz.
+        OR (j."publishedAt" IS NOT NULL
+            AND r."oldestListingPublishedAt" IS NOT NULL
+            AND (j."publishedAt" AT TIME ZONE 'UTC') > r."oldestListingPublishedAt")
+        -- A run that captured this Job is relevant even when the Job's date sits
+        -- outside its window: presence restores, and needs no coverage claim.
+        OR (rj."lastSeenAt" IS NOT NULL AND rj."lastSeenAt" >= r."startedAt")
+      )`;
     const rows = await this.prisma.$queryRaw<LifecycleCandidateRow[]>`
       SELECT j."id" AS "jobId",
              j."lifecycleStatus"::text AS "lifecycleStatus",
              j."publishedAt" AS "publishedAt",
              rj."lastSeenAt" AS "lastObservedAt",
-             run."startedAt" AS "latestQualifyingRunStartedAt",
-             run."catalogueExhausted" AS "latestQualifyingCatalogueExhausted",
-             run."oldestListingPublishedAt" AS "latestQualifyingOldestListingPublishedAt"
+             newest."startedAt" AS "newestQualifyingRunStartedAt",
+             newest."catalogueExhausted" AS "newestQualifyingCatalogueExhausted",
+             newest."oldestListingPublishedAt" AS "newestQualifyingOldestListingPublishedAt",
+             cutoff."startedAt" AS "cutoffRunStartedAt",
+             cutoff."catalogueExhausted" AS "cutoffRunCatalogueExhausted",
+             cutoff."oldestListingPublishedAt" AS "cutoffRunOldestListingPublishedAt"
         FROM "jobs" j
         LEFT JOIN "raw_jobs" rj ON rj."id" = j."rawJobId"
         LEFT JOIN LATERAL (
           SELECT r."startedAt", r."catalogueExhausted", r."oldestListingPublishedAt"
             FROM "source_runs" r
-           WHERE r."sourceId" = j."sourceId"
-             AND r."status"::text = ${SourceRunStatus.SUCCEEDED}
-             AND r."jobsDiscovered" > 0
-             AND (
-               r."catalogueExhausted" = true
-               -- publishedAt is a naive timestamp holding a UTC value, so it is interpreted as
-               -- UTC here rather than left for PostgreSQL to resolve against the session's zone
-               -- (ENG-022). The floor itself is stored as timestamptz.
-               OR (j."publishedAt" IS NOT NULL
-                   AND r."oldestListingPublishedAt" IS NOT NULL
-                   AND (j."publishedAt" AT TIME ZONE 'UTC') > r."oldestListingPublishedAt")
-               -- A run that captured this Job is relevant even when the Job's date sits
-               -- outside its window: presence restores, and needs no coverage claim.
-               OR (rj."lastSeenAt" IS NOT NULL AND rj."lastSeenAt" >= r."startedAt")
-             )
+           WHERE ${qualifying}
            ORDER BY r."startedAt" DESC
            LIMIT 1
-        ) run ON true
+        ) newest ON true
+        LEFT JOIN LATERAL (
+          SELECT r."startedAt", r."catalogueExhausted", r."oldestListingPublishedAt"
+            FROM "source_runs" r
+           WHERE ${qualifying}
+           ORDER BY r."startedAt" DESC
+           OFFSET ${LIFECYCLE_MISS_THRESHOLD - 1}::int
+           LIMIT 1
+        ) cutoff ON true
        WHERE j."sourceId" = ${sourceId}::uuid
          AND j."lifecycleStatus"::text IN (${reconciledStatuses})
     `;
 
     return rows.map((row) => {
-      const runStartedAt = toNullableDate(row.latestQualifyingRunStartedAt);
+      const newestStartedAt = toNullableDate(row.newestQualifyingRunStartedAt);
+      const cutoffStartedAt = toNullableDate(row.cutoffRunStartedAt);
       return {
         jobId: row.jobId,
         currentStatus: row.lifecycleStatus as LifecycleStatus,
         publishedAt: toNullableDate(row.publishedAt),
         lastObservedAt: toNullableDate(row.lastObservedAt),
-        latestQualifyingRun:
-          runStartedAt === null
+        newestQualifyingRun:
+          newestStartedAt === null
             ? null
             : {
-                startedAt: runStartedAt,
+                startedAt: newestStartedAt,
                 // A run with no claim cannot reach the lateral join, so both fields are
                 // meaningful here.
-                catalogueExhausted: row.latestQualifyingCatalogueExhausted === true,
+                catalogueExhausted: row.newestQualifyingCatalogueExhausted === true,
                 oldestListingPublishedAt: toNullableDate(
-                  row.latestQualifyingOldestListingPublishedAt,
+                  row.newestQualifyingOldestListingPublishedAt,
                 ),
+              },
+        retirementCutoffRun:
+          cutoffStartedAt === null
+            ? null
+            : {
+                startedAt: cutoffStartedAt,
+                catalogueExhausted: row.cutoffRunCatalogueExhausted === true,
+                oldestListingPublishedAt: toNullableDate(row.cutoffRunOldestListingPublishedAt),
               },
       };
     });

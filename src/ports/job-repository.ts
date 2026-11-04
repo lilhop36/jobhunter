@@ -58,13 +58,19 @@ export interface LifecycleCandidate {
    */
   publishedAt: Date | null;
   /**
-   * The source's most recent informative run whose coverage includes this Job - it read the
-   * whole listing, or its publication-date floor is below the Job's date - or null when no
-   * run could have seen it. A newer capped run that does not reach this Job is skipped in
-   * favour of an older complete read: it cannot speak for the Job, but it does not erase what
-   * an earlier run covered.
+   * The source's most recent informative run whose coverage includes this Job - it captured
+   * the Job, read the whole listing, or its publication-date floor is below the Job's date -
+   * or null when no run could have seen it. A newer capped run that does not reach this Job
+   * is skipped in favour of an older complete read: it cannot speak for the Job, but it does
+   * not erase what an earlier run covered.
    */
-  latestQualifyingRun: LifecycleRunEvidence | null;
+  newestQualifyingRun: LifecycleRunEvidence | null;
+  /**
+   * The qualifying run immediately before `newestQualifyingRun`, or null when there is only
+   * one. Retirement is decided against it, so a Job is retired only after two consecutive
+   * qualifying runs that could have seen it did not (audit L9).
+   */
+  retirementCutoffRun: LifecycleRunEvidence | null;
 }
 
 /**

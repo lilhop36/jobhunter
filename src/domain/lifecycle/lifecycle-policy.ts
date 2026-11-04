@@ -6,7 +6,7 @@ import { LifecycleStatus } from '@domain/enums';
  * The SRS requires expired, removed, and dead jobs to be detected, fixes neither the
  * evidence nor a threshold, and defines no acceptance criterion for FR-019. Of the three
  * states, only **removed** is derivable from persisted evidence, so this policy owns exactly
- * that one signal: a Job is absent from a newer *informative* collection of its own source.
+ * that one signal: a Job is absent from consecutive *informative* collections of its own source.
  *
  * "Informative" is the load-bearing word. Only a `SUCCEEDED` run that discovered at least
  * one record counts, because:
@@ -30,19 +30,35 @@ import { LifecycleStatus } from '@domain/enums';
  * evidence about it. That distinction is why an old Job falling off the read pages is never
  * retired (ENG-001: no evidence is not negative evidence).
  *
- * The rule is threshold-free: it compares the Job's last observation against the source's
- * most recent informative run rather than counting missed runs or days, so there is no
- * tunable constant to misconfigure. `EXPIRED` (a stated deadline) is owned by
- * `@domain/lifecycle/deadline-policy` and `NOT_FOUND` (a dead application target) comes from
- * evidence this system does not hold yet, so both are deliberately left alone here: this
- * policy can never re-derive them, and overwriting them from listing presence would destroy a
- * determination it cannot restore.
+ * **Consecutive misses** (audit L9). One run's silence used to be enough. A source that
+ * intermittently truncates a page then retired live Jobs and restored them on the next run,
+ * and every flap destroyed that Job's match and notification history. Retirement now needs
+ * `LIFECYCLE_MISS_THRESHOLD` consecutive informative collections that could speak for the Job
+ * to have missed it. The read model supplies the newest such collection and the one before it
+ * (`retirementCutoffRun`): a Job not observed at or after the cutoff's start was missed by the
+ * cutoff *and* by the newer run, because a collection that captured it stamps `lastSeenAt` at
+ * or after its own start. Runs that could not speak for the Job — failed, empty, or capped
+ * above its publication date — are not misses and are skipped rather than counted.
  *
- * `ponytail:` a single missed run is enough to retire a Job. A source that intermittently
- * truncates its listing will flap. Add a consecutive-miss requirement (and a policy version
- * bump) only once a real source shows that behaviour.
+ * `EXPIRED` (a stated deadline) is owned by `@domain/lifecycle/deadline-policy` and
+ * `NOT_FOUND` (a dead application target) comes from evidence this system does not hold yet,
+ * so both are deliberately left alone here: this policy can never re-derive them, and
+ * overwriting them from listing presence would destroy a determination it cannot restore.
+ *
+ * `ponytail:` the threshold is a fixed constant, not configuration, and it has not been tuned
+ * against a real source's truncation rate. Revisit only if a source shows repeated
+ * at-the-boundary misses.
  */
-export const LIFECYCLE_POLICY_VERSION = 'LIFECYCLE_V2';
+export const LIFECYCLE_POLICY_VERSION = 'LIFECYCLE_V3';
+
+/**
+ * How many consecutive informative collections must miss a Job before it is retired.
+ *
+ * Two is the smallest count that separates "the source stopped listing this Job" from "one
+ * collection's pages happened to miss it". The read model reads `LIFECYCLE_MISS_THRESHOLD - 1`
+ * qualifying runs back, so this constant and the SQL cannot drift apart.
+ */
+export const LIFECYCLE_MISS_THRESHOLD = 2;
 
 /** The lifecycle states this policy derives. */
 export const RECONCILED_LIFECYCLE_STATUSES: readonly LifecycleStatus[] = [
@@ -62,7 +78,7 @@ export interface LifecycleRunCoverage {
   oldestListingPublishedAt: Date | null;
 }
 
-/** The source's most recent run that can support a retirement decision. */
+/** A run, with the evidence that lets it speak for one Job. */
 export interface LifecycleRunEvidence extends LifecycleRunCoverage {
   /** Run start. A capture stamped during the run is always at or after this instant. */
   startedAt: Date;
@@ -86,10 +102,18 @@ export interface LifecycleEvidence {
   publishedAt: Date | null;
   /**
    * The source's most recent run that is SUCCEEDED, discovered at least one record, and
-   * covered this Job: it read the whole listing, or its publication-date floor is below the
-   * Job's date. Null when no such run exists.
+   * covered this Job: it captured the Job, read the whole listing, or read down past the
+   * Job's date. Null when no such run exists. Presence is decided against it first, so a Job
+   * seen by the newest collection is restored as soon as it reappears.
    */
-  latestQualifyingRun: LifecycleRunEvidence | null;
+  newestQualifyingRun: LifecycleRunEvidence | null;
+  /**
+   * The qualifying run immediately before `newestQualifyingRun`, or null when the source has
+   * had only one. Retirement is decided against this run: a Job not observed at or after its
+   * start was missed by it and by the newer one, while a Job observed by it has been missed
+   * only once and is kept.
+   */
+  retirementCutoffRun: LifecycleRunEvidence | null;
 }
 
 export interface LifecycleDecision {
@@ -109,7 +133,13 @@ function isInsideCoverage(run: LifecycleRunEvidence, publishedAt: Date | null): 
 }
 
 export function classifyLifecycle(evidence: LifecycleEvidence): LifecycleDecision {
-  const { currentStatus, lastObservedAt, publishedAt, latestQualifyingRun } = evidence;
+  const {
+    currentStatus,
+    lastObservedAt,
+    publishedAt,
+    newestQualifyingRun,
+    retirementCutoffRun,
+  } = evidence;
 
   if (!RECONCILED_LIFECYCLE_STATUSES.includes(currentStatus)) {
     return {
@@ -117,28 +147,42 @@ export function classifyLifecycle(evidence: LifecycleEvidence): LifecycleDecisio
       reason: `${currentStatus} is derived from other evidence, not from listing presence`,
     };
   }
-  if (latestQualifyingRun === null) {
+  if (newestQualifyingRun === null) {
     return { status: currentStatus, reason: 'the source has no informative collection yet' };
   }
   if (lastObservedAt === null) {
     return { status: currentStatus, reason: 'the job records no observation time' };
   }
 
-  if (lastObservedAt.getTime() >= latestQualifyingRun.startedAt.getTime()) {
+  if (lastObservedAt.getTime() >= newestQualifyingRun.startedAt.getTime()) {
     return {
       status: LifecycleStatus.ACTIVE,
       reason: 'observed by the most recent informative collection of its source',
     };
   }
-  if (!isInsideCoverage(latestQualifyingRun, publishedAt)) {
+  if (retirementCutoffRun === null) {
     return {
       status: currentStatus,
       reason:
-        'the most recent informative collection did not cover the job’s publication window',
+        'one informative collection has missed the job; retirement needs consecutive misses',
+    };
+  }
+  if (lastObservedAt.getTime() >= retirementCutoffRun.startedAt.getTime()) {
+    return {
+      status: LifecycleStatus.ACTIVE,
+      reason: 'observed by the previous informative collection of its source',
+    };
+  }
+  if (!isInsideCoverage(retirementCutoffRun, publishedAt)) {
+    return {
+      status: currentStatus,
+      reason:
+        'the informative collections that could have seen the job did not cover its publication window',
     };
   }
   return {
     status: LifecycleStatus.REMOVED,
-    reason: 'absent from the covered window of the most recent informative collection',
+    reason:
+      'absent from consecutive informative collections that covered its publication window',
   };
 }
